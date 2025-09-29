@@ -1,68 +1,104 @@
-# src/functions/feature_extractor.py
-import os
-import dpkt
+"""PCAP 特征提取模块。"""
+
+from __future__ import annotations
+
 import glob
+import os
 import socket
-from typing import Callable, List, Optional
+from typing import Callable, Iterable, List, Optional, Tuple
 
 import dpkt
 import pandas as pd
 
-def _ip_to_str(raw):
+Packet = Tuple[float, bytes]
+
+
+def _ip_to_str(raw: bytes) -> str:
     try:
         return socket.inet_ntoa(raw)
     except Exception:
-        # 不是 IPv4 时兜底
         try:
             return socket.inet_ntop(socket.AF_INET6, raw)
         except Exception:
             return ""
 
-def extract_features(pcap_path: str, output_csv: str, progress_cb=None) -> str:
+
+def _open_reader(file_obj):
+    try:
+        return dpkt.pcap.Reader(file_obj)
+    except (ValueError, dpkt.NeedData):
+        file_obj.seek(0)
+        return dpkt.pcapng.Reader(file_obj)
+
+
+def _iterate_packets(reader) -> Iterable[Packet]:
+    for packet in reader:
+        if isinstance(packet, tuple) and len(packet) == 2:
+            yield float(packet[0]), packet[1]
+        else:
+            timestamp = getattr(packet, "timestamp", None)
+            data = getattr(packet, "packet_data", None)
+            if timestamp is None or data is None:
+                continue
+            yield float(timestamp), data
+
+
+def _count_packets(pcap_path: str) -> int:
+    total = 0
+    with open(pcap_path, "rb") as handle:
+        reader = _open_reader(handle)
+        for _ in _iterate_packets(reader):
+            total += 1
+    return total
+
+
 def extract_features(
     pcap_path: str,
     output_csv: str,
     progress_cb: Optional[Callable[[int], None]] = None,
 ) -> str:
-    """
-    从单个 pcap 文件提取“按包”的轻量特征，并保存为 CSV。
-    字段：timestamp, src_ip, dst_ip, protocol, length, pcap_file
-    说明：轻量 & 快速，便于无监督训练（IsolationForest）。
-    """
+    """从单个 PCAP 文件提取按包的轻量特征，并保存为 CSV。"""
     if not os.path.exists(pcap_path):
         raise FileNotFoundError(f"文件不存在: {pcap_path}")
 
+    total_packets = _count_packets(pcap_path)
     flows = []
-    total = 0
 
-    # 先统计包数，用于进度条
-    with open(pcap_path, "rb") as f:
-        try:
-            reader = dpkt.pcap.Reader(f)
-        except (ValueError, dpkt.NeedData):
-            f.seek(0)
-            reader = dpkt.pcapng.Reader(f)
-        for _ in reader:
-            total += 1
+    with open(pcap_path, "rb") as handle:
+        reader = _open_reader(handle)
+        for index, (ts, buf) in enumerate(_iterate_packets(reader), start=1):
+            try:
+                eth = dpkt.ethernet.Ethernet(buf)
+                ip = eth.data
 
-    with open(pcap_path, "rb") as f:
-        # 再次读取
-        try:
-            reader = dpkt.pcap.Reader(f)
-@@ -63,25 +70,81 @@ def extract_features(pcap_path: str, output_csv: str, progress_cb=None) -> str:
-                    "timestamp": ts,
-                    "src_ip": src_ip,
-                    "dst_ip": dst_ip,
-                    "protocol": proto,
-                    "length": length,
-                    "pcap_file": os.path.basename(pcap_path)
-                })
+                if not isinstance(ip, (dpkt.ip.IP, dpkt.ip6.IP6)):
+                    continue
+
+                if isinstance(ip, dpkt.ip.IP):
+                    proto = ip.p
+                    src_ip = _ip_to_str(ip.src)
+                    dst_ip = _ip_to_str(ip.dst)
+                else:
+                    proto = ip.nxt
+                    src_ip = _ip_to_str(ip.src)
+                    dst_ip = _ip_to_str(ip.dst)
+
+                flows.append(
+                    {
+                        "timestamp": ts,
+                        "src_ip": src_ip,
+                        "dst_ip": dst_ip,
+                        "protocol": proto,
+                        "length": len(buf),
+                        "pcap_file": os.path.basename(pcap_path),
+                    }
+                )
             except Exception:
-                # 坏包/非IP 包等，直接跳过
-                pass
+                continue
 
-            if progress_cb and total > 0 and (i % 200 == 0 or i == total):
-                progress_cb(int(i * 100 / total))
+            if progress_cb and total_packets > 0:
+                if index % 200 == 0 or index == total_packets:
+                    progress_cb(int(index * 100 / total_packets))
 
     if not flows:
         raise ValueError(f"{pcap_path} 未提取到任何有效数据")
@@ -73,6 +109,7 @@ def extract_features(
 
     if progress_cb:
         progress_cb(100)
+
     return output_csv
 
 
@@ -83,17 +120,12 @@ def extract_features_dir(
     workers: int = 4,
     progress_cb: Optional[Callable[[int], None]] = None,
 ) -> List[str]:
-    """批量提取目录下所有 PCAP/PCAPNG 文件的轻量特征。
-
-    为保持与 UI 的兼容性，``workers`` 参数目前用于接口对齐，实际处理按顺序执行，
-    以便可以正确汇聚每个文件的进度到整体进度回调。
-    """
-
+    """批量提取目录下 PCAP/PCAPNG 文件的轻量特征。"""
     if not os.path.isdir(pcap_dir):
         raise FileNotFoundError(f"目录不存在: {pcap_dir}")
 
     patterns = [os.path.join(pcap_dir, "*.pcap"), os.path.join(pcap_dir, "*.pcapng")]
-    pcap_files = sorted({p for pattern in patterns for p in glob.glob(pattern)})
+    pcap_files = sorted({path for pattern in patterns for path in glob.glob(pattern)})
 
     if not pcap_files:
         raise RuntimeError(f"目录中没有找到 pcap/pcapng 文件: {pcap_dir}")
