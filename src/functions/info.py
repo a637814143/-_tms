@@ -98,7 +98,8 @@ def _select_files(
     batch_size: int,
     start_index: int,
 ) -> List[str]:
-    if files:
+    provided_files = bool(files)
+    if provided_files:
         candidates = [f for f in files if os.path.isfile(f)]
     elif os.path.isdir(path):
         candidates = _list_pcap_files(path)
@@ -111,15 +112,19 @@ def _select_files(
     if mode == "batch":
         if batch_size <= 0:
             raise ValueError("batch_size 必须为正整数")
-        start = max(0, start_index)
-        end = start + batch_size
-        candidates = candidates[start:end]
+        if not provided_files:
+            start = max(0, start_index)
+            end = start + batch_size
+            candidates = candidates[start:end]
     elif mode == "file":
-        start = max(0, start_index)
-        if start < len(candidates):
-            candidates = [candidates[start]]
+        if provided_files:
+            candidates = candidates[:1]
         else:
-            candidates = [candidates[-1]]
+            start = max(0, start_index)
+            if start < len(candidates):
+                candidates = [candidates[start]]
+            else:
+                candidates = [candidates[-1]]
     elif mode == "all":
         pass
     else:  # auto
