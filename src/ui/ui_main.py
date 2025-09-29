@@ -1220,5 +1220,31 @@ class Ui_MainWindow(object):
             self.output_list.setUpdatesEnabled(True)
 
     def retranslateUi(self, MainWindow):
-        _ = QtCore.QCoreApplication.translate
-        MainWindow.setWindowTitle(_("MainWindow", "恶意流量检测系统 — 主功能页面"))
+        _translate = QtCore.QCoreApplication.translate
+        MainWindow.setWindowTitle(_translate("MainWindow", "恶意流量检测系统 — 主功能页面"))
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    """PyQt 主窗口封装，方便直接运行该脚本启动 GUI。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ui = Ui_MainWindow()
+        self.ui.setupUi(self)
+
+
+def main():
+    """启动 Qt 应用并展示主窗口。"""
+    app = QtWidgets.QApplication.instance()
+    owns_app = app is None
+    if owns_app:
+        app = QtWidgets.QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    if owns_app:
+        sys.exit(app.exec_())
+    return window
+
+
+if __name__ == "__main__":
+    main()
