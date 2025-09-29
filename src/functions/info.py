@@ -1,9 +1,9 @@
+"""PCAP 信息提取工具。"""
+
+from __future__ import annotations
+
 import argparse
 import os
-import pandas as pd
-import numpy as np
-from scapy.all import PcapReader, IP, TCP, UDP
-from collections import defaultdict
 import statistics
 import time
 from collections import defaultdict
@@ -13,48 +13,46 @@ import pandas as pd
 from scapy.all import IP, TCP, UDP, PcapReader
 
 
-def get_pcap_features(path):
 def get_pcap_features(
-    path,
+    path: str,
     *,
     progress_cb: Optional[Callable[[int], None]] = None,
     cancel_cb: Optional[Callable[[], bool]] = None,
-):
-    """
-    提取 pcap 文件的流量特征（简化版 CICFlowMeter 特征集）
-    :param path: pcap 文件路径
-    :return: pandas.DataFrame
-    """
+) -> pd.DataFrame:
+    """提取 PCAP 文件的流量特征（简化版 CICFlowMeter 特征集）。"""
     if not os.path.exists(path):
         raise FileNotFoundError(f"文件不存在: {path}")
 
-    flows = defaultdict(lambda: {
-        "fwd_pkts": [],
-        "bwd_pkts": [],
-        "fwd_times": [],
-        "bwd_times": [],
-        "fwd_flags": defaultdict(int),
-        "bwd_flags": defaultdict(int),
-        "fwd_bytes": 0,
-        "bwd_bytes": 0
-    })
+    flows: defaultdict = defaultdict(
+        lambda: {
+            "fwd_pkts": [],
+            "bwd_pkts": [],
+            "fwd_times": [],
+            "bwd_times": [],
+            "fwd_flags": defaultdict(int),
+            "bwd_flags": defaultdict(int),
+            "fwd_bytes": 0,
+            "bwd_bytes": 0,
+        }
+    )
 
     start_time = time.time()
 
-    with PcapReader(path) as pcap:
-        total_packets = 0
-        for _ in pcap:
+    total_packets = 0
+    with PcapReader(path) as reader:
+        for _ in reader:
+            total_packets += 1
             if cancel_cb and cancel_cb():
                 break
-            total_packets += 1
 
     processed = 0
-    with PcapReader(path) as pcap:
-        for pkt in pcap:
+    with PcapReader(path) as reader:
+        for pkt in reader:
             if cancel_cb and cancel_cb():
                 if progress_cb:
                     progress_cb(100)
                 break
+
             if IP not in pkt:
                 continue
 
@@ -82,21 +80,18 @@ def get_pcap_features(
             length = len(pkt)
 
             if key_fwd in flows:
-                # FWD
                 flows[key_fwd]["fwd_pkts"].append(length)
                 flows[key_fwd]["fwd_times"].append(ts)
                 flows[key_fwd]["fwd_bytes"] += length
                 if flags:
                     flows[key_fwd]["fwd_flags"][str(flags)] += 1
             elif key_bwd in flows:
-                # BWD
                 flows[key_bwd]["bwd_pkts"].append(length)
                 flows[key_bwd]["bwd_times"].append(ts)
                 flows[key_bwd]["bwd_bytes"] += length
                 if flags:
                     flows[key_bwd]["bwd_flags"][str(flags)] += 1
             else:
-                # 新流
                 flows[key_fwd]["fwd_pkts"].append(length)
                 flows[key_fwd]["fwd_times"].append(ts)
                 flows[key_fwd]["fwd_bytes"] += length
@@ -108,18 +103,25 @@ def get_pcap_features(
                 if processed % 500 == 0 or processed == total_packets:
                     progress_cb(int(processed * 100 / total_packets))
 
-    # 计算特征
     records = []
     for (src_ip, dst_ip, sport, dport, proto), data in flows.items():
         all_times = data["fwd_times"] + data["bwd_times"]
         if not all_times:
             continue
+
         flow_dur = max(all_times) - min(all_times)
 
-        def safe_mean(x): return statistics.mean(x) if x else 0
-        def safe_std(x): return statistics.pstdev(x) if len(x) > 1 else 0
-        def safe_max(x): return max(x) if x else 0
-        def safe_min(x): return min(x) if x else 0
+        def safe_mean(values):
+            return statistics.mean(values) if values else 0
+
+        def safe_std(values):
+            return statistics.pstdev(values) if len(values) > 1 else 0
+
+        def safe_max(values):
+            return max(values) if values else 0
+
+        def safe_min(values):
+            return min(values) if values else 0
 
         record = {
             "src_ip": src_ip,
@@ -140,21 +142,29 @@ def get_pcap_features(
             "bwd_pkt_len_min": safe_min(data["bwd_pkts"]),
             "bwd_pkt_len_mean": safe_mean(data["bwd_pkts"]),
             "bwd_pkt_len_std": safe_std(data["bwd_pkts"]),
-            "flow_byts_per_s": (sum(data["fwd_pkts"]) + sum(data["bwd_pkts"])) / flow_dur if flow_dur > 0 else 0,
-            "flow_pkts_per_s": (len(data["fwd_pkts"]) + len(data["bwd_pkts"])) / flow_dur if flow_dur > 0 else 0
+            "flow_byts_per_s": (
+                (sum(data["fwd_pkts"]) + sum(data["bwd_pkts"])) / flow_dur if flow_dur > 0 else 0
+            ),
+            "flow_pkts_per_s": (
+                (len(data["fwd_pkts"]) + len(data["bwd_pkts"])) / flow_dur if flow_dur > 0 else 0
+            ),
         }
         records.append(record)
 
     df = pd.DataFrame(records)
-    print(f"[INFO] 提取完成: {len(df)} 条流, 耗时 {time.time() - start_time:.2f}s")
+
     duration = time.time() - start_time
     print(f"[INFO] 提取完成: {len(df)} 条流, 耗时 {duration:.2f}s")
+
+    if progress_cb:
+        progress_cb(100)
+
     return df
 
 
-def _build_parser():
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Extract simplified flow features from a PCAP/PCAPNG file."
+        description="Extract simplified flow features from a PCAP/PCAPNG file.",
     )
     parser.add_argument("pcap", help="Path to the input PCAP/PCAPNG file")
     parser.add_argument(
@@ -172,7 +182,7 @@ def _build_parser():
     return parser
 
 
-def main(argv: Optional[list[str]] = None):
+def main(argv: Optional[list[str]] = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -186,13 +196,11 @@ def main(argv: Optional[list[str]] = None):
         df.to_csv(args.output, index=False, encoding="utf-8")
         print(f"[+] 已写入 CSV: {args.output}")
     else:
-        print(df.head(args.head).to_string(index=False))
+        preview_rows = df.head(args.head)
+        if not preview_rows.empty:
+            print(preview_rows.to_string(index=False))
         print(f"[INFO] 预览 {min(args.head, len(df))} / {len(df)} 条记录")
 
 
 if __name__ == "__main__":
-    # 测试
-    info = get_pcap_features("D:\\Users\\admin\\PycharmProjects\\pythonProject8\\data\\split\\part_00001_20170707200039.pcap")
-    for k, v in info.items():
-        print(f"{k}: {v}")
     main()
