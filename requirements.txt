@@ -2,4 +2,6 @@ pandas
 scikit-learn
 matplotlib
 seaborn
-tkinter 
+tkinter
+dpkt
+PyQt5

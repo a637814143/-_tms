@@ -1,13 +1,9 @@
-from scapy.all import PcapReader, PcapWriter
 import os
 
+from scapy.utils import PcapReader, PcapWriter
+
+
 def split_pcap(input_path, output_dir, packets_per_file=200):
-    """
-    将 pcap 文件分割为多个小文件
-    :param input_path: 原始 pcap 路径
-    :param output_dir: 输出目录
-    :param packets_per_file: 每个小文件的包数量
-    """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
@@ -35,3 +31,9 @@ def split_pcap(input_path, output_dir, packets_per_file=200):
 
 
 parts = split_pcap("data/Friday-WorkingHours.pcap", "data/split", packets_per_file=1000000)
+if __name__ == "__main__":
+    parts = split_pcap(
+        "data/Friday-WorkingHours.pcap",
+        "data/split",
+        packets_per_file=1000000,
+    )
