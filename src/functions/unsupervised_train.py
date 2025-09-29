@@ -1,19 +1,29 @@
-# src/functions/unsupervised_train.py
+"""无监督异常检测训练流程。"""
+
+from __future__ import annotations
+
 import os
-import glob
-import math
-from typing import Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-
-from sklearn.preprocessing import StandardScaler
+from pandas.api.types import is_numeric_dtype
 from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 from joblib import dump
 
-from src.functions.feature_extractor import extract_features
+from src.functions.feature_extractor import extract_features, extract_features_dir
 
-NUMERIC_FEATURES = ["length"]  # 采用轻量特征：每包长度
+META_COLUMNS = {
+    "pcap_file",
+    "flow_id",
+    "src_ip",
+    "dst_ip",
+    "src_port",
+    "dst_port",
+    "protocol",
+}
 
 
 def _is_npz(path: str) -> bool:
@@ -52,23 +62,47 @@ def _load_npz_dataset(dataset_path: str) -> Tuple[np.ndarray, list]:
 
     return X.astype(float), columns
 
-def _ensure_dirs(results_dir: str, models_dir: str):
+
+def _ensure_dirs(results_dir: str, models_dir: str) -> None:
     os.makedirs(results_dir, exist_ok=True)
     os.makedirs(models_dir, exist_ok=True)
 
-def _safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
 
-def _load_or_extract_feature_csv(pcap_path: str, feature_dir: str, progress_cb=None) -> str:
-    base = os.path.splitext(os.path.basename(pcap_path))[0]
-    out_csv = os.path.join(feature_dir, f"{base}_features.csv")
-    os.makedirs(feature_dir, exist_ok=True)
-    if not os.path.exists(out_csv):
-        extract_features(pcap_path, out_csv, progress_cb=None)  # 单文件内部进度无需重复冒泡
-    return out_csv
+def _load_feature_frames(paths: List[str], workers: int) -> List[pd.DataFrame]:
+    if not paths:
+        return []
+
+    def _read_csv(path: str) -> Tuple[str, pd.DataFrame]:
+        try:
+            df = pd.read_csv(path, encoding="utf-8")
+        except UnicodeDecodeError:
+            df = pd.read_csv(path, encoding="gbk")
+        return path, df
+
+    frames: List[Tuple[str, pd.DataFrame]] = []
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = {executor.submit(_read_csv, path): path for path in paths}
+        for future in as_completed(futures):
+            frames.append(future.result())
+
+    frames.sort(key=lambda item: item[0])
+    return [df for _, df in frames]
+
+
+def _prepare_feature_matrix(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
+    numeric_cols: List[str] = []
+    for col in df.columns:
+        if col in META_COLUMNS:
+            continue
+        if is_numeric_dtype(df[col]):
+            numeric_cols.append(col)
+
+    if not numeric_cols:
+        raise RuntimeError("未发现可用于训练的数值特征。")
+
+    matrix = df[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    return matrix.to_numpy(dtype=float, copy=False), numeric_cols
+
 
 def _train_from_dataframe(
     df: pd.DataFrame,
@@ -84,13 +118,7 @@ def _train_from_dataframe(
         raise RuntimeError("训练数据为空。")
 
     working_df = df.copy()
-    for c in NUMERIC_FEATURES:
-        if c in working_df.columns:
-            working_df[c] = working_df[c].apply(_safe_float)
-        else:
-            working_df[c] = 0.0
-
-    X = working_df[NUMERIC_FEATURES].values.astype(float)
+    X, feature_columns = _prepare_feature_matrix(working_df)
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -102,9 +130,11 @@ def _train_from_dataframe(
         warm_start=True,
         n_jobs=-1,
     )
+    if progress_cb:
+        progress_cb(80)
     model.fit(X_scaled)
     if progress_cb:
-        progress_cb(70)
+        progress_cb(90)
 
     scores = model.decision_function(X_scaled)
     preds = model.predict(X_scaled)
@@ -159,6 +189,7 @@ def _train_from_dataframe(
         "flows": len(working_df),
         "malicious": int(is_malicious.sum()),
         "contamination": contamination,
+        "feature_columns": feature_columns,
     }
 
 
@@ -211,17 +242,19 @@ def train_unsupervised_on_split(
     contamination: float = 0.05,
     base_estimators: int = 50,
     progress_cb=None,
+    workers: int = 4,
 ):
     """
     无监督训练：
-    - 优先支持向量化目录/NPZ 数据集（results/vector）
-    - 兼容旧的 split 目录下 PCAP 文件批量训练
+    - 支持直接加载 NPZ 向量数据集
+    - 对 PCAP 目录进行特征提取（多线程）后再训练
     """
 
     _ensure_dirs(results_dir, models_dir)
 
     dataset_path: Optional[str] = None
     pcap_dir: Optional[str] = None
+    pcap_files: List[str] = []
 
     if not split_dir:
         raise FileNotFoundError("未提供训练数据路径")
@@ -231,6 +264,7 @@ def train_unsupervised_on_split(
             dataset_path = split_dir
         elif split_dir.lower().endswith((".pcap", ".pcapng")):
             pcap_dir = os.path.dirname(split_dir) or os.path.abspath(os.path.join(split_dir, os.pardir))
+            pcap_files = [split_dir]
         else:
             raise FileNotFoundError(f"不支持的训练文件: {split_dir}")
     elif os.path.isdir(split_dir):
@@ -256,29 +290,36 @@ def train_unsupervised_on_split(
     feature_dir = os.path.join(results_dir, "features")
     os.makedirs(feature_dir, exist_ok=True)
 
-    pcaps = sorted(glob.glob(os.path.join(pcap_dir, "*.pcap"))) + sorted(
-        glob.glob(os.path.join(pcap_dir, "*.pcapng"))
-    )
-
-    if len(pcaps) == 0:
-        raise RuntimeError(f"未在目录中发现 pcap/pcapng: {pcap_dir}")
-
-    feature_csvs = []
-    for i, pcap in enumerate(pcaps, 1):
-        out_csv = _load_or_extract_feature_csv(pcap, feature_dir)
-        feature_csvs.append(out_csv)
+    feature_csvs: List[str] = []
+    if pcap_files:
+        for idx, pcap in enumerate(pcap_files, 1):
+            base = os.path.splitext(os.path.basename(pcap))[0]
+            csv_path = os.path.join(feature_dir, f"{base}_features.csv")
+            extract_features(pcap, csv_path, progress_cb=None)
+            feature_csvs.append(csv_path)
+            if progress_cb:
+                progress_cb(min(60, int(60 * idx / len(pcap_files))))
+    else:
         if progress_cb:
-            progress_cb(int(min(40, 40 * i / len(pcaps))))
+            def _extract_progress(pct: int) -> None:
+                pct = max(0, min(100, pct))
+                progress_cb(min(60, int(pct * 0.6)))
+        else:
+            _extract_progress = None
 
-    dfs = []
-    for csv_path in feature_csvs:
-        try:
-            df = pd.read_csv(csv_path, encoding="utf-8")
-            dfs.append(df)
-        except Exception as e:
-            print(f"[WARN] 读取特征失败 {csv_path}: {e}")
+        feature_csvs = extract_features_dir(
+            pcap_dir,
+            feature_dir,
+            workers=workers,
+            progress_cb=_extract_progress,
+        )
 
-    if len(dfs) == 0:
+    if progress_cb:
+        progress_cb(70)
+
+    dfs = _load_feature_frames(feature_csvs, workers)
+
+    if not dfs:
         raise RuntimeError("未能读取到任何特征 CSV。")
 
     full_df = pd.concat(dfs, ignore_index=True)
@@ -292,5 +333,3 @@ def train_unsupervised_on_split(
         progress_cb=progress_cb,
         group_column="pcap_file" if "pcap_file" in full_df.columns else None,
     )
-
-
