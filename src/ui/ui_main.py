@@ -1063,9 +1063,17 @@ class Ui_MainWindow(object):
 
     # --------- 训练模型（按顶部路径） ----------
     def _on_train_model(self):
-        path = self.file_edit.text().strip()
-        if not path:
-            QtWidgets.QMessageBox.warning(None, "未选择路径", "请先在顶部选择文件或目录。"); return
+        selected_path = self.file_edit.text().strip()
+        vector_dir = self._vector_out_dir()
+
+        if selected_path and os.path.exists(selected_path):
+            path = selected_path
+        else:
+            path = vector_dir
+            if selected_path:
+                self.display_result(f"[WARN] 选择的路径不存在，自动改用向量目录：{vector_dir}")
+            else:
+                self.display_result(f"[INFO] 未选择路径，默认使用向量目录：{vector_dir}")
 
         res_dir = self._default_results_dir()
         mdl_dir = self._default_models_dir()
