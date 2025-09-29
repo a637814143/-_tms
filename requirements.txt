@@ -5,3 +5,10 @@ seaborn
 tkinter
 dpkt
 PyQt5
+pandas
+scikit-learn
+matplotlib
+seaborn
+dpkt
+scapy
+PyQt5
