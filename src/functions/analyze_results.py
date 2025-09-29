@@ -1,7 +1,8 @@
 # src/functions/analyze_results.py
 import os
-import pandas as pd
+
 import matplotlib.pyplot as plt
+import pandas as pd
 
 def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
     """
@@ -62,6 +63,7 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
     out3 = os.path.join(out_dir, "top20_packets.csv")
     top20.to_csv(out3, index=False, encoding="utf-8")
 
-    if progress_cb: progress_cb(100)
-    return {"plots": [out1, out2], "top20_csv": out3}
+    if progress_cb:
+        progress_cb(100)
 
+    return {"plots": [out1, out2], "top20_csv": out3, "out_dir": out_dir}

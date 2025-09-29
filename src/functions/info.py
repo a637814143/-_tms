@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import statistics
+import tempfile
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Iterable, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 from scapy.all import IP, TCP, UDP, PcapReader
@@ -57,6 +59,93 @@ def _iter_packets(path: str) -> Iterable:
             yield packet
 
 
+def _count_packets(path: str) -> int:
+    total = 0
+    with PcapReader(path) as reader:
+        for _ in reader:
+            total += 1
+    return total
+
+
+def _list_pcap_files(directory: str) -> List[str]:
+    patterns = [os.path.join(directory, "*.pcap"), os.path.join(directory, "*.pcapng")]
+    files: List[str] = []
+    for pattern in patterns:
+        files.extend(glob.glob(pattern))
+    return sorted(files)
+
+
+def _parse_ports(text: str) -> Set[int]:
+    ports: Set[int] = set()
+    for part in text.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if 0 <= value <= 65535:
+            ports.add(value)
+    return ports
+
+
+def _select_files(
+    path: str,
+    *,
+    mode: str,
+    files: Optional[Sequence[str]],
+    batch_size: int,
+    start_index: int,
+) -> List[str]:
+    provided_files = bool(files)
+    if provided_files:
+        candidates = [f for f in files if os.path.isfile(f)]
+    elif os.path.isdir(path):
+        candidates = _list_pcap_files(path)
+    else:
+        candidates = [path]
+
+    if not candidates:
+        raise FileNotFoundError("未在指定路径中找到 pcap/pcapng 文件")
+
+    if mode == "batch":
+        if batch_size <= 0:
+            raise ValueError("batch_size 必须为正整数")
+        if not provided_files:
+            start = max(0, start_index)
+            end = start + batch_size
+            candidates = candidates[start:end]
+    elif mode == "file":
+        if provided_files:
+            candidates = candidates[:1]
+        else:
+            start = max(0, start_index)
+            if start < len(candidates):
+                candidates = [candidates[start]]
+            else:
+                candidates = [candidates[-1]]
+    elif mode == "all":
+        pass
+    else:  # auto
+        if os.path.isdir(path):
+            # 目录按照 all 处理
+            pass
+        else:
+            candidates = candidates[:1]
+
+    return candidates
+
+
+def _write_temp_csv(df: pd.DataFrame) -> Optional[str]:
+    if df.empty:
+        return None
+    fd, temp_path = tempfile.mkstemp(prefix="pcap_info_", suffix=".csv")
+    os.close(fd)
+    df.to_csv(temp_path, index=False, encoding="utf-8")
+    return temp_path
+
+
 def _flow_key(pkt) -> Optional[Tuple[FlowKey, FlowKey, str]]:
     if IP not in pkt:
         return None
@@ -87,68 +176,143 @@ def _flow_key(pkt) -> Optional[Tuple[FlowKey, FlowKey, str]]:
 def get_pcap_features(
     path: str,
     *,
+    workers: int = 1,
+    mode: str = "auto",
+    batch_size: int = 1,
+    start_index: int = 0,
+    files: Optional[Sequence[str]] = None,
+    proto_filter: str = "both",
+    port_whitelist_text: str = "",
+    port_blacklist_text: str = "",
+    fast: bool = False,
     progress_cb: Optional[Callable[[int], None]] = None,
     cancel_cb: Optional[Callable[[], bool]] = None,
 ) -> pd.DataFrame:
-    """提取 PCAP 文件的流量特征，确保兼容 GUI 回调。"""
+    """提取一个或多个 PCAP 文件的流量统计信息，兼容 GUI 所需的参数。"""
 
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"文件不存在: {path}")
+    del workers  # 当前实现为串行，保留参数以兼容 GUI
 
-    flows: Dict[FlowKey, FlowStats] = defaultdict(FlowStats)
-    total_packets = sum(1 for _ in _iter_packets(path))
+    if not path and not files:
+        raise ValueError("必须提供有效的文件路径或文件列表")
+
+    target_files = _select_files(
+        path,
+        mode=mode,
+        files=files,
+        batch_size=batch_size,
+        start_index=start_index,
+    )
+
+    whitelist = _parse_ports(port_whitelist_text)
+    blacklist = _parse_ports(port_blacklist_text)
+
+    if proto_filter not in {"both", "tcp", "udp"}:
+        proto_filter = "both"
+
+    total_packets = 0
+    if not fast:
+        for file_path in target_files:
+            try:
+                total_packets += _count_packets(file_path)
+            except Exception:
+                # 如果计数失败，退化为 fast 模式
+                total_packets = 0
+                break
+
+    flows_map: Dict[Tuple[str, str, int, int, str, str], FlowStats] = defaultdict(FlowStats)
+    file_errors: List[str] = []
+    processed_packets = 0
+
     start_time = time.time()
 
-    processed = 0
-
-    for pkt in _iter_packets(path):
+    for idx, file_path in enumerate(target_files, start=1):
         if cancel_cb and cancel_cb():
             break
 
-        keys = _flow_key(pkt)
-        if keys is None:
+        try:
+            for pkt in _iter_packets(file_path):
+                if cancel_cb and cancel_cb():
+                    break
+
+                keys = _flow_key(pkt)
+                if keys is None:
+                    continue
+
+                key_fwd, key_bwd, flags = keys
+                proto = key_fwd[4]
+                if proto_filter == "tcp" and proto.upper() != "TCP":
+                    continue
+                if proto_filter == "udp" and proto.upper() != "UDP":
+                    continue
+
+                src_port, dst_port = key_fwd[2], key_fwd[3]
+                if whitelist and (src_port not in whitelist and dst_port not in whitelist):
+                    continue
+                if blacklist and (src_port in blacklist or dst_port in blacklist):
+                    continue
+
+                timestamp = float(pkt.time)
+                length = len(pkt)
+
+                flow_key = key_fwd + (os.path.basename(file_path),)
+                reverse_key = key_bwd + (os.path.basename(file_path),)
+
+                if flow_key in flows_map:
+                    flows_map[flow_key].add_packet(
+                        length=length,
+                        timestamp=timestamp,
+                        direction="fwd",
+                        flags=flags,
+                    )
+                elif reverse_key in flows_map:
+                    flows_map[reverse_key].add_packet(
+                        length=length,
+                        timestamp=timestamp,
+                        direction="bwd",
+                        flags=flags,
+                    )
+                else:
+                    flows_map[flow_key].add_packet(
+                        length=length,
+                        timestamp=timestamp,
+                        direction="fwd",
+                        flags=flags,
+                    )
+
+                processed_packets += 1
+                if progress_cb:
+                    if total_packets:
+                        if processed_packets % 500 == 0 or processed_packets == total_packets:
+                            progress_cb(min(99, int(processed_packets * 100 / total_packets)))
+                    elif fast:
+                        # fast 模式仅按文件推进
+                        progress_cb(min(99, int((idx - 1) * 100 / max(1, len(target_files)))))
+
+            if progress_cb and fast:
+                progress_cb(min(99, int(idx * 100 / max(1, len(target_files)))))
+
+        except Exception as exc:
+            file_errors.append(f"[ERROR] 解析失败 {file_path}: {exc}")
             continue
 
-        key_fwd, key_bwd, flags = keys
-        timestamp = float(pkt.time)
-        length = len(pkt)
-
-        if key_fwd in flows:
-            flows[key_fwd].add_packet(
-                length=length, timestamp=timestamp, direction="fwd", flags=flags
-            )
-        elif key_bwd in flows:
-            flows[key_bwd].add_packet(
-                length=length, timestamp=timestamp, direction="bwd", flags=flags
-            )
-        else:
-            flows[key_fwd].add_packet(
-                length=length, timestamp=timestamp, direction="fwd", flags=flags
-            )
-
-        processed += 1
-        if progress_cb and total_packets:
-            if processed % 500 == 0 or processed == total_packets:
-                progress_cb(min(99, int(processed * 100 / total_packets)))
-
     records = []
-    for (src_ip, dst_ip, src_port, dst_port, proto), stats in flows.items():
+    for (src_ip, dst_ip, src_port, dst_port, proto, filename), stats in flows_map.items():
         times = stats.all_times()
         if not times:
             continue
 
         duration = max(times) - min(times)
 
-        def safe_mean(values: list[int]) -> float:
+        def safe_mean(values: List[int]) -> float:
             return statistics.mean(values) if values else 0.0
 
-        def safe_std(values: list[int]) -> float:
+        def safe_std(values: List[int]) -> float:
             return statistics.pstdev(values) if len(values) > 1 else 0.0
 
-        def safe_max(values: list[int]) -> int:
+        def safe_max(values: List[int]) -> int:
             return max(values) if values else 0
 
-        def safe_min(values: list[int]) -> int:
+        def safe_min(values: List[int]) -> int:
             return min(values) if values else 0
 
         total_fwd = sum(stats.forward_lengths)
@@ -157,6 +321,7 @@ def get_pcap_features(
 
         records.append(
             {
+                "pcap_file": filename,
                 "src_ip": src_ip,
                 "dst_ip": dst_ip,
                 "src_port": src_port,
@@ -181,6 +346,11 @@ def get_pcap_features(
         )
 
     df = pd.DataFrame.from_records(records)
+
+    out_csv = _write_temp_csv(df)
+    df.attrs["out_csv"] = out_csv
+    df.attrs["files_total"] = len(target_files)
+    df.attrs["errors"] = "\n".join(file_errors)
 
     if progress_cb:
         progress_cb(100)

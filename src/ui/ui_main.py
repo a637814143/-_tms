@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil
-from typing import List, Optional
+from typing import List, Optional, Set
 from datetime import datetime
 
 # ---- 业务函数（保持导入路径）----
@@ -194,7 +194,7 @@ class TrainWorker(QtCore.QThread):
 
 
 class AnalysisWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
@@ -205,8 +205,12 @@ class AnalysisWorker(QtCore.QThread):
 
     def run(self):
         try:
-            run_analysis(self.results_csv, self.out_dir, progress_cb=self.progress.emit)
-            self.finished.emit(self.out_dir)
+            result = run_analysis(self.results_csv, self.out_dir, progress_cb=self.progress.emit)
+            if not isinstance(result, dict):
+                result = {"out_dir": self.out_dir}
+            elif "out_dir" not in result:
+                result["out_dir"] = self.out_dir
+            self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -1018,15 +1022,66 @@ class Ui_MainWindow(object):
         self.analysis_worker.error.connect(self._on_analysis_error)
         self.analysis_worker.start()
 
-    def _on_analysis_finished(self, out_dir):
+    def _on_analysis_finished(self, result):
         self.btn_analysis.setEnabled(True)
         self.set_button_progress(self.btn_analysis, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_analysis))
+        out_dir = None
+        plot_paths: List[str] = []
+        top20_csv: Optional[str] = None
+
+        if isinstance(result, dict):
+            out_dir = result.get("out_dir") or None
+            plots = result.get("plots") or []
+            if isinstance(plots, (list, tuple)):
+                plot_paths = [p for p in plots if isinstance(p, str)]
+            elif isinstance(plots, str):
+                plot_paths = [plots]
+            top20_csv = result.get("top20_csv") if isinstance(result.get("top20_csv"), str) else None
+        else:
+            out_dir = str(result) if result is not None else None
+
+        if not out_dir:
+            out_dir = self._analysis_out_dir()
+
         self.display_result(f"[INFO] 分析完成，图表保存在 {out_dir}")
-        for n in ["top10_malicious_ratio.png", "anomaly_score_distribution.png", "top20_flows.csv", "summary_by_file.csv"]:
-            p = os.path.join(out_dir, n)
-            if os.path.exists(p): self._add_output(p)
-        self._add_output(out_dir)
+
+        added_paths: Set[str] = set()
+
+        def _mark(path: str):
+            if path and os.path.exists(path) and path not in added_paths:
+                self._add_output(path)
+                added_paths.add(path)
+
+        for p in plot_paths:
+            _mark(p)
+
+        if top20_csv:
+            _mark(top20_csv)
+            if pd is not None and os.path.exists(top20_csv):
+                try:
+                    df = pd.read_csv(top20_csv, encoding="utf-8")
+                    if not df.empty:
+                        self.populate_table_from_df(df)
+                        self._last_out_csv = top20_csv
+                        self._open_csv_paged(top20_csv)
+                except Exception:
+                    pass
+
+        fallback_names = [
+            "top10_malicious_ratio.png",
+            "anomaly_score_distribution.png",
+            "top20_packets.csv",
+        ]
+        for name in fallback_names:
+            _mark(os.path.join(out_dir, name))
+
+        summary_csv = os.path.join(self._default_results_dir(), "summary_by_file.csv")
+        if os.path.exists(summary_csv):
+            _mark(summary_csv)
+
+        if out_dir and os.path.isdir(out_dir):
+            _mark(out_dir)
 
     def _on_analysis_error(self, msg):
         self.btn_analysis.setEnabled(True); self.reset_button_progress(self.btn_analysis)
