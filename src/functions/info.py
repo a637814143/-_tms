@@ -14,7 +14,12 @@ from scapy.all import IP, TCP, UDP, PcapReader
 
 
 def get_pcap_features(path):
-def get_pcap_features(path, *, progress_cb: Optional[Callable[[int], None]] = None):
+def get_pcap_features(
+    path,
+    *,
+    progress_cb: Optional[Callable[[int], None]] = None,
+    cancel_cb: Optional[Callable[[], bool]] = None,
+):
     """
     提取 pcap 文件的流量特征（简化版 CICFlowMeter 特征集）
     :param path: pcap 文件路径
@@ -39,11 +44,17 @@ def get_pcap_features(path, *, progress_cb: Optional[Callable[[int], None]] = No
     with PcapReader(path) as pcap:
         total_packets = 0
         for _ in pcap:
+            if cancel_cb and cancel_cb():
+                break
             total_packets += 1
 
     processed = 0
     with PcapReader(path) as pcap:
         for pkt in pcap:
+            if cancel_cb and cancel_cb():
+                if progress_cb:
+                    progress_cb(100)
+                break
             if IP not in pkt:
                 continue
 

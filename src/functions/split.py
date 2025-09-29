@@ -4,7 +4,7 @@ from scapy.utils import PcapReader, PcapWriter
 
 
 def split_pcap(input_path, output_dir, packets_per_file=200):
-  """Utility helpers for splitting large PCAP files into smaller chunks."""
+"""Utility helpers for splitting large PCAP files into smaller chunks."""
 
 import argparse
 import os

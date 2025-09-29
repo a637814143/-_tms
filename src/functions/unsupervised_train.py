@@ -134,7 +134,7 @@ def train_unsupervised_on_split(
     summary.to_csv(summary_csv, index=False, encoding="utf-8")
 
     # 7) 保存模型与 scaler
-    model_path  = os.path.join(models_dir, "isoforest.joblib")
+    model_path = os.path.join(models_dir, "isoforest.joblib")
     scaler_path = os.path.join(models_dir, "scaler.joblib")
     dump(model, model_path)
     dump(scaler, scaler_path)
@@ -148,6 +148,7 @@ def train_unsupervised_on_split(
         "model_path": model_path,
         "scaler_path": scaler_path,
         "packets": len(full_df),
+        "flows": len(full_df),
         "malicious": int(full_df["is_malicious"].sum()),
         "contamination": contamination
     }
