@@ -8,8 +8,10 @@ import glob
 import os
 import statistics
 import tempfile
+import threading
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -146,6 +148,141 @@ def _write_temp_csv(df: pd.DataFrame) -> Optional[str]:
     return temp_path
 
 
+def _flows_to_records(flows_map: Dict[FlowKey, FlowStats], *, file_name: str) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+
+    for (src_ip, dst_ip, src_port, dst_port, proto), stats in flows_map.items():
+        times = stats.all_times()
+        if not times:
+            continue
+
+        duration = max(times) - min(times)
+
+        def safe_mean(values: List[int]) -> float:
+            return statistics.mean(values) if values else 0.0
+
+        def safe_std(values: List[int]) -> float:
+            return statistics.pstdev(values) if len(values) > 1 else 0.0
+
+        def safe_max(values: List[int]) -> int:
+            return max(values) if values else 0
+
+        def safe_min(values: List[int]) -> int:
+            return min(values) if values else 0
+
+        total_fwd = sum(stats.forward_lengths)
+        total_bwd = sum(stats.backward_lengths)
+        total_packets_flow = len(stats.forward_lengths) + len(stats.backward_lengths)
+
+        records.append(
+            {
+                "pcap_file": file_name,
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "protocol": proto,
+                "flow_duration": duration,
+                "total_fwd_pkts": len(stats.forward_lengths),
+                "total_bwd_pkts": len(stats.backward_lengths),
+                "total_len_fwd_pkts": total_fwd,
+                "total_len_bwd_pkts": total_bwd,
+                "fwd_pkt_len_max": safe_max(stats.forward_lengths),
+                "fwd_pkt_len_min": safe_min(stats.forward_lengths),
+                "fwd_pkt_len_mean": safe_mean(stats.forward_lengths),
+                "fwd_pkt_len_std": safe_std(stats.forward_lengths),
+                "bwd_pkt_len_max": safe_max(stats.backward_lengths),
+                "bwd_pkt_len_min": safe_min(stats.backward_lengths),
+                "bwd_pkt_len_mean": safe_mean(stats.backward_lengths),
+                "bwd_pkt_len_std": safe_std(stats.backward_lengths),
+                "flow_byts_per_s": (total_fwd + total_bwd) / duration if duration > 0 else 0.0,
+                "flow_pkts_per_s": total_packets_flow / duration if duration > 0 else 0.0,
+            }
+        )
+
+    return records
+
+
+def _process_file(
+    file_path: str,
+    *,
+    proto_filter: str,
+    whitelist: Set[int],
+    blacklist: Set[int],
+    cancel_cb: Optional[Callable[[], bool]],
+    cancel_event: threading.Event,
+    progress_hook: Optional[Callable[[int], None]],
+) -> Tuple[List[Dict[str, object]], int, Optional[str], bool]:
+    flows_map: Dict[FlowKey, FlowStats] = defaultdict(FlowStats)
+    processed = 0
+    last_reported = 0
+    cancelled = False
+
+    try:
+        for pkt in _iter_packets(file_path):
+            if cancel_event.is_set() or (cancel_cb and cancel_cb()):
+                cancel_event.set()
+                cancelled = True
+                break
+
+            keys = _flow_key(pkt)
+            if keys is None:
+                continue
+
+            key_fwd, key_bwd, flags = keys
+            proto = key_fwd[4]
+            if proto_filter == "tcp" and proto.upper() != "TCP":
+                continue
+            if proto_filter == "udp" and proto.upper() != "UDP":
+                continue
+
+            src_port, dst_port = key_fwd[2], key_fwd[3]
+            if whitelist and (src_port not in whitelist and dst_port not in whitelist):
+                continue
+            if blacklist and (src_port in blacklist or dst_port in blacklist):
+                continue
+
+            timestamp = float(pkt.time)
+            length = len(pkt)
+
+            if key_fwd in flows_map:
+                flows_map[key_fwd].add_packet(
+                    length=length,
+                    timestamp=timestamp,
+                    direction="fwd",
+                    flags=flags,
+                )
+            elif key_bwd in flows_map:
+                flows_map[key_bwd].add_packet(
+                    length=length,
+                    timestamp=timestamp,
+                    direction="bwd",
+                    flags=flags,
+                )
+            else:
+                flows_map[key_fwd].add_packet(
+                    length=length,
+                    timestamp=timestamp,
+                    direction="fwd",
+                    flags=flags,
+                )
+
+            processed += 1
+            if progress_hook and processed - last_reported >= 200:
+                progress_hook(processed - last_reported)
+                last_reported = processed
+
+        if progress_hook and processed > last_reported:
+            progress_hook(processed - last_reported)
+
+    except Exception as exc:
+        return [], processed, f"[ERROR] 解析失败 {file_path}: {exc}", cancelled
+
+    file_name = os.path.basename(file_path)
+    records = _flows_to_records(flows_map, file_name=file_name)
+    return records, processed, None, cancelled
+
+
 def _flow_key(pkt) -> Optional[Tuple[FlowKey, FlowKey, str]]:
     if IP not in pkt:
         return None
@@ -190,8 +327,6 @@ def get_pcap_features(
 ) -> pd.DataFrame:
     """提取一个或多个 PCAP 文件的流量统计信息，兼容 GUI 所需的参数。"""
 
-    del workers  # 当前实现为串行，保留参数以兼容 GUI
-
     if not path and not files:
         raise ValueError("必须提供有效的文件路径或文件列表")
 
@@ -219,131 +354,100 @@ def get_pcap_features(
                 total_packets = 0
                 break
 
-    flows_map: Dict[Tuple[str, str, int, int, str, str], FlowStats] = defaultdict(FlowStats)
+    workers = max(1, int(workers))
     file_errors: List[str] = []
+    cancel_event = threading.Event()
     processed_packets = 0
+    last_emit_pct = -1
+    completed_files = 0
+    progress_lock = threading.Lock()
+
+    def _packet_progress(delta: int) -> None:
+        nonlocal processed_packets, last_emit_pct
+        if not progress_cb or total_packets <= 0:
+            return
+        if delta <= 0:
+            return
+        with progress_lock:
+            processed_packets += delta
+            pct = min(99, int(processed_packets * 100 / total_packets)) if total_packets else 0
+            if pct != last_emit_pct:
+                last_emit_pct = pct
+                progress_cb(pct)
+
+    def _file_progress() -> None:
+        nonlocal completed_files
+        if not progress_cb or total_packets > 0:
+            return
+        with progress_lock:
+            completed_files += 1
+            pct = min(99, int(completed_files * 100 / max(1, len(target_files))))
+            progress_cb(pct)
 
     start_time = time.time()
+    records: List[Dict[str, object]] = []
 
-    for idx, file_path in enumerate(target_files, start=1):
-        if cancel_cb and cancel_cb():
-            break
+    use_pool = workers > 1 and len(target_files) > 1
 
-        try:
-            for pkt in _iter_packets(file_path):
-                if cancel_cb and cancel_cb():
-                    break
-
-                keys = _flow_key(pkt)
-                if keys is None:
-                    continue
-
-                key_fwd, key_bwd, flags = keys
-                proto = key_fwd[4]
-                if proto_filter == "tcp" and proto.upper() != "TCP":
-                    continue
-                if proto_filter == "udp" and proto.upper() != "UDP":
-                    continue
-
-                src_port, dst_port = key_fwd[2], key_fwd[3]
-                if whitelist and (src_port not in whitelist and dst_port not in whitelist):
-                    continue
-                if blacklist and (src_port in blacklist or dst_port in blacklist):
-                    continue
-
-                timestamp = float(pkt.time)
-                length = len(pkt)
-
-                flow_key = key_fwd + (os.path.basename(file_path),)
-                reverse_key = key_bwd + (os.path.basename(file_path),)
-
-                if flow_key in flows_map:
-                    flows_map[flow_key].add_packet(
-                        length=length,
-                        timestamp=timestamp,
-                        direction="fwd",
-                        flags=flags,
-                    )
-                elif reverse_key in flows_map:
-                    flows_map[reverse_key].add_packet(
-                        length=length,
-                        timestamp=timestamp,
-                        direction="bwd",
-                        flags=flags,
-                    )
-                else:
-                    flows_map[flow_key].add_packet(
-                        length=length,
-                        timestamp=timestamp,
-                        direction="fwd",
-                        flags=flags,
-                    )
-
-                processed_packets += 1
-                if progress_cb:
-                    if total_packets:
-                        if processed_packets % 500 == 0 or processed_packets == total_packets:
-                            progress_cb(min(99, int(processed_packets * 100 / total_packets)))
-                    elif fast:
-                        # fast 模式仅按文件推进
-                        progress_cb(min(99, int((idx - 1) * 100 / max(1, len(target_files)))))
-
-            if progress_cb and fast:
-                progress_cb(min(99, int(idx * 100 / max(1, len(target_files)))))
-
-        except Exception as exc:
-            file_errors.append(f"[ERROR] 解析失败 {file_path}: {exc}")
-            continue
-
-    records = []
-    for (src_ip, dst_ip, src_port, dst_port, proto, filename), stats in flows_map.items():
-        times = stats.all_times()
-        if not times:
-            continue
-
-        duration = max(times) - min(times)
-
-        def safe_mean(values: List[int]) -> float:
-            return statistics.mean(values) if values else 0.0
-
-        def safe_std(values: List[int]) -> float:
-            return statistics.pstdev(values) if len(values) > 1 else 0.0
-
-        def safe_max(values: List[int]) -> int:
-            return max(values) if values else 0
-
-        def safe_min(values: List[int]) -> int:
-            return min(values) if values else 0
-
-        total_fwd = sum(stats.forward_lengths)
-        total_bwd = sum(stats.backward_lengths)
-        total_packets_flow = len(stats.forward_lengths) + len(stats.backward_lengths)
-
-        records.append(
-            {
-                "pcap_file": filename,
-                "src_ip": src_ip,
-                "dst_ip": dst_ip,
-                "src_port": src_port,
-                "dst_port": dst_port,
-                "protocol": proto,
-                "flow_duration": duration,
-                "total_fwd_pkts": len(stats.forward_lengths),
-                "total_bwd_pkts": len(stats.backward_lengths),
-                "total_len_fwd_pkts": total_fwd,
-                "total_len_bwd_pkts": total_bwd,
-                "fwd_pkt_len_max": safe_max(stats.forward_lengths),
-                "fwd_pkt_len_min": safe_min(stats.forward_lengths),
-                "fwd_pkt_len_mean": safe_mean(stats.forward_lengths),
-                "fwd_pkt_len_std": safe_std(stats.forward_lengths),
-                "bwd_pkt_len_max": safe_max(stats.backward_lengths),
-                "bwd_pkt_len_min": safe_min(stats.backward_lengths),
-                "bwd_pkt_len_mean": safe_mean(stats.backward_lengths),
-                "bwd_pkt_len_std": safe_std(stats.backward_lengths),
-                "flow_byts_per_s": (total_fwd + total_bwd) / duration if duration > 0 else 0.0,
-                "flow_pkts_per_s": total_packets_flow / duration if duration > 0 else 0.0,
+    if use_pool:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_file = {
+                executor.submit(
+                    _process_file,
+                    file_path,
+                    proto_filter=proto_filter,
+                    whitelist=whitelist,
+                    blacklist=blacklist,
+                    cancel_cb=cancel_cb,
+                    cancel_event=cancel_event,
+                    progress_hook=_packet_progress if total_packets and not fast else None,
+                ): file_path
+                for file_path in target_files
             }
-        )
+
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                try:
+                    recs, processed, err, cancelled = future.result()
+                    if recs:
+                        records.extend(recs)
+                    if err:
+                        file_errors.append(err)
+                    if total_packets <= 0 or fast:
+                        _file_progress()
+                    if cancelled:
+                        cancel_event.set()
+                        break
+                except Exception as exc:
+                    file_errors.append(f"[ERROR] 解析失败 {file_path}: {exc}")
+                    if total_packets <= 0 or fast:
+                        _file_progress()
+                if cancel_event.is_set():
+                    break
+    else:
+        for file_path in target_files:
+            if cancel_event.is_set() or (cancel_cb and cancel_cb()):
+                cancel_event.set()
+                break
+
+            recs, processed, err, cancelled = _process_file(
+                file_path,
+                proto_filter=proto_filter,
+                whitelist=whitelist,
+                blacklist=blacklist,
+                cancel_cb=cancel_cb,
+                cancel_event=cancel_event,
+                progress_hook=_packet_progress if total_packets and not fast else None,
+            )
+            if recs:
+                records.extend(recs)
+            if err:
+                file_errors.append(err)
+            if total_packets <= 0 or fast:
+                _file_progress()
+            if cancelled:
+                cancel_event.set()
+                break
 
     df = pd.DataFrame.from_records(records)
 
