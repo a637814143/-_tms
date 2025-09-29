@@ -99,7 +99,7 @@ class RowHighlighter(QtWidgets.QStyledItemDelegate):
                 tag = ""
             if tag:
                 painter.save()
-                painter.fillRect(option.rect, QtGui.QColor(255, 247, 204))
+                painter.fillRect(option.rect, QtGui.QColor(255, 204, 204))
                 painter.restore()
         super().paint(painter, option, index)
 
@@ -112,7 +112,7 @@ class RowHighlighter(QtWidgets.QStyledItemDelegate):
             except Exception:
                 tag = ""
             if tag:
-                QtWidgets.QToolTip.showText(event.globalPos(), f"标注：{tag}")
+                QtWidgets.QToolTip.showText(event.globalPos(), f"自动标注：{tag}")
                 return True
         return super().helpEvent(event, view, option, index)
 
@@ -335,7 +335,6 @@ class Ui_MainWindow(object):
         self._build_param_panel()
         self._build_center_tabs()
         self._build_paging_toolbar()
-        self._build_tag_toolbar()
         self._build_output_list()
         self._build_footer()
 
@@ -353,7 +352,6 @@ class Ui_MainWindow(object):
         # 状态缓存
         self._last_preview_df: Optional["pd.DataFrame"] = None
         self._last_out_csv: Optional[str] = None
-        self._last_tagged_csv: Optional[str] = None
 
         # 分页状态
         self._csv_paged_path: Optional[str] = None
@@ -498,28 +496,6 @@ class Ui_MainWindow(object):
 
         self.left_layout.addWidget(bar)
 
-    def _build_tag_toolbar(self):
-        group = QtWidgets.QGroupBox("快速筛选 / 标注（对当前表格）")
-        gl = QtWidgets.QGridLayout(group)
-        gl.setContentsMargins(10, 6, 10, 8)
-        gl.setHorizontalSpacing(10); gl.setVerticalSpacing(6)
-
-        self.btn_tag_scan = QtWidgets.QPushButton("标注扫描/探测")
-        self.btn_tag_udpflood = QtWidgets.QPushButton("标注 UDP Flood")
-        self.btn_tag_beacon = QtWidgets.QPushButton("标注 Beacon")
-        self.btn_tag_exfil = QtWidgets.QPushButton("标注外泄")
-        self.btn_tag_clear = QtWidgets.QPushButton("清除标注")
-        self.btn_tag_export = QtWidgets.QPushButton("导出带标注 CSV")
-
-        gl.addWidget(self.btn_tag_scan, 0, 0, 1, 2)
-        gl.addWidget(self.btn_tag_udpflood, 0, 2, 1, 2)
-        gl.addWidget(self.btn_tag_beacon, 1, 0, 1, 2)
-        gl.addWidget(self.btn_tag_exfil, 1, 2, 1, 2)
-        gl.addWidget(self.btn_tag_clear, 2, 0, 1, 2)
-        gl.addWidget(self.btn_tag_export, 2, 2, 1, 2)
-
-        self.left_layout.addWidget(group)
-
     def _build_output_list(self):
         self.out_group = QtWidgets.QGroupBox("输出文件（双击打开所在目录，右键复制路径）")
         og = QtWidgets.QVBoxLayout(self.out_group)
@@ -591,13 +567,6 @@ class Ui_MainWindow(object):
         self.btn_page_next.clicked.connect(self._on_page_next)
         self.page_size_spin.valueChanged.connect(self._on_page_size_changed)
         self.btn_show_all.clicked.connect(self._show_full_preview)
-
-        self.btn_tag_scan.clicked.connect(lambda: self._apply_tag("scan/probing"))
-        self.btn_tag_udpflood.clicked.connect(lambda: self._apply_tag("udp_flood"))
-        self.btn_tag_beacon.clicked.connect(lambda: self._apply_tag("beacon"))
-        self.btn_tag_exfil.clicked.connect(lambda: self._apply_tag("exfiltration"))
-        self.btn_tag_clear.clicked.connect(lambda: self._apply_tag(""))
-        self.btn_tag_export.clicked.connect(self._export_tagged_csv)
 
         self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
         self.output_list.itemDoubleClicked.connect(self._on_output_double_click)
@@ -712,7 +681,7 @@ class Ui_MainWindow(object):
 
     def _show_full_preview(self):
         csv_path = None
-        for p in [self._csv_paged_path, self._last_tagged_csv, self._last_out_csv]:
+        for p in [self._csv_paged_path, self._last_out_csv]:
             if p and os.path.exists(p): csv_path = p; break
         if not csv_path:
             QtWidgets.QMessageBox.warning(None, "没有 CSV", "请先查看流量信息或导出带标注 CSV。"); return
@@ -728,8 +697,117 @@ class Ui_MainWindow(object):
             app.restoreOverrideCursor()
 
     # --------- 表格渲染 ----------
+    def _auto_tag_dataframe(self, df: "pd.DataFrame"):
+        if pd is None or df is None:
+            return df
+        if df.empty:
+            return df
+
+        tag_col = "__TAG__"
+        df[tag_col] = ""
+
+        def _ensure_mask(mask):
+            if isinstance(mask, pd.Series):
+                return mask.fillna(False)
+            return pd.Series(mask, index=df.index).fillna(False)
+
+        def _append_reason(mask, reason: str):
+            mask = _ensure_mask(mask)
+            if not mask.any():
+                return
+            current = df.loc[mask, tag_col].astype(str)
+            df.loc[mask, tag_col] = [
+                reason if not s or not s.strip() else f"{s};{reason}"
+                for s in current
+            ]
+
+        def _append_reason_from_values(mask, values: "pd.Series", prefix: str):
+            mask = _ensure_mask(mask)
+            if not mask.any():
+                return
+            if not isinstance(values, pd.Series):
+                values = pd.Series(values, index=df.index)
+            vals = values.loc[mask].astype(str).str.strip().str[:40]
+            current = df.loc[mask, tag_col].astype(str)
+            df.loc[mask, tag_col] = [
+                (f"{prefix}{val}" if not s or not s.strip() else f"{s};{prefix}{val}")
+                for s, val in zip(current, vals)
+            ]
+
+        if "prediction" in df.columns:
+            series = df["prediction"]
+            try:
+                if pd.api.types.is_numeric_dtype(series):
+                    mask_pred = pd.to_numeric(series, errors="coerce").fillna(0) < 0
+                else:
+                    text = series.astype(str).str.lower()
+                    mask_pred = text.isin({"-1", "anomaly", "abnormal", "malicious", "恶意", "异常"}) | text.str.contains(
+                        "attack|threat|anomaly|异常|恶意", case=False, na=False
+                    )
+            except Exception:
+                mask_pred = pd.Series(False, index=df.index)
+            _append_reason(mask_pred, "模型预测异常")
+
+        if "anomaly_score" in df.columns:
+            series = pd.to_numeric(df["anomaly_score"], errors="coerce")
+            finite = series.dropna()
+            if not finite.empty:
+                if (finite <= 0).any() and (finite >= 0).any():
+                    threshold = 0
+                else:
+                    threshold = finite.quantile(0.98) if len(finite) > 10 else finite.max()
+                mask_score = series > threshold
+                _append_reason(mask_score, "异常得分偏高")
+
+        bool_like_names = {
+            "is_anomaly",
+            "anomaly",
+            "is_attack",
+            "is_malicious",
+            "malicious",
+            "threat",
+        }
+        for col in df.columns:
+            if str(col).lower() in bool_like_names:
+                series = df[col].astype(str).str.strip().str.lower()
+                mask_bool = series.isin({"1", "true", "yes", "y", "异常", "恶意", "attack", "malicious", "是"})
+                _append_reason(mask_bool, f"{col} 指示异常")
+
+        suspicious_column_keywords = ("label", "result", "status", "type", "attack", "threat", "alert", "category", "tag")
+        safe_values = {"", "normal", "benign", "none", "ok", "-", "合法", "正常", "无"}
+        safe_values = {s.lower() for s in safe_values}
+        suspicious_values = [
+            "异常", "攻击", "恶意", "malicious", "threat", "suspicious", "可疑", "beacon", "flood",
+            "bot", "c2", "command", "shell", "scan", "exploit", "入侵", "泄露", "exfil"
+        ]
+
+        for col in df.columns:
+            lower = str(col).lower()
+            if lower == tag_col.lower():
+                continue
+            if any(key in lower for key in suspicious_column_keywords):
+                try:
+                    text_series = df[col].astype(str).str.strip()
+                except Exception:
+                    continue
+
+                def _is_suspicious(value: str) -> bool:
+                    if not value:
+                        return False
+                    lv = value.lower()
+                    if lv in safe_values:
+                        return False
+                    return any(keyword in lv for keyword in suspicious_values)
+
+                mask = text_series.apply(_is_suspicious)
+                _append_reason_from_values(mask, text_series, f"{col}: ")
+
+        return df
+
     def populate_table_from_df(self, df: "pd.DataFrame"):
         if pd is None: raise RuntimeError("pandas required")
+        if pd is not None and isinstance(df, pd.DataFrame):
+            df = self._auto_tag_dataframe(df)
         self._last_preview_df = df
         show_df = df.head(PREVIEW_LIMIT_FOR_TABLE).copy() if (len(df) > PREVIEW_LIMIT_FOR_TABLE and not self._csv_paged_path) else df
         self.table_view.setUpdatesEnabled(False)
@@ -820,6 +898,9 @@ class Ui_MainWindow(object):
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_view))
         self.worker = None
 
+        if pd is not None and isinstance(df, pd.DataFrame):
+            df = self._auto_tag_dataframe(df)
+
         out_csv = getattr(df, "attrs", {}).get("out_csv", None)
         files_total = getattr(df, "attrs", {}).get("files_total", None)
         errs = getattr(df, "attrs", {}).get("errors", "")
@@ -886,54 +967,6 @@ class Ui_MainWindow(object):
         self._add_output(outp)
         self.display_result(f"[INFO] 已导出异常CSV：{outp}")
         self._open_csv_paged(outp)
-
-    # --------- 标注 ----------
-    def _apply_tag(self, tag_value: str):
-        model = self.table_view.model()
-        if model is None: return
-        try:
-            src: PandasFrameModel = model.sourceModel()  # type: ignore
-            df = getattr(src, "_df", None)
-        except Exception:
-            df = None
-        if df is None or df.empty: return
-
-        sel = self.table_view.selectionModel().selectedRows()
-        if not sel:
-            QtWidgets.QMessageBox.information(None, "未选择行", "请在表格中选择要标注的行。"); return
-
-        if "__TAG__" not in df.columns: df["__TAG__"] = ""
-        rows = [r.row() for r in sel]
-        for r in rows:
-            try:
-                df.iat[r, df.columns.get_loc("__TAG__")] = tag_value
-            except Exception:
-                pass
-
-        self.populate_table_from_df(df)
-        self.display_result(f"[INFO] 已对 {len(rows)} 行设置标签：{tag_value if tag_value else '清除'}")
-
-    def _export_tagged_csv(self):
-        if self._csv_paged_path and os.path.exists(self._csv_paged_path):
-            base_df = pd.read_csv(self._csv_paged_path, encoding="utf-8")
-        else:
-            df = self._last_preview_df
-            if df is None or (hasattr(df, "empty") and df.empty):
-                QtWidgets.QMessageBox.warning(None, "没有可导出的数据", "请先查看流量信息。"); return
-            base_df = df.copy()
-
-        cur_df = self._last_preview_df
-        if cur_df is not None and "__TAG__" in cur_df.columns:
-            if "__TAG__" not in base_df.columns: base_df["__TAG__"] = ""
-            n = min(len(base_df), len(cur_df))
-            base_df.loc[:n - 1, "__TAG__"] = cur_df["__TAG__"].values[:n]
-
-        default = os.path.join(self._abnormal_out_dir(), f"pcap_info_tagged_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-        base_df.to_csv(default, index=False, encoding="utf-8")
-        self._last_tagged_csv = default
-        self._add_output(default)
-        self.display_result(f"[INFO] 已导出带标注 CSV：{default}")
-        self._open_csv_paged(default)
 
     # --------- 提取特征（按顶部路径） ----------
     def _on_extract_features(self):
@@ -1370,7 +1403,6 @@ class Ui_MainWindow(object):
             self.page_info.setText("第 0/0 页")
             self._last_preview_df = None
             self._last_out_csv = None
-            self._last_tagged_csv = None
             self.reset_button_progress(self.btn_view)
             self.reset_button_progress(self.btn_fe)
             self.reset_button_progress(self.btn_vector)
