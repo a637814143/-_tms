@@ -32,6 +32,9 @@ def split_pcap(input_path, output_dir, packets_per_file=200):
         writer.close()
 
     print(f"[+] 完成分割: 共 {part_num} 个文件")
-
-
-parts = split_pcap("data/Friday-WorkingHours.pcap", "data/split", packets_per_file=1000000)
+if __name__ == "__main__":
+    parts = split_pcap(
+        "data/Friday-WorkingHours.pcap",
+        "data/split",
+        packets_per_file=1000000,
+    )
