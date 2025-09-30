@@ -6,13 +6,12 @@ from __future__ import annotations
 import argparse
 import glob
 import os
-import statistics
 import tempfile
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
@@ -25,12 +24,12 @@ FlowKey = Tuple[str, str, int, int, str]
 class FlowStats:
     """记录单条网络流的基础统计信息。"""
 
-    forward_lengths: list[int] = field(default_factory=list)
-    backward_lengths: list[int] = field(default_factory=list)
-    forward_times: list[float] = field(default_factory=list)
-    backward_times: list[float] = field(default_factory=list)
-    forward_flags: Counter[str] = field(default_factory=Counter)
-    backward_flags: Counter[str] = field(default_factory=Counter)
+    forward_packets: int = 0
+    backward_packets: int = 0
+    forward_bytes: int = 0
+    backward_bytes: int = 0
+    min_time: Optional[float] = None
+    max_time: Optional[float] = None
 
     def add_packet(
         self,
@@ -38,21 +37,18 @@ class FlowStats:
         length: int,
         timestamp: float,
         direction: str,
-        flags: Optional[str] = None,
     ) -> None:
         if direction == "fwd":
-            self.forward_lengths.append(length)
-            self.forward_times.append(timestamp)
-            if flags:
-                self.forward_flags[flags] += 1
+            self.forward_packets += 1
+            self.forward_bytes += length
         else:
-            self.backward_lengths.append(length)
-            self.backward_times.append(timestamp)
-            if flags:
-                self.backward_flags[flags] += 1
+            self.backward_packets += 1
+            self.backward_bytes += length
 
-    def all_times(self) -> list[float]:
-        return self.forward_times + self.backward_times
+        if self.min_time is None or timestamp < self.min_time:
+            self.min_time = timestamp
+        if self.max_time is None or timestamp > self.max_time:
+            self.max_time = timestamp
 
 
 def _iter_packets(path: str) -> Iterable:
@@ -152,27 +148,13 @@ def _flows_to_records(flows_map: Dict[FlowKey, FlowStats], *, file_name: str) ->
     records: List[Dict[str, object]] = []
 
     for (src_ip, dst_ip, src_port, dst_port, proto), stats in flows_map.items():
-        times = stats.all_times()
-        if not times:
+        if stats.min_time is None or stats.max_time is None:
             continue
 
-        duration = max(times) - min(times)
-
-        def safe_mean(values: List[int]) -> float:
-            return statistics.mean(values) if values else 0.0
-
-        def safe_std(values: List[int]) -> float:
-            return statistics.pstdev(values) if len(values) > 1 else 0.0
-
-        def safe_max(values: List[int]) -> int:
-            return max(values) if values else 0
-
-        def safe_min(values: List[int]) -> int:
-            return min(values) if values else 0
-
-        total_fwd = sum(stats.forward_lengths)
-        total_bwd = sum(stats.backward_lengths)
-        total_packets_flow = len(stats.forward_lengths) + len(stats.backward_lengths)
+        duration = stats.max_time - stats.min_time
+        total_fwd = stats.forward_bytes
+        total_bwd = stats.backward_bytes
+        total_packets_flow = stats.forward_packets + stats.backward_packets
 
         records.append(
             {
@@ -183,18 +165,10 @@ def _flows_to_records(flows_map: Dict[FlowKey, FlowStats], *, file_name: str) ->
                 "dst_port": dst_port,
                 "protocol": proto,
                 "flow_duration": duration,
-                "total_fwd_pkts": len(stats.forward_lengths),
-                "total_bwd_pkts": len(stats.backward_lengths),
+                "total_fwd_pkts": stats.forward_packets,
+                "total_bwd_pkts": stats.backward_packets,
                 "total_len_fwd_pkts": total_fwd,
                 "total_len_bwd_pkts": total_bwd,
-                "fwd_pkt_len_max": safe_max(stats.forward_lengths),
-                "fwd_pkt_len_min": safe_min(stats.forward_lengths),
-                "fwd_pkt_len_mean": safe_mean(stats.forward_lengths),
-                "fwd_pkt_len_std": safe_std(stats.forward_lengths),
-                "bwd_pkt_len_max": safe_max(stats.backward_lengths),
-                "bwd_pkt_len_min": safe_min(stats.backward_lengths),
-                "bwd_pkt_len_mean": safe_mean(stats.backward_lengths),
-                "bwd_pkt_len_std": safe_std(stats.backward_lengths),
                 "flow_byts_per_s": (total_fwd + total_bwd) / duration if duration > 0 else 0.0,
                 "flow_pkts_per_s": total_packets_flow / duration if duration > 0 else 0.0,
             }
@@ -229,7 +203,7 @@ def _process_file(
             if keys is None:
                 continue
 
-            key_fwd, key_bwd, flags = keys
+            key_fwd, key_bwd = keys
             proto = key_fwd[4]
             if proto_filter == "tcp" and proto.upper() != "TCP":
                 continue
@@ -250,21 +224,18 @@ def _process_file(
                     length=length,
                     timestamp=timestamp,
                     direction="fwd",
-                    flags=flags,
                 )
             elif key_bwd in flows_map:
                 flows_map[key_bwd].add_packet(
                     length=length,
                     timestamp=timestamp,
                     direction="bwd",
-                    flags=flags,
                 )
             else:
                 flows_map[key_fwd].add_packet(
                     length=length,
                     timestamp=timestamp,
                     direction="fwd",
-                    flags=flags,
                 )
 
             processed += 1
@@ -283,7 +254,7 @@ def _process_file(
     return records, processed, None, cancelled
 
 
-def _flow_key(pkt) -> Optional[Tuple[FlowKey, FlowKey, str]]:
+def _flow_key(pkt) -> Optional[Tuple[FlowKey, FlowKey]]:
     if IP not in pkt:
         return None
 
@@ -306,8 +277,7 @@ def _flow_key(pkt) -> Optional[Tuple[FlowKey, FlowKey, str]]:
     dst_port = int(layer.dport)
     forward = (pkt[IP].src, pkt[IP].dst, src_port, dst_port, proto)
     backward = (pkt[IP].dst, pkt[IP].src, dst_port, src_port, proto)
-    flags = str(layer.flags) if hasattr(layer, "flags") else ""
-    return forward, backward, flags
+    return forward, backward
 
 
 def get_pcap_features(
