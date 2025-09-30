@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import glob
+import importlib
+import importlib.util
 import os
 import tempfile
 import threading
@@ -12,10 +14,26 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from types import ModuleType
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-import pandas as pd
-from scapy.all import IP, TCP, UDP, PcapReader
+
+def _load_module(module_path: str, friendly_name: Optional[str] = None) -> ModuleType:
+    """Load a module dynamically and provide a clear error message when missing."""
+
+    spec = importlib.util.find_spec(module_path)
+    if spec is None:
+        display = friendly_name or module_path
+        raise ImportError(f"缺少依赖: 请先安装 {display}")
+    return importlib.import_module(module_path)
+
+
+pd: Any = _load_module("pandas", friendly_name="pandas")
+_scapy: Any = _load_module("scapy.all", friendly_name="scapy")
+IP = _scapy.IP
+TCP = _scapy.TCP
+UDP = _scapy.UDP
+PcapReader = _scapy.PcapReader
 
 FlowKey = Tuple[str, str, int, int, str]
 
