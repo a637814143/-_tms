@@ -158,7 +158,7 @@ class FeatureWorker(QtCore.QThread):
 
 
 class DirFeatureWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(list)
+    finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
@@ -170,8 +170,8 @@ class DirFeatureWorker(QtCore.QThread):
 
     def run(self):
         try:
-            csvs = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
-            self.finished.emit(csvs)
+            result = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
+            self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -886,6 +886,7 @@ class Ui_MainWindow(object):
             files=file_list if os.path.isdir(path) else None,
             proto_filter=proto, port_whitelist_text=wl, port_blacklist_text=bl,
             fast=True,
+            fast_time_budget=1.0,
         )
         self.worker.progress.connect(lambda p: self.set_button_progress(self.btn_view, p))
         self.worker.finished.connect(self._on_worker_finished)
@@ -904,6 +905,7 @@ class Ui_MainWindow(object):
         out_csv = getattr(df, "attrs", {}).get("out_csv", None)
         files_total = getattr(df, "attrs", {}).get("files_total", None)
         errs = getattr(df, "attrs", {}).get("errors", "")
+        fast_summary = getattr(df, "attrs", {}).get("fast_summary", False)
 
         dst_dir = self._default_csv_info_dir()
         os.makedirs(dst_dir, exist_ok=True)
@@ -930,7 +932,21 @@ class Ui_MainWindow(object):
                 head_txt = df.head(20).to_string()
             except Exception:
                 head_txt = "(预览生成失败)"
-            self.display_result(f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}", append=False)
+            if fast_summary:
+                truncated_count = 0
+                if hasattr(df, "columns") and "truncated" in df.columns:
+                    try:
+                        truncated_count = int(df["truncated"].sum())
+                    except Exception:
+                        truncated_count = 0
+                note = "（快速模式，仅展示核心统计" + (
+                    f"；其中 {truncated_count} 个因时间限制被截断" if truncated_count else ""
+                ) + "）"
+            else:
+                note = "（表格仅显示前 {limit} 行；全部已写入 CSV）".format(
+                    limit=PREVIEW_LIMIT_FOR_TABLE
+                )
+            self.display_result(f"[INFO] 解析完成{note}.\n{head_txt}", append=False)
             rows = len(df) if hasattr(df, "__len__") else 0
             self.bottom_label.setText(f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个  @2025")
         if errs:
@@ -1010,22 +1026,35 @@ class Ui_MainWindow(object):
         except Exception:
             pass
 
-    def _on_fe_dir_finished(self, csv_list: List[str]):
+    def _on_fe_dir_finished(self, payload):
         self.btn_fe.setEnabled(True)
         self.set_button_progress(self.btn_fe, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
-        self.display_result(f"[INFO] 目录特征提取完成：共 {len(csv_list)} 个 CSV")
-        for p in csv_list:
-            if os.path.exists(p): self._add_output(p)
-        if csv_list:
-            first = csv_list[0]
+        info = payload if isinstance(payload, dict) else {}
+        csv_path = info.get("csv_path")
+        manifest_path = info.get("manifest_path")
+        files = info.get("files") or []
+        total_rows = info.get("total_rows")
+
+        summary = f"[INFO] 目录特征提取完成：合并 {len(files)} 个文件"
+        if total_rows is not None:
+            summary += f"，共 {total_rows} 条记录"
+        if csv_path:
+            summary += f"，输出：{csv_path}"
+        self.display_result(summary)
+
+        if csv_path and os.path.exists(csv_path):
+            self._add_output(csv_path)
             try:
-                df = pd.read_csv(first, nrows=50, encoding="utf-8")
+                df = pd.read_csv(csv_path, nrows=50, encoding="utf-8")
                 self.populate_table_from_df(df)
-                self._last_out_csv = first
-                self._open_csv_paged(first)
+                self._last_out_csv = csv_path
+                self._open_csv_paged(csv_path)
             except Exception:
                 pass
+
+        if manifest_path and os.path.exists(manifest_path):
+            self._add_output(manifest_path)
 
     def _on_fe_error(self, msg):
         self.btn_fe.setEnabled(True); self.reset_button_progress(self.btn_fe)

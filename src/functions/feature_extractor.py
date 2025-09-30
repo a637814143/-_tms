@@ -6,8 +6,9 @@ import glob
 import os
 import socket
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from datetime import datetime
+from functools import lru_cache
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import dpkt
@@ -217,12 +218,28 @@ class FlowAccumulator:
         return features
 
 
-def extract_features(
+@lru_cache(maxsize=1)
+def _feature_column_order() -> List[str]:
+    """返回特征列的固定顺序，确保批量写入时列对齐。"""
+
+    dummy = FlowAccumulator(
+        src_ip="0.0.0.0",
+        dst_ip="0.0.0.0",
+        src_port=0,
+        dst_port=0,
+        protocol="TCP",
+        pcap_file="__template__",
+    )
+    template = dummy.to_row()
+    return list(template.keys())
+
+
+def _extract_flow_dataframe(
     pcap_path: str,
-    output_csv: str,
+    *,
     progress_cb: ProgressCallback = None,
-) -> str:
-    """从单个 PCAP 文件提取高维流量特征并保存为 CSV。"""
+) -> pd.DataFrame:
+    """核心提取逻辑，返回单个 PCAP 的特征数据。"""
 
     if not os.path.exists(pcap_path):
         raise FileNotFoundError(f"文件不存在: {pcap_path}")
@@ -288,13 +305,33 @@ def extract_features(
     if not flows:
         raise ValueError(f"{pcap_path} 未提取到任何有效数据")
 
-    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
     records = [acc.to_row() for acc in flows.values()]
     df = pd.DataFrame(records)
-    df.to_csv(output_csv, index=False, encoding="utf-8")
+
+    column_order = _feature_column_order()
+    missing_cols = [c for c in column_order if c not in df.columns]
+    if missing_cols:
+        for col in missing_cols:
+            df[col] = 0
+    df = df.reindex(columns=column_order)
 
     if progress_cb:
         progress_cb(100)
+
+    return df
+
+
+def extract_features(
+    pcap_path: str,
+    output_csv: str,
+    progress_cb: ProgressCallback = None,
+) -> str:
+    """从单个 PCAP 文件提取高维流量特征并保存为 CSV。"""
+
+    df = _extract_flow_dataframe(pcap_path, progress_cb=progress_cb)
+
+    os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
+    df.to_csv(output_csv, index=False, encoding="utf-8")
 
     return output_csv
 
@@ -310,8 +347,8 @@ def extract_features_dir(
     *,
     workers: int = 4,
     progress_cb: ProgressCallback = None,
-) -> List[str]:
-    """批量提取目录下 PCAP/PCAPNG 文件的高维特征（多线程）。"""
+) -> Dict[str, object]:
+    """批量提取目录下 PCAP/PCAPNG 文件的高维特征，并合并为单个 CSV。"""
 
     if not os.path.isdir(pcap_dir):
         raise FileNotFoundError(f"目录不存在: {pcap_dir}")
@@ -324,25 +361,55 @@ def extract_features_dir(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    total = len(pcap_files)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = f"merged_features_{timestamp}"
+    output_csv = os.path.join(output_dir, f"{base_name}.csv")
+    manifest_path = os.path.join(output_dir, f"{base_name}_manifest.csv")
+
+    column_order = _feature_column_order() + ["__source_file__", "__source_path__"]
+    header_written = False
+    total_rows = 0
+    manifest_rows: List[Dict[str, object]] = []
+
     _notify(progress_cb, 0)
 
-    def _task(pcap_path: str) -> Tuple[str, str]:
-        base = os.path.splitext(os.path.basename(pcap_path))[0]
-        csv_path = os.path.join(output_dir, f"{base}_features.csv")
-        extract_features(pcap_path, csv_path, progress_cb=None)
-        return pcap_path, csv_path
+    for idx, pcap_path in enumerate(pcap_files, start=1):
+        df = _extract_flow_dataframe(pcap_path, progress_cb=None)
+        df["__source_file__"] = os.path.basename(pcap_path)
+        df["__source_path__"] = os.path.abspath(pcap_path)
+        df = df.reindex(columns=column_order, fill_value=0)
 
-    results: List[Tuple[str, str]] = []
-    max_workers = max(1, workers)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(_task, path): path for path in pcap_files}
-        completed = 0
-        for future in as_completed(future_map):
-            pcap_path, csv_path = future.result()
-            results.append((pcap_path, csv_path))
-            completed += 1
-            _notify(progress_cb, int(completed * 100 / total))
+        mode = "a" if header_written else "w"
+        df.to_csv(output_csv, mode=mode, header=not header_written, index=False, encoding="utf-8")
+        header_written = True
 
-    results.sort(key=lambda item: item[0])
-    return [csv_path for _, csv_path in results]
+        rows = len(df)
+        manifest_rows.append(
+            {
+                "source_file": os.path.basename(pcap_path),
+                "source_path": os.path.abspath(pcap_path),
+                "start_row": total_rows,
+                "end_row": total_rows + rows - 1,
+                "rows": rows,
+            }
+        )
+        total_rows += rows
+
+        if progress_cb:
+            progress_cb(min(95, int(idx * 95 / len(pcap_files))))
+
+    if not header_written:
+        raise RuntimeError("未能生成任何特征数据，输出 CSV 为空。")
+
+    manifest_df = pd.DataFrame(manifest_rows)
+    manifest_df.to_csv(manifest_path, index=False, encoding="utf-8")
+
+    _notify(progress_cb, 100)
+
+    return {
+        "csv_path": output_csv,
+        "manifest_path": manifest_path,
+        "files": pcap_files,
+        "total_rows": total_rows,
+        "columns": column_order,
+    }

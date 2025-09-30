@@ -8,6 +8,8 @@ import os
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
+import tempfile
+
 import numpy as np
 import pandas as pd
 
@@ -173,14 +175,38 @@ def vectorize_feature_dir(
     _notify(progress_cb, 50)
     matrix, cat_maps = _vectorize_dataframe(working_df)
 
-    X = matrix.to_numpy(dtype="float32", copy=False)
+    rows, cols = matrix.shape
+    if rows == 0 or cols == 0:
+        raise RuntimeError("向量化后的矩阵为空，无法生成数据集。")
+
     dataset_name = f"dataset_vectors_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     dataset_path = os.path.join(output_dir, f"{dataset_name}.npz")
+
+    temp_fd, temp_path = tempfile.mkstemp(prefix="vector_tmp_", suffix=".npy", dir=output_dir or None)
+    os.close(temp_fd)
+
+    bytes_per_value = 4  # float32
+    target_chunk_bytes = 128 * 1024 * 1024  # 128MB
+    chunk_rows = max(1, int(target_chunk_bytes / max(1, cols) / bytes_per_value))
+    chunk_rows = min(chunk_rows, rows)
+
+    mmap = np.lib.format.open_memmap(temp_path, mode="w+", dtype="float32", shape=(rows, cols))
+    for start in range(0, rows, chunk_rows):
+        end = min(rows, start + chunk_rows)
+        mmap[start:end, :] = matrix.iloc[start:end].to_numpy(dtype="float32", copy=False)
+    del mmap
+
+    mmap = np.lib.format.open_memmap(temp_path, mode="r", dtype="float32", shape=(rows, cols))
     np.savez_compressed(
         dataset_path,
-        X=X,
+        X=mmap,
         columns=matrix.columns.to_list(),
     )
+    del mmap
+    try:
+        os.remove(temp_path)
+    except OSError:
+        pass
 
     manifest_path = os.path.join(output_dir, f"{dataset_name}_manifest.csv")
     manifest_df = pd.DataFrame(manifest_rows)
@@ -190,8 +216,8 @@ def vectorize_feature_dir(
     meta_payload = {
         "dataset_path": dataset_path,
         "manifest_path": manifest_path,
-        "rows": int(X.shape[0]),
-        "cols": int(X.shape[1]),
+        "rows": int(rows),
+        "cols": int(cols),
         "columns": matrix.columns.to_list(),
     }
     if cat_maps:
@@ -209,7 +235,7 @@ def vectorize_feature_dir(
         "dataset_path": dataset_path,
         "manifest_path": manifest_path,
         "meta_path": meta_path,
-        "total_rows": int(X.shape[0]),
-        "total_cols": int(X.shape[1]),
+        "total_rows": int(rows),
+        "total_cols": int(cols),
         "files": csv_files,
     }
