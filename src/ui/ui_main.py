@@ -886,6 +886,7 @@ class Ui_MainWindow(object):
             files=file_list if os.path.isdir(path) else None,
             proto_filter=proto, port_whitelist_text=wl, port_blacklist_text=bl,
             fast=True,
+            fast_time_budget=1.0,
         )
         self.worker.progress.connect(lambda p: self.set_button_progress(self.btn_view, p))
         self.worker.finished.connect(self._on_worker_finished)
@@ -904,6 +905,7 @@ class Ui_MainWindow(object):
         out_csv = getattr(df, "attrs", {}).get("out_csv", None)
         files_total = getattr(df, "attrs", {}).get("files_total", None)
         errs = getattr(df, "attrs", {}).get("errors", "")
+        fast_summary = getattr(df, "attrs", {}).get("fast_summary", False)
 
         dst_dir = self._default_csv_info_dir()
         os.makedirs(dst_dir, exist_ok=True)
@@ -930,7 +932,21 @@ class Ui_MainWindow(object):
                 head_txt = df.head(20).to_string()
             except Exception:
                 head_txt = "(预览生成失败)"
-            self.display_result(f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}", append=False)
+            if fast_summary:
+                truncated_count = 0
+                if hasattr(df, "columns") and "truncated" in df.columns:
+                    try:
+                        truncated_count = int(df["truncated"].sum())
+                    except Exception:
+                        truncated_count = 0
+                note = "（快速模式，仅展示核心统计" + (
+                    f"；其中 {truncated_count} 个因时间限制被截断" if truncated_count else ""
+                ) + "）"
+            else:
+                note = "（表格仅显示前 {limit} 行；全部已写入 CSV）".format(
+                    limit=PREVIEW_LIMIT_FOR_TABLE
+                )
+            self.display_result(f"[INFO] 解析完成{note}.\n{head_txt}", append=False)
             rows = len(df) if hasattr(df, "__len__") else 0
             self.bottom_label.setText(f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个  @2025")
         if errs:

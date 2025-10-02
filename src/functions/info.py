@@ -272,6 +272,108 @@ def _process_file(
     return records, processed, None, cancelled
 
 
+def _process_file_fast(
+    file_path: str,
+    *,
+    proto_filter: str,
+    whitelist: Set[int],
+    blacklist: Set[int],
+    cancel_cb: Optional[Callable[[], bool]],
+    cancel_event: threading.Event,
+    time_budget: float,
+    progress_hook: Optional[Callable[[int], None]],
+) -> Tuple[List[Dict[str, object]], int, Optional[str], bool]:
+    start_time = time.time()
+    processed = 0
+    last_reported = 0
+    bytes_total = 0
+    tcp_packets = 0
+    udp_packets = 0
+    unique_src: Set[str] = set()
+    unique_dst: Set[str] = set()
+    first_ts: Optional[float] = None
+    last_ts: Optional[float] = None
+    cancelled = False
+    truncated = False
+
+    try:
+        for pkt in _iter_packets(file_path):
+            if cancel_event.is_set() or (cancel_cb and cancel_cb()):
+                cancel_event.set()
+                cancelled = True
+                break
+
+            now = time.time()
+            if time_budget > 0 and now - start_time > time_budget:
+                truncated = True
+                break
+
+            keys = _flow_key(pkt)
+            if keys is None:
+                continue
+
+            key_fwd, _ = keys
+            proto = key_fwd[4]
+            if proto_filter == "tcp" and proto.upper() != "TCP":
+                continue
+            if proto_filter == "udp" and proto.upper() != "UDP":
+                continue
+
+            src_port, dst_port = key_fwd[2], key_fwd[3]
+            if whitelist and (src_port not in whitelist and dst_port not in whitelist):
+                continue
+            if blacklist and (src_port in blacklist or dst_port in blacklist):
+                continue
+
+            timestamp = float(pkt.time)
+            length = len(pkt)
+
+            processed += 1
+            bytes_total += length
+            if proto.upper() == "TCP":
+                tcp_packets += 1
+            elif proto.upper() == "UDP":
+                udp_packets += 1
+
+            unique_src.add(key_fwd[0])
+            unique_dst.add(key_fwd[1])
+
+            if first_ts is None or timestamp < first_ts:
+                first_ts = timestamp
+            if last_ts is None or timestamp > last_ts:
+                last_ts = timestamp
+
+            if progress_hook and processed - last_reported >= 200:
+                progress_hook(processed - last_reported)
+                last_reported = processed
+
+        if progress_hook and processed > last_reported:
+            progress_hook(processed - last_reported)
+
+    except Exception as exc:
+        return [], processed, f"[ERROR] 快速解析失败 {file_path}: {exc}", cancelled
+
+    duration = 0.0
+    if first_ts is not None and last_ts is not None and last_ts >= first_ts:
+        duration = last_ts - first_ts
+
+    file_name = os.path.basename(file_path)
+    record: Dict[str, object] = {
+        "pcap_file": file_name,
+        "observed_packets": processed,
+        "observed_bytes": bytes_total,
+        "tcp_packets": tcp_packets,
+        "udp_packets": udp_packets,
+        "unique_src_ips": len(unique_src),
+        "unique_dst_ips": len(unique_dst),
+        "duration_span": duration,
+        "avg_bytes_per_s": (bytes_total / duration) if duration > 0 else 0.0,
+        "truncated": truncated,
+    }
+
+    return [record], processed, None, cancelled
+
+
 def _flow_key(pkt) -> Optional[Tuple[FlowKey, FlowKey]]:
     if IP not in pkt:
         return None
@@ -310,6 +412,7 @@ def get_pcap_features(
     port_whitelist_text: str = "",
     port_blacklist_text: str = "",
     fast: bool = False,
+    fast_time_budget: float = 1.0,
     progress_cb: Optional[Callable[[int], None]] = None,
     cancel_cb: Optional[Callable[[], bool]] = None,
 ) -> pd.DataFrame:
@@ -379,19 +482,32 @@ def get_pcap_features(
 
     if use_pool:
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_file = {
-                executor.submit(
-                    _process_file,
-                    file_path,
-                    proto_filter=proto_filter,
-                    whitelist=whitelist,
-                    blacklist=blacklist,
-                    cancel_cb=cancel_cb,
-                    cancel_event=cancel_event,
-                    progress_hook=_packet_progress if total_packets and not fast else None,
-                ): file_path
-                for file_path in target_files
-            }
+            future_to_file = {}
+            for file_path in target_files:
+                if fast:
+                    future = executor.submit(
+                        _process_file_fast,
+                        file_path,
+                        proto_filter=proto_filter,
+                        whitelist=whitelist,
+                        blacklist=blacklist,
+                        cancel_cb=cancel_cb,
+                        cancel_event=cancel_event,
+                        time_budget=max(0.1, float(fast_time_budget)),
+                        progress_hook=None,
+                    )
+                else:
+                    future = executor.submit(
+                        _process_file,
+                        file_path,
+                        proto_filter=proto_filter,
+                        whitelist=whitelist,
+                        blacklist=blacklist,
+                        cancel_cb=cancel_cb,
+                        cancel_event=cancel_event,
+                        progress_hook=_packet_progress if total_packets else None,
+                    )
+                future_to_file[future] = file_path
 
             for future in as_completed(future_to_file):
                 file_path = future_to_file[future]
@@ -418,15 +534,27 @@ def get_pcap_features(
                 cancel_event.set()
                 break
 
-            recs, processed, err, cancelled = _process_file(
-                file_path,
-                proto_filter=proto_filter,
-                whitelist=whitelist,
-                blacklist=blacklist,
-                cancel_cb=cancel_cb,
-                cancel_event=cancel_event,
-                progress_hook=_packet_progress if total_packets and not fast else None,
-            )
+            if fast:
+                recs, processed, err, cancelled = _process_file_fast(
+                    file_path,
+                    proto_filter=proto_filter,
+                    whitelist=whitelist,
+                    blacklist=blacklist,
+                    cancel_cb=cancel_cb,
+                    cancel_event=cancel_event,
+                    time_budget=max(0.1, float(fast_time_budget)),
+                    progress_hook=None,
+                )
+            else:
+                recs, processed, err, cancelled = _process_file(
+                    file_path,
+                    proto_filter=proto_filter,
+                    whitelist=whitelist,
+                    blacklist=blacklist,
+                    cancel_cb=cancel_cb,
+                    cancel_event=cancel_event,
+                    progress_hook=_packet_progress if total_packets else None,
+                )
             if recs:
                 records.extend(recs)
             if err:
@@ -443,6 +571,7 @@ def get_pcap_features(
     df.attrs["out_csv"] = out_csv
     df.attrs["files_total"] = len(target_files)
     df.attrs["errors"] = "\n".join(file_errors)
+    df.attrs["fast_summary"] = fast
 
     if progress_cb:
         progress_cb(100)
