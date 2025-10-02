@@ -307,12 +307,18 @@ def train_unsupervised_on_split(
         else:
             _extract_progress = None
 
-        feature_csvs = extract_features_dir(
+        dir_result = extract_features_dir(
             pcap_dir,
             feature_dir,
             workers=workers,
             progress_cb=_extract_progress,
         )
+        if not isinstance(dir_result, dict):
+            raise RuntimeError("目录特征提取失败，未获得输出文件信息。")
+        csv_path = dir_result.get("csv_path")
+        if not csv_path:
+            raise RuntimeError("目录特征提取未返回有效的 CSV 路径。")
+        feature_csvs = [csv_path]
 
     if progress_cb:
         progress_cb(70)

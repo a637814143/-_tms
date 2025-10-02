@@ -158,7 +158,7 @@ class FeatureWorker(QtCore.QThread):
 
 
 class DirFeatureWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(list)
+    finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
@@ -170,8 +170,8 @@ class DirFeatureWorker(QtCore.QThread):
 
     def run(self):
         try:
-            csvs = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
-            self.finished.emit(csvs)
+            result = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
+            self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -1026,22 +1026,35 @@ class Ui_MainWindow(object):
         except Exception:
             pass
 
-    def _on_fe_dir_finished(self, csv_list: List[str]):
+    def _on_fe_dir_finished(self, payload):
         self.btn_fe.setEnabled(True)
         self.set_button_progress(self.btn_fe, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
-        self.display_result(f"[INFO] 目录特征提取完成：共 {len(csv_list)} 个 CSV")
-        for p in csv_list:
-            if os.path.exists(p): self._add_output(p)
-        if csv_list:
-            first = csv_list[0]
+        info = payload if isinstance(payload, dict) else {}
+        csv_path = info.get("csv_path")
+        manifest_path = info.get("manifest_path")
+        files = info.get("files") or []
+        total_rows = info.get("total_rows")
+
+        summary = f"[INFO] 目录特征提取完成：合并 {len(files)} 个文件"
+        if total_rows is not None:
+            summary += f"，共 {total_rows} 条记录"
+        if csv_path:
+            summary += f"，输出：{csv_path}"
+        self.display_result(summary)
+
+        if csv_path and os.path.exists(csv_path):
+            self._add_output(csv_path)
             try:
-                df = pd.read_csv(first, nrows=50, encoding="utf-8")
+                df = pd.read_csv(csv_path, nrows=50, encoding="utf-8")
                 self.populate_table_from_df(df)
-                self._last_out_csv = first
-                self._open_csv_paged(first)
+                self._last_out_csv = csv_path
+                self._open_csv_paged(csv_path)
             except Exception:
                 pass
+
+        if manifest_path and os.path.exists(manifest_path):
+            self._add_output(manifest_path)
 
     def _on_fe_error(self, msg):
         self.btn_fe.setEnabled(True); self.reset_button_progress(self.btn_fe)
