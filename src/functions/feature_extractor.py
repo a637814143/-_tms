@@ -6,6 +6,7 @@ import glob
 import os
 import socket
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from functools import lru_cache
@@ -71,15 +72,6 @@ def _iterate_packets(reader) -> Iterable[Packet]:
             yield float(timestamp), data
 
 
-def _count_packets(pcap_path: str) -> int:
-    total = 0
-    with open(pcap_path, "rb") as handle:
-        reader = _open_reader(handle)
-        for _ in _iterate_packets(reader):
-            total += 1
-    return total
-
-
 def _hist_features(values: List[float], bins: np.ndarray, prefix: str) -> Dict[str, int]:
     if not values:
         return {f"{prefix}_{i:03d}": 0 for i in range(len(bins) - 1)}
@@ -94,7 +86,7 @@ def _inter_arrivals(times: List[float]) -> np.ndarray:
     return arr[arr >= 0]
 
 
-@dataclass
+@dataclass(slots=True)
 class FlowAccumulator:
     src_ip: str
     dst_ip: str
@@ -244,10 +236,10 @@ def _extract_flow_dataframe(
     if not os.path.exists(pcap_path):
         raise FileNotFoundError(f"文件不存在: {pcap_path}")
 
-    total_packets = _count_packets(pcap_path)
     flows: Dict[Tuple[str, str, int, int, str], FlowAccumulator] = {}
     processed = 0
     pcap_name = os.path.basename(pcap_path)
+    file_size = os.path.getsize(pcap_path) or None
 
     with open(pcap_path, "rb") as handle:
         reader = _open_reader(handle)
@@ -298,9 +290,13 @@ def _extract_flow_dataframe(
                 continue
 
             processed += 1
-            if progress_cb and total_packets:
-                if processed % 200 == 0 or processed == total_packets:
-                    progress_cb(min(99, int(processed * 100 / total_packets)))
+            if progress_cb and file_size and (processed == 1 or processed % 200 == 0):
+                try:
+                    current_pos = handle.tell()
+                except (OSError, ValueError):
+                    current_pos = 0
+                if current_pos:
+                    progress_cb(min(99, int(current_pos * 100 / file_size)))
 
     if not flows:
         raise ValueError(f"{pcap_path} 未提取到任何有效数据")
@@ -345,10 +341,14 @@ def extract_features_dir(
     pcap_dir: str,
     output_dir: str,
     *,
-    workers: int = 4,
+    workers: int = 0,
     progress_cb: ProgressCallback = None,
 ) -> Dict[str, object]:
-    """批量提取目录下 PCAP/PCAPNG 文件的高维特征，并合并为单个 CSV。"""
+    """批量提取目录下 PCAP/PCAPNG 文件的高维特征，并合并为单个 CSV。
+
+    参数:
+        workers: 并发线程数量，设置为 0 时根据 CPU 核心数自动推算合理的线程池大小。
+    """
 
     if not os.path.isdir(pcap_dir):
         raise FileNotFoundError(f"目录不存在: {pcap_dir}")
@@ -373,30 +373,62 @@ def extract_features_dir(
 
     _notify(progress_cb, 0)
 
-    for idx, pcap_path in enumerate(pcap_files, start=1):
-        df = _extract_flow_dataframe(pcap_path, progress_cb=None)
-        df["__source_file__"] = os.path.basename(pcap_path)
-        df["__source_path__"] = os.path.abspath(pcap_path)
-        df = df.reindex(columns=column_order, fill_value=0)
+    if workers < 0:
+        raise ValueError("workers 参数必须大于等于 0")
 
-        mode = "a" if header_written else "w"
-        df.to_csv(output_csv, mode=mode, header=not header_written, index=False, encoding="utf-8")
-        header_written = True
+    max_workers = workers or min(len(pcap_files), min(8, max(1, os.cpu_count() or 4)))
 
-        rows = len(df)
-        manifest_rows.append(
-            {
-                "source_file": os.path.basename(pcap_path),
-                "source_path": os.path.abspath(pcap_path),
-                "start_row": total_rows,
-                "end_row": total_rows + rows - 1,
-                "rows": rows,
-            }
-        )
-        total_rows += rows
+    def _task(index: int, path: str) -> Tuple[int, str, pd.DataFrame]:
+        df_local = _extract_flow_dataframe(path, progress_cb=None)
+        df_local["__source_file__"] = os.path.basename(path)
+        df_local["__source_path__"] = os.path.abspath(path)
+        df_local = df_local.reindex(columns=column_order, fill_value=0)
+        return index, path, df_local
 
-        if progress_cb:
-            progress_cb(min(95, int(idx * 95 / len(pcap_files))))
+    pending: Dict[int, Tuple[str, pd.DataFrame]] = {}
+    next_index = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_task, idx, path): idx
+            for idx, path in enumerate(pcap_files)
+        }
+
+        for future in as_completed(futures):
+            idx = futures[future]
+            _, path, df = future.result()
+            pending[idx] = (path, df)
+
+            while next_index in pending:
+                current_path, current_df = pending.pop(next_index)
+                mode = "a" if header_written else "w"
+                current_df.to_csv(
+                    output_csv,
+                    mode=mode,
+                    header=not header_written,
+                    index=False,
+                    encoding="utf-8",
+                )
+                header_written = True
+
+                rows = len(current_df)
+                manifest_rows.append(
+                    {
+                        "source_file": os.path.basename(current_path),
+                        "source_path": os.path.abspath(current_path),
+                        "start_row": total_rows,
+                        "end_row": total_rows + rows - 1,
+                        "rows": rows,
+                    }
+                )
+                total_rows += rows
+
+                del current_df
+
+                next_index += 1
+
+                if progress_cb:
+                    progress_cb(min(95, int(next_index * 95 / len(pcap_files))))
 
     if not header_written:
         raise RuntimeError("未能生成任何特征数据，输出 CSV 为空。")
