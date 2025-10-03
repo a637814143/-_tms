@@ -7,10 +7,12 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
+import tempfile
 
 ProgressCallback = Optional[Callable[[int], None]]
 
@@ -64,8 +66,70 @@ def _vectorize_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, List
         raise ValueError("未找到可向量化的列")
 
     matrix = pd.concat(pieces, axis=1)
-    matrix = matrix.fillna(0.0).astype("float32")
+    # 统一为 float32，缺失值后续在写入 numpy 数组时再处理，避免在 DataFrame
+    # 阶段额外拷贝一份巨大的矩阵导致的内存峰值。
+    matrix = matrix.astype("float32", copy=False)
     return matrix, categorical_maps
+
+
+def _matrix_to_numpy(
+    matrix: pd.DataFrame,
+    *,
+    dtype: str = "float32",
+    allow_memmap: bool = True,
+) -> Tuple[np.ndarray, Optional[str]]:
+    """将 DataFrame 转换为 numpy 数组，当内存不足时自动退化为内存映射。"""
+
+    target_dtype = np.dtype(dtype)
+    try:
+        arr = matrix.to_numpy(dtype=target_dtype, copy=False)
+        if np.issubdtype(arr.dtype, np.floating):
+            np.nan_to_num(arr, copy=False)
+        return arr, None
+    except MemoryError:
+        if not allow_memmap:
+            raise
+
+    rows, cols = matrix.shape
+    if rows == 0 or cols == 0:
+        raise RuntimeError("数据为空，无法转换为数组。")
+
+    temp_dir = tempfile.gettempdir()
+    temp_path = os.path.join(temp_dir, f"vectorize_{uuid4().hex}.npy")
+    try:
+        mm = np.lib.format.open_memmap(
+            temp_path,
+            mode="w+",
+            dtype=target_dtype,
+            shape=(rows, cols),
+        )
+
+        target_bytes = 8 * 1024 * 1024  # 8 MiB 目标块大小
+        cells_per_chunk = max(1, target_bytes // target_dtype.itemsize)
+        chunk_rows = max(1, min(rows, cells_per_chunk // max(1, cols)))
+
+        for start in range(0, rows, chunk_rows):
+            end = min(rows, start + chunk_rows)
+            try:
+                chunk = matrix.iloc[start:end].to_numpy(dtype=target_dtype, copy=True)
+                if np.issubdtype(chunk.dtype, np.floating):
+                    np.nan_to_num(chunk, copy=False)
+            except MemoryError as exc:
+                raise MemoryError(
+                    "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
+                ) from exc
+            mm[start:end] = chunk
+
+        mm.flush()
+        mm.flags.writeable = False
+        return mm, temp_path
+    except Exception:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise
 
 
 def vectorize_csv(
@@ -88,23 +152,35 @@ def vectorize_csv(
 
     _notify(progress_cb, 35)
     matrix, cat_maps = _vectorize_dataframe(clean_df)
+    columns = matrix.columns.to_list()
+    rows, cols = matrix.shape
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    X = matrix.to_numpy(dtype="float32", copy=False)
+    X, memmap_path = _matrix_to_numpy(matrix)
+    del matrix
     np.savez_compressed(
         output_path,
         X=X,
-        columns=matrix.columns.to_list(),
+        columns=columns,
         source_csv=os.path.abspath(csv_path),
     )
+
+    if isinstance(X, np.memmap):
+        X.flush()
+        del X
+    if memmap_path:
+        try:
+            os.remove(memmap_path)
+        except OSError:
+            pass
 
     meta: Dict[str, object] = {
         "vector_path": output_path,
         "source_csv": os.path.abspath(csv_path),
-        "rows": int(X.shape[0]),
-        "cols": int(X.shape[1]),
-        "columns": matrix.columns.to_list(),
+        "rows": int(rows),
+        "cols": int(cols),
+        "columns": columns,
     }
 
     if cat_maps:
@@ -188,15 +264,26 @@ def vectorize_feature_dir(
 
     _notify(progress_cb, 50)
     matrix, cat_maps = _vectorize_dataframe(working_df)
-
-    X = matrix.to_numpy(dtype="float32", copy=False)
+    columns = matrix.columns.to_list()
+    rows, cols = matrix.shape
+    X, memmap_path = _matrix_to_numpy(matrix)
+    del matrix
     dataset_name = f"dataset_vectors_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     dataset_path = os.path.join(output_dir, f"{dataset_name}.npz")
     np.savez_compressed(
         dataset_path,
         X=X,
-        columns=matrix.columns.to_list(),
+        columns=columns,
     )
+
+    if isinstance(X, np.memmap):
+        X.flush()
+        del X
+    if memmap_path:
+        try:
+            os.remove(memmap_path)
+        except OSError:
+            pass
 
     manifest_path = os.path.join(output_dir, f"{dataset_name}_manifest.csv")
     manifest_df = pd.DataFrame(manifest_rows)
@@ -206,9 +293,9 @@ def vectorize_feature_dir(
     meta_payload = {
         "dataset_path": dataset_path,
         "manifest_path": manifest_path,
-        "rows": int(X.shape[0]),
-        "cols": int(X.shape[1]),
-        "columns": matrix.columns.to_list(),
+        "rows": int(rows),
+        "cols": int(cols),
+        "columns": columns,
     }
     if cat_maps:
         cat_map_path = os.path.join(output_dir, f"{dataset_name}_cats.json")
@@ -225,7 +312,7 @@ def vectorize_feature_dir(
         "dataset_path": dataset_path,
         "manifest_path": manifest_path,
         "meta_path": meta_path,
-        "total_rows": int(X.shape[0]),
-        "total_cols": int(X.shape[1]),
+        "total_rows": int(rows),
+        "total_cols": int(cols),
         "files": csv_files,
     }
