@@ -1,7 +1,4 @@
-
 """PCAP 特征提取模块，输出高维流量特征。"""
-
-from __future__ import annotations
 
 import glob
 import os
