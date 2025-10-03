@@ -49,6 +49,17 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
     malicious_total = int(malicious_mask.sum())
     malicious_ratio_global = float(malicious_total / total_rows) if total_rows else 0.0
 
+    avg_confidence = None
+    if "anomaly_confidence" in df.columns:
+        try:
+            conf_series = df["anomaly_confidence"].astype("float32", copy=False)
+            if malicious_mask.any():
+                avg_confidence = float(conf_series[malicious_mask].mean())
+            else:
+                avg_confidence = float(conf_series.mean())
+        except Exception:
+            avg_confidence = None
+
     grouped = df.groupby("pcap_file", dropna=False)
     summary = grouped["is_malicious"].agg([("malicious_count", lambda s: int((s.astype("float32") > 0).sum())),
                                             ("total", "count")])
@@ -144,6 +155,8 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
         f"建议异常得分阈值（越小越异常）：≤ {score_threshold:.6f}",
         f"文件级判定阈值：恶意占比 ≥ {ratio_threshold:.2%}",
     ]
+    if avg_confidence is not None:
+        summary_lines.append(f"异常置信度均值：{avg_confidence:.2%}")
     if single_file_status:
         summary_lines.append(f"单文件判定：{single_file_status}")
     if anomalous_files:
@@ -167,6 +180,7 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
         "malicious_ratio": malicious_ratio_global,
         "score_threshold": score_threshold,
         "ratio_threshold": ratio_threshold,
+        "avg_confidence": avg_confidence,
         "anomalous_files": anomalous_files,
         "anomaly_score_quantiles": anomaly_score_quantiles,
         "single_file_status": single_file_status,
