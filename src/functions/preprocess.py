@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,53 +51,108 @@ def _load_feature_csv(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def _prepare_numeric(series: pd.Series) -> tuple[pd.Series, Dict[str, float]]:
-    numeric = pd.to_numeric(series, errors="coerce")
-    if numeric.isna().all():
-        fill_value = 0.0
-    else:
-        fill_value = float(numeric.median(skipna=True))
-        if np.isnan(fill_value):
-            fill_value = float(numeric.dropna().iloc[0]) if numeric.dropna().any() else 0.0
-    filled = numeric.fillna(fill_value).astype("float32")
-    stats = {
-        "fill_value": float(fill_value),
-        "min": float(filled.min(initial=0.0)),
-        "max": float(filled.max(initial=0.0)),
-        "mean": float(filled.mean()),
-        "std": float(filled.std(ddof=0)),
-    }
-    return filled, stats
+def _median_or_default(series: pd.Series) -> float:
+    non_na = series.dropna()
+    if non_na.empty:
+        return 0.0
+    median = float(non_na.median())
+    if math.isnan(median) or math.isinf(median):
+        median = float(non_na.iloc[0])
+    return median
 
 
-def _prepare_boolean(series: pd.Series) -> tuple[pd.Series, Dict[str, float]]:
-    bool_series = series.fillna(False).astype(bool)
-    numeric = bool_series.astype("int32")
-    stats = {
-        "fill_value": 0.0,
-        "min": float(numeric.min()),
-        "max": float(numeric.max()),
-        "mean": float(numeric.mean()),
-        "std": float(numeric.std(ddof=0)),
-    }
-    return numeric, stats
+def _update_numeric_stats(name: str, values: pd.Series, store: Dict[str, Dict[str, float]]) -> None:
+    if values.empty:
+        return
+    arr = np.asarray(values, dtype=np.float64)
+    stats = store.setdefault(
+        name,
+        {"count": 0.0, "sum": 0.0, "sum_sq": 0.0, "min": None, "max": None},
+    )
+    count = float(arr.size)
+    stats["count"] += count
+    stats["sum"] += float(arr.sum())
+    stats["sum_sq"] += float(np.multiply(arr, arr).sum())
+    current_min = float(arr.min())
+    current_max = float(arr.max())
+    stats["min"] = current_min if stats["min"] is None else min(stats["min"], current_min)
+    stats["max"] = current_max if stats["max"] is None else max(stats["max"], current_max)
 
 
-def _prepare_categorical(series: pd.Series, column: str) -> tuple[pd.Series, Dict[str, object]]:
-    filled = series.fillna(MISSING_TOKEN)
-    if is_datetime64_any_dtype(filled):
-        filled = filled.astype(str)
-    elif not is_categorical_dtype(filled):
-        filled = filled.astype(str)
-    normalized = filled.str.strip().replace("", MISSING_TOKEN)
-    codes, uniques = pd.factorize(normalized, sort=True)
-    encoded = pd.Series(codes.astype("int32"), name=f"{column}__code", index=series.index)
-    metadata = {
-        "source_column": column,
-        "labels": [str(u) for u in uniques],
-        "missing_token": MISSING_TOKEN,
-    }
-    return encoded, metadata
+def _process_single_dataframe(
+    df: pd.DataFrame,
+    *,
+    fill_strategies: Dict[str, float],
+    categorical_maps: Dict[str, Dict[str, object]],
+    numeric_stats: Dict[str, Dict[str, float]],
+) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """处理单个特征表，返回预处理后的 DataFrame、元信息列和特征列顺序。"""
+
+    meta_cols = [col for col in RESERVED_META_COLUMNS if col in df.columns]
+    feature_columns: List[str] = []
+    processed_data: Dict[str, pd.Series] = {}
+
+    for column in df.columns:
+        if column in meta_cols:
+            continue
+
+        series = df[column]
+
+        if is_bool_dtype(series):
+            encoded = series.fillna(False).astype(bool).astype("int8")
+            fill_strategies.setdefault(column, 0.0)
+            _update_numeric_stats(column, encoded, numeric_stats)
+            processed_data[column] = encoded
+            feature_columns.append(column)
+        elif is_numeric_dtype(series):
+            numeric = pd.to_numeric(series, errors="coerce")
+            if column not in fill_strategies:
+                fill_strategies[column] = _median_or_default(numeric)
+            filled = numeric.fillna(fill_strategies[column]).astype("float32")
+            _update_numeric_stats(column, filled, numeric_stats)
+            processed_data[column] = filled
+            feature_columns.append(column)
+        else:
+            filled = series.fillna(MISSING_TOKEN)
+            if is_datetime64_any_dtype(filled):
+                filled = filled.astype(str)
+            elif not is_categorical_dtype(filled):
+                filled = filled.astype(str)
+            normalized = filled.str.strip().replace("", MISSING_TOKEN)
+
+            encoded_name = f"{column}__code"
+            entry = categorical_maps.setdefault(
+                encoded_name,
+                {
+                    "source_column": column,
+                    "labels": [],
+                    "missing_token": MISSING_TOKEN,
+                    "mapping": {},
+                },
+            )
+            mapping = entry["mapping"]
+            codes = normalized.map(mapping)
+            missing_mask = codes.isna()
+            if missing_mask.any():
+                for value in normalized[missing_mask].unique():
+                    label = str(value)
+                    if label not in mapping:
+                        mapping[label] = len(entry["labels"])
+                        entry["labels"].append(label)
+                codes = normalized.map(mapping)
+            encoded = codes.fillna(-1).astype("int32")
+            processed_data[encoded_name] = encoded
+            feature_columns.append(encoded_name)
+
+    if not processed_data:
+        raise RuntimeError("没有找到可用于训练的特征列。")
+
+    parts: List[pd.DataFrame] = []
+    if meta_cols:
+        parts.append(df.loc[:, meta_cols])
+    parts.append(pd.DataFrame(processed_data, index=df.index))
+    processed_df = pd.concat(parts, axis=1)
+    return processed_df, meta_cols, feature_columns
 
 
 def preprocess_feature_dir(
@@ -122,132 +177,146 @@ def preprocess_feature_dir(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    frames_map: Dict[str, pd.DataFrame] = {}
-    total_files = len(csv_files)
-    max_workers = min(8, max(1, os.cpu_count() or 4))
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = f"dataset_preprocessed_{timestamp}"
+    dataset_path = os.path.join(output_dir, f"{base_name}.csv")
+    manifest_path = os.path.join(output_dir, f"{base_name}_manifest.csv")
+    meta_path = os.path.join(output_dir, f"{base_name}_meta.json")
 
-    if total_files > 1 and max_workers > 1:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {executor.submit(_load_feature_csv, path): path for path in csv_files}
-            for idx, future in enumerate(as_completed(future_map), start=1):
-                path = future_map[future]
-                frames_map[path] = future.result()
-                _notify(progress_cb, 5 + int(20 * idx / total_files))
-    else:
-        for idx, csv_path in enumerate(csv_files, start=1):
-            frames_map[csv_path] = _load_feature_csv(csv_path)
-            _notify(progress_cb, 5 + int(20 * idx / total_files))
+    counter = 1
+    while os.path.exists(dataset_path):
+        base_name = f"dataset_preprocessed_{timestamp}_{counter}"
+        dataset_path = os.path.join(output_dir, f"{base_name}.csv")
+        manifest_path = os.path.join(output_dir, f"{base_name}_manifest.csv")
+        meta_path = os.path.join(output_dir, f"{base_name}_meta.json")
+        counter += 1
 
-    frames: List[pd.DataFrame] = []
+    fill_strategies: Dict[str, float] = {}
+    categorical_maps: Dict[str, Dict[str, object]] = {}
+    numeric_stats: Dict[str, Dict[str, float]] = {}
+
     manifest_rows: List[Dict[str, object]] = []
-    row_cursor = 0
+    total_rows = 0
+    total_files = len(csv_files)
+    meta_columns_global: List[str] = []
+    feature_columns_global: List[str] = []
+    first_chunk = True
 
     for idx, csv_path in enumerate(csv_files, start=1):
-        df = frames_map[csv_path]
+        df = _load_feature_csv(csv_path)
+        df = df.copy()
         df["__source_file__"] = os.path.basename(csv_path)
         df["__source_path__"] = os.path.abspath(csv_path)
-        frames.append(df)
 
-        rows = len(df)
+        processed_df, meta_cols, feature_columns = _process_single_dataframe(
+            df,
+            fill_strategies=fill_strategies,
+            categorical_maps=categorical_maps,
+            numeric_stats=numeric_stats,
+        )
+
+        if first_chunk:
+            meta_columns_global = meta_cols
+            feature_columns_global = feature_columns
+        else:
+            if meta_cols != meta_columns_global:
+                raise RuntimeError(
+                    f"文件 {os.path.basename(csv_path)} 的元信息列与之前不一致。"
+                )
+            if feature_columns != feature_columns_global:
+                missing = [c for c in feature_columns_global if c not in feature_columns]
+                extra = [c for c in feature_columns if c not in feature_columns_global]
+                if missing or extra:
+                    raise RuntimeError(
+                        f"文件 {os.path.basename(csv_path)} 的特征列与之前不一致。"
+                    )
+
+        full_column_order = list(meta_columns_global) + feature_columns_global
+        processed_df = processed_df.loc[:, full_column_order]
+
+        processed_df.to_csv(
+            dataset_path,
+            index=False,
+            encoding="utf-8",
+            mode="w" if first_chunk else "a",
+            header=first_chunk,
+        )
+
+        rows = int(len(processed_df))
         manifest_rows.append(
             {
                 "source_file": os.path.basename(csv_path),
                 "source_path": os.path.abspath(csv_path),
-                "start_index": row_cursor,
-                "end_index": row_cursor + rows,
+                "start_index": total_rows,
+                "end_index": total_rows + rows,
                 "rows": rows,
             }
         )
-        row_cursor += rows
-        _notify(progress_cb, 30 + int(15 * idx / total_files))
+        total_rows += rows
+        first_chunk = False
 
-    full_df = pd.concat(frames, ignore_index=True)
-    if full_df.empty:
-        raise RuntimeError("聚合后的特征数据为空，无法进行预处理。")
+        _notify(progress_cb, 10 + int(80 * idx / total_files))
 
-    meta_cols_in_df = [col for col in RESERVED_META_COLUMNS if col in full_df.columns]
-
-    working_df = full_df.copy()
-
-    processed_columns: Dict[str, pd.Series] = {}
-    column_profiles: List[Dict[str, object]] = []
-    categorical_maps: Dict[str, Dict[str, object]] = {}
-    fill_strategies: Dict[str, float] = {}
-
-    for column in working_df.columns:
-        if column in meta_cols_in_df:
-            continue
-
-        series = working_df[column]
-
-        if is_bool_dtype(series):
-            encoded, stats = _prepare_boolean(series)
-            processed_columns[column] = encoded
-            column_profiles.append(
-                {
-                    "name": column,
-                    "kind": "boolean",
-                    **stats,
-                }
-            )
-            fill_strategies[column] = stats["fill_value"]
-        elif is_numeric_dtype(series):
-            encoded, stats = _prepare_numeric(series)
-            processed_columns[column] = encoded
-            column_profiles.append(
-                {
-                    "name": column,
-                    "kind": "numeric",
-                    **stats,
-                }
-            )
-            fill_strategies[column] = stats["fill_value"]
-        else:
-            encoded, meta = _prepare_categorical(series, column)
-            processed_columns[encoded.name] = encoded
-            categorical_maps[encoded.name] = meta
-            column_profiles.append(
-                {
-                    "name": encoded.name,
-                    "kind": "categorical_encoded",
-                    "source_column": column,
-                    "unique": len(meta["labels"]),
-                }
-            )
-
-    if not processed_columns:
-        raise RuntimeError("没有找到可用于训练的特征列。")
-
-    feature_df = pd.DataFrame(processed_columns, index=working_df.index)
-
-    if meta_cols_in_df:
-        meta_df = full_df[meta_cols_in_df]
-        processed_df = pd.concat([meta_df, feature_df], axis=1)
-    else:
-        processed_df = feature_df
-
-    dataset_name = f"dataset_preprocessed_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    dataset_path = os.path.join(output_dir, f"{dataset_name}.csv")
-    manifest_path = os.path.join(output_dir, f"{dataset_name}_manifest.csv")
-    meta_path = os.path.join(output_dir, f"{dataset_name}_meta.json")
-
-    processed_df.to_csv(dataset_path, index=False, encoding="utf-8")
+    if first_chunk:
+        raise RuntimeError("未能生成任何预处理数据。")
 
     manifest_df = pd.DataFrame(manifest_rows)
     manifest_df.to_csv(manifest_path, index=False, encoding="utf-8")
 
-    feature_columns = [col for col in processed_df.columns if col not in meta_cols_in_df]
+    feature_columns = feature_columns_global
+
+    column_profiles: List[Dict[str, object]] = []
+    for column in feature_columns:
+        if column in numeric_stats:
+            stats = numeric_stats[column]
+            count = stats["count"] or 0.0
+            if count:
+                mean = stats["sum"] / count
+                variance = max(stats["sum_sq"] / count - mean * mean, 0.0)
+                std = math.sqrt(variance)
+            else:
+                mean = 0.0
+                std = 0.0
+            column_profiles.append(
+                {
+                    "name": column,
+                    "kind": "numeric",
+                    "min": float(stats["min"] if stats["min"] is not None else 0.0),
+                    "max": float(stats["max"] if stats["max"] is not None else 0.0),
+                    "mean": float(mean),
+                    "std": float(std),
+                }
+            )
+        else:
+            meta = categorical_maps.get(column, {})
+            column_profiles.append(
+                {
+                    "name": column,
+                    "kind": "categorical_encoded",
+                    "source_column": meta.get("source_column"),
+                    "unique": len(meta.get("labels", [])),
+                }
+            )
+
+    categorical_serializable = {}
+    for key, meta in categorical_maps.items():
+        categorical_serializable[key] = {
+            "source_column": meta.get("source_column"),
+            "labels": list(meta.get("labels", [])),
+            "missing_token": meta.get("missing_token", MISSING_TOKEN),
+        }
 
     meta_payload = {
         "type": "preprocessed_dataset",
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source_feature_dir": os.path.abspath(feature_dir),
-        "rows": int(len(processed_df)),
+        "rows": int(total_rows),
         "feature_columns": feature_columns,
-        "meta_columns": meta_cols_in_df,
+        "meta_columns": meta_columns_global,
         "fill_values": fill_strategies,
-        "categorical_maps": categorical_maps,
+        "categorical_maps": categorical_serializable,
         "column_profiles": column_profiles,
+        "files": [os.path.abspath(p) for p in csv_files],
     }
 
     with open(meta_path, "w", encoding="utf-8") as fh:
@@ -259,7 +328,7 @@ def preprocess_feature_dir(
         "dataset_path": dataset_path,
         "manifest_path": manifest_path,
         "meta_path": meta_path,
-        "total_rows": int(len(processed_df)),
+        "total_rows": int(total_rows),
         "total_cols": int(len(feature_columns)),
         "files": csv_files,
     }
