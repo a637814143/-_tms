@@ -182,14 +182,14 @@ class PreprocessWorker(QtCore.QThread):
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
-    def __init__(self, feature_dir, out_dir):
+    def __init__(self, feature_source, out_dir):
         super().__init__()
-        self.feature_dir = feature_dir
+        self.feature_source = feature_source
         self.out_dir = out_dir
 
     def run(self):
         try:
-            result = preprocess_dir(self.feature_dir, self.out_dir, progress_cb=self.progress.emit)
+            result = preprocess_dir(self.feature_source, self.out_dir, progress_cb=self.progress.emit)
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
@@ -637,6 +637,86 @@ class Ui_MainWindow(object):
         if d:
             self.file_edit.setText(d); self.display_result(f"已选择目录: {d}", True)
 
+    def _ask_pcap_input(self):
+        current = self.file_edit.text().strip()
+        if current and os.path.exists(current):
+            start_dir = current if os.path.isdir(current) else os.path.dirname(current)
+        else:
+            start_dir = self._default_split_dir()
+
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None,
+            "选择 PCAP 文件",
+            start_dir,
+            "pcap (*.pcap *.pcapng);;所有文件 (*)",
+        )
+        if file_path:
+            return file_path
+
+        dir_path = QtWidgets.QFileDialog.getExistingDirectory(
+            None,
+            "选择包含多个小包的目录",
+            start_dir or self._default_split_dir(),
+        )
+        if dir_path:
+            return dir_path
+        return None
+
+    def _ask_feature_source(self):
+        start_dir = self._default_csv_feature_dir()
+        dir_path = QtWidgets.QFileDialog.getExistingDirectory(
+            None, "选择特征 CSV 所在目录", start_dir
+        )
+        if dir_path:
+            return dir_path
+
+        files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            None,
+            "选择特征 CSV 文件",
+            start_dir,
+            "CSV (*.csv);;所有文件 (*)",
+        )
+        if files:
+            return files
+        return None
+
+    def _ask_training_source(self):
+        current = self.file_edit.text().strip()
+        if current and os.path.exists(current):
+            start_dir = current if os.path.isdir(current) else os.path.dirname(current)
+        else:
+            start_dir = self._preprocess_out_dir()
+
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None,
+            "选择训练数据（预处理CSV/NPZ/PCAP）",
+            start_dir,
+            "预处理CSV (*.csv);;NPZ (*.npz);;PCAP (*.pcap *.pcapng);;所有文件 (*)",
+        )
+        if file_path:
+            return file_path
+
+        dir_path = QtWidgets.QFileDialog.getExistingDirectory(
+            None,
+            "选择训练数据所在目录",
+            start_dir or self._default_split_dir(),
+        )
+        if dir_path:
+            return dir_path
+        return None
+
+    def _ask_analysis_csv(self):
+        start_dir = self._default_results_dir()
+        csv_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None,
+            "选择检测结果 CSV",
+            start_dir,
+            "CSV (*.csv);;所有文件 (*)",
+        )
+        if csv_path:
+            return csv_path
+        return None
+
     def display_result(self, text, append=True):
         (self.results_text.append if append else self.results_text.setPlainText)(text)
 
@@ -985,8 +1065,9 @@ class Ui_MainWindow(object):
             anomaly_count = int(export_payload.get("anomaly_count", 0))
             anomaly_files = [str(x) for x in export_payload.get("anomaly_files", []) if x]
             single_status = export_payload.get("single_file_status")
+            status_text = export_payload.get("status_text") or ("异常" if anomaly_count > 0 else "正常")
 
-            summary_txt = [f"异常包数量: {anomaly_count}"]
+            summary_txt = [f"分析结论: {status_text}", f"异常包数量: {anomaly_count}"]
             if anomaly_files:
                 summary_txt.append("异常包名: " + ", ".join(anomaly_files))
             else:
@@ -1047,9 +1128,14 @@ class Ui_MainWindow(object):
 
     # --------- 提取特征（按顶部路径） ----------
     def _on_extract_features(self):
-        path = self.file_edit.text().strip()
-        if not path:
-            QtWidgets.QMessageBox.warning(None, "未选择路径", "请先在顶部选择 pcap 文件或目录。"); return
+        selection = self._ask_pcap_input()
+        if not selection:
+            self.display_result("[INFO] 已取消特征提取。")
+            return
+
+        path = selection
+        if isinstance(path, str) and os.path.exists(path):
+            self.file_edit.setText(path)
 
         out_dir = self._default_csv_feature_dir()
         os.makedirs(out_dir, exist_ok=True)
@@ -1111,22 +1197,27 @@ class Ui_MainWindow(object):
 
     # --------- 数据预处理（基于特征 CSV） ----------
     def _on_preprocess_features(self):
-        feature_dir = self._default_csv_feature_dir()
-        if not os.path.isdir(feature_dir):
-            QtWidgets.QMessageBox.warning(None, "目录不存在", f"特征目录不存在：{feature_dir}")
-            return
-
-        csv_files = [n for n in os.listdir(feature_dir) if n.lower().endswith(".csv")]
-        if not csv_files:
-            QtWidgets.QMessageBox.information(None, "没有特征数据", "请先完成特征提取后再进行数据预处理。")
+        feature_source = self._ask_feature_source()
+        if not feature_source:
+            self.display_result("[INFO] 已取消数据预处理。")
             return
 
         out_dir = self._preprocess_out_dir()
         os.makedirs(out_dir, exist_ok=True)
 
-        self.display_result(f"[INFO] 数据预处理：{feature_dir} -> {out_dir}")
+        if isinstance(feature_source, (list, tuple, set)):
+            files_list = list(feature_source)
+            preview = f"{len(files_list)} 个CSV文件"
+            if files_list:
+                self.file_edit.setText(str(files_list[0]))
+        else:
+            preview = str(feature_source)
+            if os.path.exists(preview):
+                self.file_edit.setText(preview)
+
+        self.display_result(f"[INFO] 数据预处理：{preview} -> {out_dir}")
         self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
-        self.preprocess_worker = PreprocessWorker(feature_dir, out_dir)
+        self.preprocess_worker = PreprocessWorker(feature_source, out_dir)
         self.preprocess_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
         self.preprocess_worker.finished.connect(self._on_preprocess_finished)
         self.preprocess_worker.error.connect(self._on_preprocess_error)
@@ -1173,17 +1264,14 @@ class Ui_MainWindow(object):
 
     # --------- 训练模型（按顶部路径） ----------
     def _on_train_model(self):
-        selected_path = self.file_edit.text().strip()
-        preprocess_dir = self._preprocess_out_dir()
+        selection = self._ask_training_source()
+        if not selection:
+            self.display_result("[INFO] 已取消模型训练。")
+            return
 
-        if selected_path and os.path.exists(selected_path):
-            path = selected_path
-        else:
-            path = preprocess_dir
-            if selected_path:
-                self.display_result(f"[WARN] 选择的路径不存在，自动改用预处理目录：{preprocess_dir}")
-            else:
-                self.display_result(f"[INFO] 未选择路径，默认使用预处理目录：{preprocess_dir}")
+        path = selection
+        if os.path.exists(path):
+            self.file_edit.setText(path)
 
         res_dir = self._default_results_dir()
         mdl_dir = self._default_models_dir()
@@ -1215,6 +1303,16 @@ class Ui_MainWindow(object):
             msg_lines.append(f"自动阈值={res.get('threshold'):.6f}")
         if res.get("vote_threshold") is not None:
             msg_lines.append(f"投票阈值={res.get('vote_threshold'):.2f}")
+        breakdown = res.get("threshold_breakdown") or {}
+        if isinstance(breakdown, dict) and breakdown.get("adaptive") is not None:
+            adaptive = breakdown.get("adaptive")
+            quant = breakdown.get("quantile")
+            robust = breakdown.get("robust")
+            msg_lines.append(
+                "阈值拆解: 自适应 {:.6f} | 分位 {:.6f} | 鲁棒 {:.6f}".format(
+                    float(adaptive), float(quant if quant is not None else adaptive), float(robust if robust is not None else adaptive)
+                )
+            )
         if res.get("estimated_precision") is not None:
             msg_lines.append(f"异常置信度均值≈{res.get('estimated_precision'):.2%}")
         msg = "\n".join(msg_lines)
@@ -1234,12 +1332,14 @@ class Ui_MainWindow(object):
     def _on_run_analysis(self):
         out_dir = self._analysis_out_dir()
         os.makedirs(out_dir, exist_ok=True)
-        auto = os.path.join(self._default_results_dir(), "iforest_results.csv")
-        if os.path.exists(auto):
-            csv = auto
-        else:
-            csv, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择检测结果CSV", "", "CSV Files (*.csv)")
-            if not csv:
+
+        csv = self._ask_analysis_csv()
+        if not csv:
+            auto = os.path.join(self._default_results_dir(), "iforest_results.csv")
+            if os.path.exists(auto):
+                csv = auto
+                self.display_result(f"[INFO] 未选择文件，自动使用最新结果：{csv}")
+            else:
                 self.display_result("请先选择结果CSV"); return
 
         self.display_result(f"[INFO] 正在分析结果 -> {out_dir}")
@@ -1373,7 +1473,12 @@ class Ui_MainWindow(object):
                 metadata = {}
 
         feature_columns = metadata.get("feature_columns") if isinstance(metadata, dict) else None
-        threshold = metadata.get("threshold") if isinstance(metadata, dict) else None
+        threshold_breakdown_meta = metadata.get("threshold_breakdown") if isinstance(metadata, dict) else None
+        threshold = None
+        if isinstance(threshold_breakdown_meta, dict) and threshold_breakdown_meta.get("adaptive") is not None:
+            threshold = threshold_breakdown_meta.get("adaptive")
+        elif isinstance(metadata, dict):
+            threshold = metadata.get("threshold")
         score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
         vote_mean_meta = metadata.get("vote_mean") if isinstance(metadata, dict) else None
         vote_threshold_meta = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
@@ -1505,6 +1610,14 @@ class Ui_MainWindow(object):
             f"分数范围：{score_min:.4f} ~ {score_max:.4f}",
             f"平均异常置信度：{float(anomaly_confidence.mean()):.2%}",
         ]
+        if isinstance(threshold_breakdown_meta, dict) and threshold_breakdown_meta.get("adaptive") is not None:
+            msg.append(
+                "阈值拆解: 自适应 {:.6f} | 分位 {:.6f} | 鲁棒 {:.6f}".format(
+                    float(threshold_breakdown_meta.get("adaptive")),
+                    float(threshold_breakdown_meta.get("quantile", threshold)),
+                    float(threshold_breakdown_meta.get("robust", threshold)),
+                )
+            )
         self.display_result("\n".join(msg))
 
         self._add_output(out_csv)
