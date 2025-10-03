@@ -23,6 +23,8 @@ META_COLUMNS = {
     "src_port",
     "dst_port",
     "protocol",
+    "__source_file__",
+    "__source_path__",
 }
 
 
@@ -40,6 +42,33 @@ def _latest_npz_in_dir(directory: str) -> Optional[str]:
         return None
     candidates.sort(key=lambda p: os.path.getmtime(p))
     return candidates[-1]
+
+
+def _is_preprocessed_csv(path: str) -> bool:
+    if not path.lower().endswith(".csv"):
+        return False
+    name = os.path.basename(path)
+    if not name.startswith("dataset_preprocessed_"):
+        return False
+    base, _ = os.path.splitext(path)
+    return os.path.exists(f"{base}_meta.json")
+
+
+def _latest_preprocessed_csv(directory: str) -> Optional[str]:
+    candidates = [
+        os.path.join(directory, name)
+        for name in os.listdir(directory)
+        if _is_preprocessed_csv(os.path.join(directory, name))
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getmtime(p))
+    return candidates[-1]
+
+
+def _manifest_path_for(dataset_path: str) -> str:
+    base, _ = os.path.splitext(dataset_path)
+    return f"{base}_manifest.csv"
 
 
 def _load_npz_dataset(dataset_path: str) -> Tuple[np.ndarray, list]:
@@ -193,6 +222,57 @@ def _train_from_dataframe(
     }
 
 
+def _train_from_preprocessed_csv(
+    dataset_path: str,
+    *,
+    results_dir: str,
+    models_dir: str,
+    contamination: float,
+    base_estimators: int,
+    progress_cb=None,
+) -> dict:
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"预处理数据集不存在: {dataset_path}")
+
+    df = pd.read_csv(dataset_path, encoding="utf-8")
+    if df.empty:
+        raise RuntimeError("预处理数据集为空，无法训练。")
+
+    manifest_path = _manifest_path_for(dataset_path)
+    manifest_col = None
+    if os.path.exists(manifest_path):
+        try:
+            manifest_df = pd.read_csv(manifest_path, encoding="utf-8")
+            expanded = []
+            for _, row in manifest_df.iterrows():
+                rows = int(row.get("rows", 0))
+                source_file = row.get("source_file") or row.get("source_path") or "unknown"
+                expanded.extend([source_file] * rows)
+            if len(expanded) == len(df):
+                df["__source_file__"] = expanded
+                manifest_col = "__source_file__"
+        except Exception as exc:
+            print(f"[WARN] 读取 manifest 失败 {manifest_path}: {exc}")
+
+    if "__source_file__" in df.columns:
+        manifest_col = "__source_file__"
+    elif "pcap_file" in df.columns:
+        manifest_col = "pcap_file"
+
+    if progress_cb:
+        progress_cb(40)
+
+    return _train_from_dataframe(
+        df,
+        results_dir=results_dir,
+        models_dir=models_dir,
+        contamination=contamination,
+        base_estimators=base_estimators,
+        progress_cb=progress_cb,
+        group_column=manifest_col,
+    )
+
+
 def _train_from_npz(
     dataset_path: str,
     *,
@@ -246,7 +326,7 @@ def train_unsupervised_on_split(
 ):
     """
     无监督训练：
-    - 支持直接加载 NPZ 向量数据集
+    - 支持直接加载预处理 CSV 或 NPZ 数据集
     - 对 PCAP 目录进行特征提取（多线程）后再训练
     """
 
@@ -260,7 +340,9 @@ def train_unsupervised_on_split(
         raise FileNotFoundError("未提供训练数据路径")
 
     if os.path.isfile(split_dir):
-        if _is_npz(split_dir):
+        if _is_preprocessed_csv(split_dir):
+            dataset_path = split_dir
+        elif _is_npz(split_dir):
             dataset_path = split_dir
         elif split_dir.lower().endswith((".pcap", ".pcapng")):
             pcap_dir = os.path.dirname(split_dir) or os.path.abspath(os.path.join(split_dir, os.pardir))
@@ -268,13 +350,24 @@ def train_unsupervised_on_split(
         else:
             raise FileNotFoundError(f"不支持的训练文件: {split_dir}")
     elif os.path.isdir(split_dir):
-        dataset_path = _latest_npz_in_dir(split_dir)
+        dataset_path = _latest_preprocessed_csv(split_dir)
+        if dataset_path is None:
+            dataset_path = _latest_npz_in_dir(split_dir)
         if dataset_path is None:
             pcap_dir = split_dir
     else:
         raise FileNotFoundError(f"路径不存在: {split_dir}")
 
     if dataset_path:
+        if dataset_path.lower().endswith(".csv"):
+            return _train_from_preprocessed_csv(
+                dataset_path,
+                results_dir=results_dir,
+                models_dir=models_dir,
+                contamination=contamination,
+                base_estimators=base_estimators,
+                progress_cb=progress_cb,
+            )
         return _train_from_npz(
             dataset_path,
             results_dir=results_dir,

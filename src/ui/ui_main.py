@@ -12,7 +12,7 @@ from src.functions.feature_extractor import (
 )
 from src.functions.unsupervised_train import train_unsupervised_on_split as run_train
 from src.functions.analyze_results import analyze_results as run_analysis
-from src.functions.vectorize import vectorize_feature_dir as vec_dir
+from src.functions.preprocess import preprocess_feature_dir as preprocess_dir
 
 try:
     import pandas as pd
@@ -176,7 +176,7 @@ class DirFeatureWorker(QtCore.QThread):
             self.error.emit(str(e))
 
 
-class VectorWorker(QtCore.QThread):
+class PreprocessWorker(QtCore.QThread):
     finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
@@ -188,7 +188,7 @@ class VectorWorker(QtCore.QThread):
 
     def run(self):
         try:
-            result = vec_dir(self.feature_dir, self.out_dir, progress_cb=self.progress.emit)
+            result = preprocess_dir(self.feature_dir, self.out_dir, progress_cb=self.progress.emit)
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
@@ -361,7 +361,7 @@ class Ui_MainWindow(object):
 
         # worker
         self.worker: Optional[InfoWorker] = None
-        self.vector_worker: Optional[VectorWorker] = None
+        self.preprocess_worker: Optional[VectorWorker] = None
 
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
@@ -524,7 +524,7 @@ class Ui_MainWindow(object):
 
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
         self.btn_fe = QtWidgets.QPushButton("提取特征")
-        self.btn_vector = QtWidgets.QPushButton("数据处理（向量化）")
+        self.btn_vector = QtWidgets.QPushButton("数据预处理")
         self.btn_train = QtWidgets.QPushButton("训练模型")
         self.btn_analysis = QtWidgets.QPushButton("运行分析")
         self.btn_predict = QtWidgets.QPushButton("加载模型预测")
@@ -559,7 +559,7 @@ class Ui_MainWindow(object):
         self.btn_export.clicked.connect(self._on_export_results)
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_fe.clicked.connect(self._on_extract_features)
-        self.btn_vector.clicked.connect(self._on_vectorize_features)
+        self.btn_vector.clicked.connect(self._on_preprocess_features)
         self.btn_train.clicked.connect(self._on_train_model)
         self.btn_analysis.clicked.connect(self._on_run_analysis)
         self.btn_predict.clicked.connect(self._on_predict)
@@ -591,7 +591,7 @@ class Ui_MainWindow(object):
         return PATHS["results_pred"]
     def _abnormal_out_dir(self):
         return PATHS["results_abnormal"]
-    def _vector_out_dir(self):
+    def _preprocess_out_dir(self):
         return PATHS["results_vector"]
     def _browse_compat(self):
         p, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择 pcap 文件", "", "pcap (*.pcap *.pcapng);;所有文件 (*)")
@@ -1084,8 +1084,8 @@ class Ui_MainWindow(object):
         QtWidgets.QMessageBox.critical(None, "特征提取失败", msg)
         self.display_result(f"[错误] 特征提取失败: {msg}")
 
-    # --------- 向量化处理（基于特征 CSV） ----------
-    def _on_vectorize_features(self):
+    # --------- 数据预处理（基于特征 CSV） ----------
+    def _on_preprocess_features(self):
         feature_dir = self._default_csv_feature_dir()
         if not os.path.isdir(feature_dir):
             QtWidgets.QMessageBox.warning(None, "目录不存在", f"特征目录不存在：{feature_dir}")
@@ -1093,25 +1093,25 @@ class Ui_MainWindow(object):
 
         csv_files = [n for n in os.listdir(feature_dir) if n.lower().endswith(".csv")]
         if not csv_files:
-            QtWidgets.QMessageBox.information(None, "没有特征数据", "请先完成特征提取后再进行向量化处理。")
+            QtWidgets.QMessageBox.information(None, "没有特征数据", "请先完成特征提取后再进行数据预处理。")
             return
 
-        out_dir = self._vector_out_dir()
+        out_dir = self._preprocess_out_dir()
         os.makedirs(out_dir, exist_ok=True)
 
-        self.display_result(f"[INFO] 向量化处理：{feature_dir} -> {out_dir}")
+        self.display_result(f"[INFO] 数据预处理：{feature_dir} -> {out_dir}")
         self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
-        self.vector_worker = VectorWorker(feature_dir, out_dir)
-        self.vector_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
-        self.vector_worker.finished.connect(self._on_vector_finished)
-        self.vector_worker.error.connect(self._on_vector_error)
-        self.vector_worker.start()
+        self.preprocess_worker = PreprocessWorker(feature_dir, out_dir)
+        self.preprocess_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
+        self.preprocess_worker.finished.connect(self._on_preprocess_finished)
+        self.preprocess_worker.error.connect(self._on_preprocess_error)
+        self.preprocess_worker.start()
 
-    def _on_vector_finished(self, result):
+    def _on_preprocess_finished(self, result):
         self.btn_vector.setEnabled(True)
         self.set_button_progress(self.btn_vector, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_vector))
-        self.vector_worker = None
+        self.preprocess_worker = None
 
         data = result if isinstance(result, dict) else {}
         dataset = data.get("dataset_path")
@@ -1134,31 +1134,31 @@ class Ui_MainWindow(object):
         if meta_path:
             self._add_output(meta_path)
 
-        summary = f"[INFO] 向量化完成：{total_rows or 0} 条记录，{total_cols or 0} 个特征。"
+        summary = f"[INFO] 数据预处理完成：{total_rows or 0} 条记录，{total_cols or 0} 个特征。"
         if dataset:
             summary += f" 数据集：{dataset}"
         self.display_result(summary)
 
-    def _on_vector_error(self, msg):
+    def _on_preprocess_error(self, msg):
         self.btn_vector.setEnabled(True)
         self.reset_button_progress(self.btn_vector)
-        QtWidgets.QMessageBox.critical(None, "向量化失败", msg)
-        self.display_result(f"[错误] 向量化失败: {msg}")
-        self.vector_worker = None
+        QtWidgets.QMessageBox.critical(None, "数据预处理失败", msg)
+        self.display_result(f"[错误] 数据预处理失败: {msg}")
+        self.preprocess_worker = None
 
     # --------- 训练模型（按顶部路径） ----------
     def _on_train_model(self):
         selected_path = self.file_edit.text().strip()
-        vector_dir = self._vector_out_dir()
+        preprocess_dir = self._preprocess_out_dir()
 
         if selected_path and os.path.exists(selected_path):
             path = selected_path
         else:
-            path = vector_dir
+            path = preprocess_dir
             if selected_path:
-                self.display_result(f"[WARN] 选择的路径不存在，自动改用向量目录：{vector_dir}")
+                self.display_result(f"[WARN] 选择的路径不存在，自动改用预处理目录：{preprocess_dir}")
             else:
-                self.display_result(f"[INFO] 未选择路径，默认使用向量目录：{vector_dir}")
+                self.display_result(f"[INFO] 未选择路径，默认使用预处理目录：{preprocess_dir}")
 
         res_dir = self._default_results_dir()
         mdl_dir = self._default_models_dir()
@@ -1455,8 +1455,8 @@ class Ui_MainWindow(object):
     def _on_clear(self):
         if getattr(self, "worker", None) and self.worker.isRunning():
             self.worker.requestInterruption()
-        if getattr(self, "vector_worker", None) and self.vector_worker.isRunning():
-            self.vector_worker.requestInterruption()
+        if getattr(self, "preprocess_worker", None) and self.preprocess_worker.isRunning():
+            self.preprocess_worker.requestInterruption()
 
         self.results_text.setUpdatesEnabled(False)
         self.table_view.setUpdatesEnabled(False)
