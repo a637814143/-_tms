@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
-from sklearn.ensemble import IsolationForest
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from joblib import dump
 
 from src.functions.feature_extractor import extract_features, extract_features_dir
+from src.functions.anomaly_detector import EnsembleAnomalyDetector
 
 META_COLUMNS = {
     "pcap_file",
@@ -149,27 +153,44 @@ def _train_from_dataframe(
     working_df = df.copy()
     X, feature_columns = _prepare_feature_matrix(working_df)
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    model = IsolationForest(
-        n_estimators=base_estimators,
-        contamination=contamination,
-        random_state=42,
-        warm_start=True,
-        n_jobs=-1,
+    pipeline = Pipeline(
+        [
+            ("scaler", StandardScaler()),
+            (
+                "detector",
+                EnsembleAnomalyDetector(
+                    contamination=contamination,
+                    n_estimators=max(128, base_estimators),
+                    random_state=42,
+                ),
+            ),
+        ]
     )
-    if progress_cb:
-        progress_cb(80)
-    model.fit(X_scaled)
-    if progress_cb:
-        progress_cb(90)
 
-    scores = model.decision_function(X_scaled)
-    preds = model.predict(X_scaled)
+    if progress_cb:
+        progress_cb(70)
+
+    pipeline.fit(X)
+    detector: EnsembleAnomalyDetector = pipeline.named_steps["detector"]
+
+    scores = detector.fit_decision_scores_ if detector.fit_decision_scores_ is not None else detector.score_samples(pipeline.named_steps["scaler"].transform(X))
+    threshold = detector.threshold_ if detector.threshold_ is not None else float(np.quantile(scores, contamination))
+
+    preds = pipeline.predict(X)
     is_malicious = (preds == -1).astype(int)
 
+    if detector.fit_votes_:
+        vote_ratio = np.vstack([np.where(v == -1, 1.0, 0.0) for v in detector.fit_votes_.values()]).mean(axis=0)
+    else:
+        vote_ratio = np.ones_like(is_malicious, dtype=float)
+
+    score_std = float(np.std(scores) or 1.0)
+    conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
+    anomaly_confidence = np.clip((conf_from_score + vote_ratio) / 2.0, 0.0, 1.0)
+
     working_df["anomaly_score"] = scores
+    working_df["vote_ratio"] = vote_ratio
+    working_df["anomaly_confidence"] = anomaly_confidence
     working_df["is_malicious"] = is_malicious
 
     results_csv = os.path.join(results_dir, "iforest_results.csv")
@@ -201,10 +222,48 @@ def _train_from_dataframe(
     summary_csv = os.path.join(results_dir, "summary_by_file.csv")
     summary.to_csv(summary_csv, index=False, encoding="utf-8")
 
-    model_path = os.path.join(models_dir, "isoforest.joblib")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    pipeline_name = f"iforest_pipeline_{timestamp}.joblib"
+    pipeline_path = os.path.join(models_dir, pipeline_name)
+    dump(pipeline, pipeline_path)
+
+    latest_pipeline_path = os.path.join(models_dir, "latest_iforest_pipeline.joblib")
+    try:
+        shutil.copy2(pipeline_path, latest_pipeline_path)
+    except Exception:
+        dump(pipeline, latest_pipeline_path)
+
     scaler_path = os.path.join(models_dir, "scaler.joblib")
-    dump(model, model_path)
-    dump(scaler, scaler_path)
+    dump(pipeline.named_steps["scaler"], scaler_path)
+    model_path = os.path.join(models_dir, "isoforest.joblib")
+    base_iforest = detector.detectors_.get("iforest")
+    if base_iforest:
+        dump(base_iforest.estimator, model_path)
+    else:
+        dump(detector, model_path)
+
+    metadata = {
+        "timestamp": timestamp,
+        "contamination": contamination,
+        "base_estimators": base_estimators,
+        "feature_columns": feature_columns,
+        "threshold": float(threshold),
+        "score_std": float(score_std),
+        "vote_mean": float(np.mean(vote_ratio)),
+        "detectors": list(detector.detectors_.keys()),
+        "estimated_precision": float(anomaly_confidence[is_malicious == 1].mean() if is_malicious.any() else 0.0),
+        "estimated_anomaly_ratio": float(is_malicious.mean()),
+        "results_csv": results_csv,
+        "summary_csv": summary_csv,
+    }
+
+    metadata_path = os.path.join(models_dir, f"iforest_metadata_{timestamp}.json")
+    with open(metadata_path, "w", encoding="utf-8") as fh:
+        json.dump(metadata, fh, ensure_ascii=False, indent=2)
+
+    latest_meta_path = os.path.join(models_dir, "latest_iforest_metadata.json")
+    with open(latest_meta_path, "w", encoding="utf-8") as fh:
+        json.dump(metadata, fh, ensure_ascii=False, indent=2)
 
     if progress_cb:
         progress_cb(100)
@@ -212,13 +271,19 @@ def _train_from_dataframe(
     return {
         "results_csv": results_csv,
         "summary_csv": summary_csv,
-        "model_path": model_path,
+        "model_path": pipeline_path,
         "scaler_path": scaler_path,
+        "pipeline_path": pipeline_path,
+        "pipeline_latest": latest_pipeline_path,
+        "metadata_path": metadata_path,
+        "metadata_latest": latest_meta_path,
         "packets": len(working_df),
         "flows": len(working_df),
         "malicious": int(is_malicious.sum()),
         "contamination": contamination,
         "feature_columns": feature_columns,
+        "threshold": float(threshold),
+        "estimated_precision": metadata["estimated_precision"],
     }
 
 

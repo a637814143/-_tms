@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from PyQt5 import QtCore, QtGui, QtWidgets
-import sys, os, platform, subprocess, math, shutil
+import sys, os, platform, subprocess, math, shutil, json
+import numpy as np
 from typing import List, Optional, Set
 from datetime import datetime
 
@@ -361,7 +362,7 @@ class Ui_MainWindow(object):
 
         # worker
         self.worker: Optional[InfoWorker] = None
-        self.preprocess_worker: Optional[VectorWorker] = None
+        self.preprocess_worker: Optional[PreprocessWorker] = None
 
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
@@ -593,6 +594,30 @@ class Ui_MainWindow(object):
         return PATHS["results_abnormal"]
     def _preprocess_out_dir(self):
         return PATHS["csv_preprocess"]
+
+    def _latest_pipeline_bundle(self):
+        models_dir = self._default_models_dir()
+        latest_path = os.path.join(models_dir, "latest_iforest_pipeline.joblib")
+        latest_meta = os.path.join(models_dir, "latest_iforest_metadata.json")
+        if os.path.exists(latest_path):
+            return latest_path, latest_meta if os.path.exists(latest_meta) else None
+
+        candidates = []
+        prefix = "iforest_pipeline_"
+        suffix = ".joblib"
+        for name in os.listdir(models_dir):
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                continue
+            path = os.path.join(models_dir, name)
+            stamp = name[len(prefix):-len(suffix)]
+            meta = os.path.join(models_dir, f"iforest_metadata_{stamp}.json")
+            candidates.append((os.path.getmtime(path), path, meta if os.path.exists(meta) else None))
+
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _, path, meta = candidates[0]
+        return path, meta
     def _browse_compat(self):
         p, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择 pcap 文件", "", "pcap (*.pcap *.pcapng);;所有文件 (*)")
         if not p:
@@ -1176,11 +1201,23 @@ class Ui_MainWindow(object):
         self.btn_train.setEnabled(True)
         self.set_button_progress(self.btn_train, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_train))
-        msg = (f"results:\n- {res.get('results_csv')}\n- {res.get('summary_csv')}\n"
-               f"models:\n- {res.get('model_path')}\n- {res.get('scaler_path')}\n"
-               f"flows={res.get('flows')} malicious={res.get('malicious')}")
+        msg_lines = [
+            "results:",
+            f"- {res.get('results_csv')}",
+            f"- {res.get('summary_csv')}",
+            "models:",
+            f"- 最新管线: {res.get('pipeline_latest') or res.get('model_path')}",
+            f"- 元数据: {res.get('metadata_latest') or res.get('metadata_path')}",
+            f"- 标准化器: {res.get('scaler_path')}",
+            f"样本总数={res.get('flows')} 异常数={res.get('malicious')}",
+        ]
+        if res.get("threshold") is not None:
+            msg_lines.append(f"自动阈值={res.get('threshold'):.6f}")
+        if res.get("estimated_precision") is not None:
+            msg_lines.append(f"异常置信度均值≈{res.get('estimated_precision'):.2%}")
+        msg = "\n".join(msg_lines)
         self.display_result(f"[INFO] 训练完成：\n{msg}")
-        for k in ("results_csv", "summary_csv", "model_path", "scaler_path"):
+        for k in ("results_csv", "summary_csv", "model_path", "scaler_path", "pipeline_latest", "metadata_latest", "metadata_path"):
             p = res.get(k)
             if p and os.path.exists(p): self._add_output(p)
         if res.get("results_csv") and os.path.exists(res["results_csv"]):
@@ -1301,118 +1338,150 @@ class Ui_MainWindow(object):
         csv_path, _ = QtWidgets.QFileDialog.getOpenFileName(
             None, "选择特征CSV", self._default_csv_feature_dir(), "CSV (*.csv)"
         )
-        if not csv_path: return
+        if not csv_path:
+            return
         try:
             df = pd.read_csv(csv_path, encoding="utf-8")
         except Exception as e:
-            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{e}"); return
+            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{e}")
+            return
         if df.empty:
-            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。"); return
+            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
+            return
 
         from joblib import load as joblib_load
 
-        mdl_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            None, "选择模型（isoforest.joblib 或 Pipeline）",
-            self._default_models_dir(), "JOBLIB (*.joblib);;All (*)"
-        )
-        if not mdl_path: return
+        pipeline_path, meta_path = self._latest_pipeline_bundle()
+        if not pipeline_path or not os.path.exists(pipeline_path):
+            QtWidgets.QMessageBox.warning(None, "缺少模型", "未找到最新的管线模型，请先完成一次训练。")
+            return
 
         try:
-            mdl_obj = joblib_load(mdl_path)
+            pipeline = joblib_load(pipeline_path)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(None, "加载失败", f"无法加载模型：{e}"); return
+            QtWidgets.QMessageBox.critical(None, "加载失败", f"无法加载模型：{e}")
+            return
 
-        def _is_pipeline(o): return hasattr(o, "named_steps") and hasattr(o, "predict")
-        def _is_scaler(o):
-            name = o.__class__.__name__.lower()
-            return (hasattr(o, "transform") and not hasattr(o, "predict")) or ("scaler" in name)
-        def _is_estimator(o): return hasattr(o, "predict") and not _is_pipeline(o)
+        metadata = {}
+        if meta_path and os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    metadata = json.load(fh)
+            except Exception:
+                metadata = {}
 
-        is_pipeline = _is_pipeline(mdl_obj)
-        scaler = None; estimator = None; pipeline = None
-
-        if is_pipeline:
-            pipeline = mdl_obj
-        else:
-            other_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-                None, "选择 scaler.joblib（若无可取消）",
-                self._default_models_dir(), "JOBLIB (*.joblib);;All (*)"
-            )
-            other_obj = None
-            if other_path:
-                try:
-                    other_obj = joblib_load(other_path)
-                except Exception as e:
-                    QtWidgets.QMessageBox.critical(None, "加载失败", f"无法加载标准化器：{e}"); return
-
-            if _is_scaler(mdl_obj) and (other_obj is not None) and _is_estimator(other_obj):
-                scaler, estimator = mdl_obj, other_obj
-            elif (other_obj is not None) and _is_scaler(other_obj) and _is_estimator(mdl_obj):
-                scaler, estimator = other_obj, mdl_obj
-            elif _is_estimator(mdl_obj) and other_obj is None:
-                estimator = mdl_obj
-            else:
-                QtWidgets.QMessageBox.critical(
-                    None, "加载失败",
-                    "无法判定哪个是模型哪个是scaler：\n"
-                    " - 如果你保存的是Pipeline，只需要选一次模型文件即可；\n"
-                    " - 如果是分离的 scaler + 模型，请两个都选择，顺序随意。"
-                )
-                return
+        feature_columns = metadata.get("feature_columns") if isinstance(metadata, dict) else None
+        threshold = metadata.get("threshold") if isinstance(metadata, dict) else None
+        score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
+        vote_mean_meta = metadata.get("vote_mean") if isinstance(metadata, dict) else None
 
         use_df = df.copy()
-        if pipeline is None and scaler is not None:
-            need_k = int(getattr(scaler, "n_features_in_", 0) or 0)
-            if need_k <= 0:
-                QtWidgets.QMessageBox.warning(None, "无法确定列数", "StandardScaler 未包含 n_features_in_ 信息。")
-                return
-            dlg = FeaturePickDialog(list(use_df.columns), need_k)
-            if dlg.exec_() != QtWidgets.QDialog.Accepted: return
-            cols = dlg.selected_columns()
-            for c in cols:
-                if c not in use_df.columns: use_df[c] = 0
-            X = use_df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
+        if feature_columns:
+            missing_cols = [c for c in feature_columns if c not in use_df.columns]
+            for col in missing_cols:
+                use_df[col] = 0
+            X_df = use_df[feature_columns]
         else:
-            X = use_df.apply(pd.to_numeric, errors="coerce").fillna(0.0).values
+            X_df = use_df.select_dtypes(include=[np.number])
+            if X_df.empty:
+                X_df = use_df.apply(pd.to_numeric, errors="coerce")
+
+        X_df = X_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        X = X_df.to_numpy(dtype=float, copy=False)
+
+        named_steps = getattr(pipeline, "named_steps", {}) if hasattr(pipeline, "named_steps") else {}
+        detector = named_steps.get("detector") if isinstance(named_steps, dict) else None
+        scaler = named_steps.get("scaler") if isinstance(named_steps, dict) else None
 
         try:
-            if pipeline is not None:
-                pred = pipeline.predict(X)
-                if hasattr(pipeline, "decision_function"):
-                    score = -pipeline.decision_function(X)
-                elif hasattr(pipeline, "score_samples"):
-                    score = -pipeline.score_samples(X)
-                else:
-                    score = None
-            else:
-                if scaler is not None:
-                    X = scaler.transform(X)
-                pred = estimator.predict(X)
-                if hasattr(estimator, "decision_function"):
-                    score = -estimator.decision_function(X)
-                elif hasattr(estimator, "score_samples"):
-                    score = -estimator.score_samples(X)
-                else:
-                    score = None
+            preds = pipeline.predict(X)
         except Exception as e:
-            QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}"); return
+            QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}")
+            return
+
+        scores = None
+        vote_ratio = None
+        if detector is not None and scaler is not None:
+            try:
+                X_scaled = scaler.transform(X)
+                scores = detector.score_samples(X_scaled)
+                vote_blocks = []
+                for info in getattr(detector, "detectors_", {}).values():
+                    est = getattr(info, "estimator", None)
+                    if est is None or not hasattr(est, "predict"):
+                        continue
+                    try:
+                        sub_pred = est.predict(X_scaled)
+                        vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
+                    except Exception:
+                        continue
+                if vote_blocks:
+                    vote_ratio = np.vstack(vote_blocks).mean(axis=0)
+            except Exception:
+                scores = None
+
+        if scores is None:
+            try:
+                scores = pipeline.decision_function(X)
+            except Exception:
+                scores = None
+
+        if scores is None:
+            scores = np.zeros(len(X))
+
+        if vote_ratio is None:
+            fallback_vote = 0.5 if vote_mean_meta is None else float(vote_mean_meta)
+            vote_ratio = np.full(len(X), fallback_vote, dtype=float)
+
+        if threshold is None and detector is not None:
+            threshold = getattr(detector, "threshold_", None)
+        if threshold is None:
+            threshold = float(np.quantile(scores, 0.05)) if len(scores) else 0.0
+
+        if score_std is None:
+            score_std = float(np.std(scores) or 1.0)
+
+        conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
+        anomaly_confidence = np.clip((conf_from_score + vote_ratio) / 2.0, 0.0, 1.0)
 
         out_df = df.copy()
-        out_df["prediction"] = pred
-        if score is not None:
-            out_df["anomaly_score"] = score
+        out_df["prediction"] = preds
+        out_df["is_malicious"] = (preds == -1).astype(int)
+        out_df["anomaly_score"] = scores
+        out_df["anomaly_confidence"] = anomaly_confidence
+        out_df["vote_ratio"] = vote_ratio
 
-        pred_dir = self._prediction_out_dir()
-        os.makedirs(pred_dir, exist_ok=True)
+        malicious = int(out_df["is_malicious"].sum())
+        total = int(len(out_df))
+        ratio = (malicious / total) if total else 0.0
+        status = "异常" if malicious else "正常"
+
+        out_dir = self._prediction_out_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = os.path.splitext(os.path.basename(csv_path))[0]
-        out_csv = os.path.join(pred_dir, f"{base}_pred_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        out_csv = os.path.join(out_dir, f"prediction_{base}_{stamp}.csv")
         try:
             out_df.to_csv(out_csv, index=False, encoding="utf-8")
         except Exception as e:
-            QtWidgets.QMessageBox.critical(None, "保存失败", f"无法写出预测结果：{e}"); return
+            QtWidgets.QMessageBox.critical(None, "保存失败", f"无法写出预测结果：{e}")
+            return
 
-        self.display_result(f"[INFO] 预测完成：{out_csv}")
+        score_min = float(np.min(scores)) if len(scores) else 0.0
+        score_max = float(np.max(scores)) if len(scores) else 0.0
+        msg = [
+            f"模型预测完成：{out_csv}",
+            f"整体判定：{status}",
+            f"检测包数：{total}",
+            f"异常包数：{malicious} ({ratio:.2%})",
+            f"自动阈值：{threshold:.6f}",
+            f"分数范围：{score_min:.4f} ~ {score_max:.4f}",
+            f"平均异常置信度：{float(anomaly_confidence.mean()):.2%}",
+        ]
+        self.display_result("\n".join(msg))
+
         self._add_output(out_csv)
+        self._last_out_csv = out_csv
         self._open_csv_paged(out_csv)
 
     # --------- 输出列表 ----------
