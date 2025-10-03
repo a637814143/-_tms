@@ -78,7 +78,14 @@ def _matrix_to_numpy(
     dtype: str = "float32",
     allow_memmap: bool = True,
 ) -> Tuple[np.ndarray, Optional[str]]:
-    """将 DataFrame 转换为 numpy 数组，当内存不足时自动退化为内存映射。"""
+    """
+    将 DataFrame 转换为 numpy 数组。
+
+    pandas 在极宽的矩阵（列非常多，行很少）的场景下会在 ``DataFrame.to_numpy``
+    中一次性申请一整块连续内存，即便数据量并不算大也可能因为内存碎片
+    或平台限制导致失败。这里首先尝试直接转换；若失败则退化为手动按列
+    分块复制到目标数组/内存映射文件，避免在转换过程中额外的巨大临时内存。
+    """
 
     target_dtype = np.dtype(dtype)
     try:
@@ -86,13 +93,54 @@ def _matrix_to_numpy(
         if np.issubdtype(arr.dtype, np.floating):
             np.nan_to_num(arr, copy=False)
         return arr, None
-    except MemoryError:
-        if not allow_memmap:
+    except Exception as exc:  # pragma: no cover - fallback path在宽矩阵上触发
+        is_memory_issue = isinstance(exc, MemoryError) or exc.__class__.__name__ == "_ArrayMemoryError"
+        if not is_memory_issue and "Unable to allocate" not in str(exc):
             raise
+        first_error = exc
 
     rows, cols = matrix.shape
     if rows == 0 or cols == 0:
         raise RuntimeError("数据为空，无法转换为数组。")
+
+    def _iter_column_chunks(chunk_target_bytes: int):
+        cells_per_chunk = max(1, chunk_target_bytes // max(1, target_dtype.itemsize))
+        chunk_cols = cells_per_chunk // max(1, rows)
+        if chunk_cols <= 0:
+            chunk_cols = 1
+        chunk_cols = min(cols, max(1, chunk_cols))
+
+        for start in range(0, cols, chunk_cols):
+            end = min(cols, start + chunk_cols)
+            try:
+                chunk = matrix.iloc[:, start:end].to_numpy(dtype=target_dtype, copy=False)
+            except MemoryError as exc:
+                raise MemoryError(
+                    "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
+                ) from exc
+            if np.issubdtype(chunk.dtype, np.floating):
+                np.nan_to_num(chunk, copy=False)
+            yield start, end, chunk
+
+    def _copy_into(target: np.ndarray | np.memmap) -> None:
+        for start, end, chunk in _iter_column_chunks(8 * 1024 * 1024):
+            try:
+                target[:, start:end] = chunk
+            except MemoryError as exc:
+                raise MemoryError(
+                    "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
+                ) from exc
+
+    try:
+        arr = np.empty((rows, cols), dtype=target_dtype)
+        _copy_into(arr)
+        arr.setflags(write=False)
+        return arr, None
+    except MemoryError:
+        if not allow_memmap:
+            raise MemoryError(
+                "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
+            ) from first_error
 
     temp_dir = tempfile.gettempdir()
     temp_path = os.path.join(temp_dir, f"vectorize_{uuid4().hex}.npy")
@@ -103,23 +151,7 @@ def _matrix_to_numpy(
             dtype=target_dtype,
             shape=(rows, cols),
         )
-
-        target_bytes = 8 * 1024 * 1024  # 8 MiB 目标块大小
-        cells_per_chunk = max(1, target_bytes // target_dtype.itemsize)
-        chunk_rows = max(1, min(rows, cells_per_chunk // max(1, cols)))
-
-        for start in range(0, rows, chunk_rows):
-            end = min(rows, start + chunk_rows)
-            try:
-                chunk = matrix.iloc[start:end].to_numpy(dtype=target_dtype, copy=True)
-                if np.issubdtype(chunk.dtype, np.floating):
-                    np.nan_to_num(chunk, copy=False)
-            except MemoryError as exc:
-                raise MemoryError(
-                    "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
-                ) from exc
-            mm[start:end] = chunk
-
+        _copy_into(mm)
         mm.flush()
         mm.flags.writeable = False
         return mm, temp_path
@@ -129,7 +161,9 @@ def _matrix_to_numpy(
                 os.remove(temp_path)
             except OSError:
                 pass
-        raise
+        raise MemoryError(
+            "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
+        ) from first_error
 
 
 def vectorize_csv(
