@@ -10,15 +10,9 @@ from src.functions.feature_extractor import (
     extract_features as fe_single,
     extract_features_dir as fe_dir,
 )
-from src.functions.unsupervised_train import (
-    train_unsupervised_on_split as run_train,
-    infer_ground_truth_labels,
-    normalize_prediction_output,
-    META_COLUMNS,
-    LABEL_KEYWORDS,
-)
+from src.functions.unsupervised_train import train_unsupervised_on_split as run_train
 from src.functions.analyze_results import analyze_results as run_analysis
-from src.functions.vectorize import vectorize_feature_dir as vec_dir
+from src.functions.preprocess import preprocess_feature_dir as preprocess_dir
 
 try:
     import pandas as pd
@@ -164,7 +158,7 @@ class FeatureWorker(QtCore.QThread):
 
 
 class DirFeatureWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(object)
+    finished = QtCore.pyqtSignal(list)
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
@@ -176,13 +170,13 @@ class DirFeatureWorker(QtCore.QThread):
 
     def run(self):
         try:
-            result = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
-            self.finished.emit(result)
+            csvs = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
+            self.finished.emit(csvs)
         except Exception as e:
             self.error.emit(str(e))
 
 
-class VectorWorker(QtCore.QThread):
+class PreprocessWorker(QtCore.QThread):
     finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
@@ -194,7 +188,7 @@ class VectorWorker(QtCore.QThread):
 
     def run(self):
         try:
-            result = vec_dir(self.feature_dir, self.out_dir, progress_cb=self.progress.emit)
+            result = preprocess_dir(self.feature_dir, self.out_dir, progress_cb=self.progress.emit)
             self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
@@ -358,6 +352,7 @@ class Ui_MainWindow(object):
         # 状态缓存
         self._last_preview_df: Optional["pd.DataFrame"] = None
         self._last_out_csv: Optional[str] = None
+        self._analysis_summary: Optional[dict] = None
 
         # 分页状态
         self._csv_paged_path: Optional[str] = None
@@ -366,7 +361,7 @@ class Ui_MainWindow(object):
 
         # worker
         self.worker: Optional[InfoWorker] = None
-        self.vector_worker: Optional[VectorWorker] = None
+        self.preprocess_worker: Optional[VectorWorker] = None
 
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
@@ -529,7 +524,7 @@ class Ui_MainWindow(object):
 
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
         self.btn_fe = QtWidgets.QPushButton("提取特征")
-        self.btn_vector = QtWidgets.QPushButton("数据处理（向量化）")
+        self.btn_vector = QtWidgets.QPushButton("数据预处理")
         self.btn_train = QtWidgets.QPushButton("训练模型")
         self.btn_analysis = QtWidgets.QPushButton("运行分析")
         self.btn_predict = QtWidgets.QPushButton("加载模型预测")
@@ -564,7 +559,7 @@ class Ui_MainWindow(object):
         self.btn_export.clicked.connect(self._on_export_results)
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_fe.clicked.connect(self._on_extract_features)
-        self.btn_vector.clicked.connect(self._on_vectorize_features)
+        self.btn_vector.clicked.connect(self._on_preprocess_features)
         self.btn_train.clicked.connect(self._on_train_model)
         self.btn_analysis.clicked.connect(self._on_run_analysis)
         self.btn_predict.clicked.connect(self._on_predict)
@@ -596,7 +591,7 @@ class Ui_MainWindow(object):
         return PATHS["results_pred"]
     def _abnormal_out_dir(self):
         return PATHS["results_abnormal"]
-    def _vector_out_dir(self):
+    def _preprocess_out_dir(self):
         return PATHS["results_vector"]
     def _browse_compat(self):
         p, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择 pcap 文件", "", "pcap (*.pcap *.pcapng);;所有文件 (*)")
@@ -892,7 +887,6 @@ class Ui_MainWindow(object):
             files=file_list if os.path.isdir(path) else None,
             proto_filter=proto, port_whitelist_text=wl, port_blacklist_text=bl,
             fast=True,
-            fast_time_budget=1.0,
         )
         self.worker.progress.connect(lambda p: self.set_button_progress(self.btn_view, p))
         self.worker.finished.connect(self._on_worker_finished)
@@ -911,7 +905,6 @@ class Ui_MainWindow(object):
         out_csv = getattr(df, "attrs", {}).get("out_csv", None)
         files_total = getattr(df, "attrs", {}).get("files_total", None)
         errs = getattr(df, "attrs", {}).get("errors", "")
-        fast_summary = getattr(df, "attrs", {}).get("fast_summary", False)
 
         dst_dir = self._default_csv_info_dir()
         os.makedirs(dst_dir, exist_ok=True)
@@ -938,21 +931,7 @@ class Ui_MainWindow(object):
                 head_txt = df.head(20).to_string()
             except Exception:
                 head_txt = "(预览生成失败)"
-            if fast_summary:
-                truncated_count = 0
-                if hasattr(df, "columns") and "truncated" in df.columns:
-                    try:
-                        truncated_count = int(df["truncated"].sum())
-                    except Exception:
-                        truncated_count = 0
-                note = "（快速模式，仅展示核心统计" + (
-                    f"；其中 {truncated_count} 个因时间限制被截断" if truncated_count else ""
-                ) + "）"
-            else:
-                note = "（表格仅显示前 {limit} 行；全部已写入 CSV）".format(
-                    limit=PREVIEW_LIMIT_FOR_TABLE
-                )
-            self.display_result(f"[INFO] 解析完成{note}.\n{head_txt}", append=False)
+            self.display_result(f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}", append=False)
             rows = len(df) if hasattr(df, "__len__") else 0
             self.bottom_label.setText(f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个  @2025")
         if errs:
@@ -967,30 +946,75 @@ class Ui_MainWindow(object):
 
     # --------- 导出异常 ----------
     def _on_export_results(self):
-        df = self._last_preview_df
-        if df is None or (hasattr(df, "empty") and df.empty):
-            QtWidgets.QMessageBox.warning(None, "没有数据", "请先查看或加载带预测的数据。"); return
         out_dir = self._abnormal_out_dir()
         os.makedirs(out_dir, exist_ok=True)
 
+        summary_payload = self._analysis_summary if isinstance(self._analysis_summary, dict) else {}
+        export_payload = summary_payload.get("export_payload") if isinstance(summary_payload.get("export_payload"), dict) else None
+        metrics_payload = summary_payload.get("metrics") if isinstance(summary_payload.get("metrics"), dict) else None
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        written_any = False
+
+        if export_payload:
+            anomaly_count = int(export_payload.get("anomaly_count", 0))
+            anomaly_files = [str(x) for x in export_payload.get("anomaly_files", []) if x]
+            single_status = export_payload.get("single_file_status")
+
+            summary_txt = [f"异常包数量: {anomaly_count}"]
+            if anomaly_files:
+                summary_txt.append("异常包名: " + ", ".join(anomaly_files))
+            else:
+                summary_txt.append("异常包名: 无")
+            if single_status:
+                summary_txt.append(f"单文件结论: {single_status}")
+
+            summary_txt_display = "\n".join(summary_txt)
+            self.display_result(f"[INFO] 导出摘要：\n{summary_txt_display}")
+
+            summary_txt_path = os.path.join(out_dir, f"abnormal_summary_{timestamp}.txt")
+            with open(summary_txt_path, "w", encoding="utf-8") as fh:
+                fh.write(summary_txt_display)
+            self._add_output(summary_txt_path)
+            written_any = True
+
+            if metrics_payload and metrics_payload.get("anomalous_files") and pd is not None:
+                try:
+                    df_files = pd.DataFrame(metrics_payload["anomalous_files"])
+                    if not df_files.empty:
+                        csv_path = os.path.join(out_dir, f"abnormal_files_{timestamp}.csv")
+                        df_files.to_csv(csv_path, index=False, encoding="utf-8")
+                        self._add_output(csv_path)
+                        written_any = True
+                except Exception as exc:
+                    self.display_result(f"[WARN] 导出异常文件列表失败：{exc}")
+
+            if anomaly_count == 0:
+                QtWidgets.QMessageBox.information(None, "没有异常", "当前分析结果中未检测到异常流量。")
+                return
+
+        df = self._last_preview_df
+        if df is None or (hasattr(df, "empty") and df.empty):
+            if written_any:
+                return
+            QtWidgets.QMessageBox.warning(None, "没有数据", "请先查看或加载带预测的数据。")
+            return
+
         export_df = None
-        if "prediction" in df.columns and pd is not None:
-            try:
-                values = df["prediction"].tolist()
-            except Exception:
-                values = list(df["prediction"])
-            _, flags = normalize_prediction_output(values)
-            mask = pd.Series(flags, index=df.index).astype(bool)
-            export_df = df[mask].copy()
+        if "prediction" in df.columns:
+            export_df = df[df["prediction"] == -1].copy()
         elif "anomaly_score" in df.columns:
             export_df = df[df["anomaly_score"] > 0].copy()
         else:
-            QtWidgets.QMessageBox.information(None, "无异常标记", "没有 prediction 或 anomaly_score 列，无法筛选异常。")
+            if not written_any:
+                QtWidgets.QMessageBox.information(None, "无异常标记", "没有 prediction 或 anomaly_score 列，无法筛选异常。")
             return
         if export_df.empty:
-            QtWidgets.QMessageBox.information(None, "没有异常", "当前数据中未检测到异常行。"); return
+            if not written_any:
+                QtWidgets.QMessageBox.information(None, "没有异常", "当前数据中未检测到异常行。")
+            return
 
-        outp = os.path.join(out_dir, f"abnormal_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+        outp = os.path.join(out_dir, f"abnormal_{timestamp}.csv")
         export_df.to_csv(outp, index=False, encoding="utf-8")
         self._add_output(outp)
         self.display_result(f"[INFO] 已导出异常CSV：{outp}")
@@ -1038,43 +1062,30 @@ class Ui_MainWindow(object):
         except Exception:
             pass
 
-    def _on_fe_dir_finished(self, payload):
+    def _on_fe_dir_finished(self, csv_list: List[str]):
         self.btn_fe.setEnabled(True)
         self.set_button_progress(self.btn_fe, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
-        info = payload if isinstance(payload, dict) else {}
-        csv_path = info.get("csv_path")
-        manifest_path = info.get("manifest_path")
-        files = info.get("files") or []
-        total_rows = info.get("total_rows")
-
-        summary = f"[INFO] 目录特征提取完成：合并 {len(files)} 个文件"
-        if total_rows is not None:
-            summary += f"，共 {total_rows} 条记录"
-        if csv_path:
-            summary += f"，输出：{csv_path}"
-        self.display_result(summary)
-
-        if csv_path and os.path.exists(csv_path):
-            self._add_output(csv_path)
+        self.display_result(f"[INFO] 目录特征提取完成：共 {len(csv_list)} 个 CSV")
+        for p in csv_list:
+            if os.path.exists(p): self._add_output(p)
+        if csv_list:
+            first = csv_list[0]
             try:
-                df = pd.read_csv(csv_path, nrows=50, encoding="utf-8")
+                df = pd.read_csv(first, nrows=50, encoding="utf-8")
                 self.populate_table_from_df(df)
-                self._last_out_csv = csv_path
-                self._open_csv_paged(csv_path)
+                self._last_out_csv = first
+                self._open_csv_paged(first)
             except Exception:
                 pass
-
-        if manifest_path and os.path.exists(manifest_path):
-            self._add_output(manifest_path)
 
     def _on_fe_error(self, msg):
         self.btn_fe.setEnabled(True); self.reset_button_progress(self.btn_fe)
         QtWidgets.QMessageBox.critical(None, "特征提取失败", msg)
         self.display_result(f"[错误] 特征提取失败: {msg}")
 
-    # --------- 向量化处理（基于特征 CSV） ----------
-    def _on_vectorize_features(self):
+    # --------- 数据预处理（基于特征 CSV） ----------
+    def _on_preprocess_features(self):
         feature_dir = self._default_csv_feature_dir()
         if not os.path.isdir(feature_dir):
             QtWidgets.QMessageBox.warning(None, "目录不存在", f"特征目录不存在：{feature_dir}")
@@ -1082,25 +1093,25 @@ class Ui_MainWindow(object):
 
         csv_files = [n for n in os.listdir(feature_dir) if n.lower().endswith(".csv")]
         if not csv_files:
-            QtWidgets.QMessageBox.information(None, "没有特征数据", "请先完成特征提取后再进行向量化处理。")
+            QtWidgets.QMessageBox.information(None, "没有特征数据", "请先完成特征提取后再进行数据预处理。")
             return
 
-        out_dir = self._vector_out_dir()
+        out_dir = self._preprocess_out_dir()
         os.makedirs(out_dir, exist_ok=True)
 
-        self.display_result(f"[INFO] 向量化处理：{feature_dir} -> {out_dir}")
+        self.display_result(f"[INFO] 数据预处理：{feature_dir} -> {out_dir}")
         self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
-        self.vector_worker = VectorWorker(feature_dir, out_dir)
-        self.vector_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
-        self.vector_worker.finished.connect(self._on_vector_finished)
-        self.vector_worker.error.connect(self._on_vector_error)
-        self.vector_worker.start()
+        self.preprocess_worker = PreprocessWorker(feature_dir, out_dir)
+        self.preprocess_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
+        self.preprocess_worker.finished.connect(self._on_preprocess_finished)
+        self.preprocess_worker.error.connect(self._on_preprocess_error)
+        self.preprocess_worker.start()
 
-    def _on_vector_finished(self, result):
+    def _on_preprocess_finished(self, result):
         self.btn_vector.setEnabled(True)
         self.set_button_progress(self.btn_vector, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_vector))
-        self.vector_worker = None
+        self.preprocess_worker = None
 
         data = result if isinstance(result, dict) else {}
         dataset = data.get("dataset_path")
@@ -1123,31 +1134,31 @@ class Ui_MainWindow(object):
         if meta_path:
             self._add_output(meta_path)
 
-        summary = f"[INFO] 向量化完成：{total_rows or 0} 条记录，{total_cols or 0} 个特征。"
+        summary = f"[INFO] 数据预处理完成：{total_rows or 0} 条记录，{total_cols or 0} 个特征。"
         if dataset:
             summary += f" 数据集：{dataset}"
         self.display_result(summary)
 
-    def _on_vector_error(self, msg):
+    def _on_preprocess_error(self, msg):
         self.btn_vector.setEnabled(True)
         self.reset_button_progress(self.btn_vector)
-        QtWidgets.QMessageBox.critical(None, "向量化失败", msg)
-        self.display_result(f"[错误] 向量化失败: {msg}")
-        self.vector_worker = None
+        QtWidgets.QMessageBox.critical(None, "数据预处理失败", msg)
+        self.display_result(f"[错误] 数据预处理失败: {msg}")
+        self.preprocess_worker = None
 
     # --------- 训练模型（按顶部路径） ----------
     def _on_train_model(self):
         selected_path = self.file_edit.text().strip()
-        vector_dir = self._vector_out_dir()
+        preprocess_dir = self._preprocess_out_dir()
 
         if selected_path and os.path.exists(selected_path):
             path = selected_path
         else:
-            path = vector_dir
+            path = preprocess_dir
             if selected_path:
-                self.display_result(f"[WARN] 选择的路径不存在，自动改用向量目录：{vector_dir}")
+                self.display_result(f"[WARN] 选择的路径不存在，自动改用预处理目录：{preprocess_dir}")
             else:
-                self.display_result(f"[INFO] 未选择路径，默认使用向量目录：{vector_dir}")
+                self.display_result(f"[INFO] 未选择路径，默认使用预处理目录：{preprocess_dir}")
 
         res_dir = self._default_results_dir()
         mdl_dir = self._default_models_dir()
@@ -1168,14 +1179,6 @@ class Ui_MainWindow(object):
         msg = (f"results:\n- {res.get('results_csv')}\n- {res.get('summary_csv')}\n"
                f"models:\n- {res.get('model_path')}\n- {res.get('scaler_path')}\n"
                f"flows={res.get('flows')} malicious={res.get('malicious')}")
-        acc = res.get("accuracy")
-        acc_col = res.get("accuracy_column")
-        if isinstance(acc, (int, float)):
-            acc_pct = f"{acc * 100:.2f}%"
-            if acc_col:
-                msg += f"\n准确率：{acc_pct}（基于 {acc_col} 列）"
-            else:
-                msg += f"\n准确率：{acc_pct}"
         self.display_result(f"[INFO] 训练完成：\n{msg}")
         for k in ("results_csv", "summary_csv", "model_path", "scaler_path"):
             p = res.get(k)
@@ -1201,6 +1204,7 @@ class Ui_MainWindow(object):
                 self.display_result("请先选择结果CSV"); return
 
         self.display_result(f"[INFO] 正在分析结果 -> {out_dir}")
+        self._analysis_summary = None
         self.btn_analysis.setEnabled(False); self.set_button_progress(self.btn_analysis, 1)
         self.analysis_worker = AnalysisWorker(csv, out_dir)
         self.analysis_worker.progress.connect(lambda p: self.set_button_progress(self.btn_analysis, p))
@@ -1215,8 +1219,12 @@ class Ui_MainWindow(object):
         out_dir = None
         plot_paths: List[str] = []
         top20_csv: Optional[str] = None
+        summary_csv: Optional[str] = None
+        summary_text: Optional[str] = None
+        summary_json: Optional[str] = None
 
         if isinstance(result, dict):
+            self._analysis_summary = result
             out_dir = result.get("out_dir") or None
             plots = result.get("plots") or []
             if isinstance(plots, (list, tuple)):
@@ -1224,13 +1232,20 @@ class Ui_MainWindow(object):
             elif isinstance(plots, str):
                 plot_paths = [plots]
             top20_csv = result.get("top20_csv") if isinstance(result.get("top20_csv"), str) else None
+            summary_csv = result.get("summary_csv") if isinstance(result.get("summary_csv"), str) else None
+            summary_text = result.get("summary_text") if isinstance(result.get("summary_text"), str) else None
+            summary_json = result.get("summary_json") if isinstance(result.get("summary_json"), str) else None
         else:
             out_dir = str(result) if result is not None else None
 
         if not out_dir:
             out_dir = self._analysis_out_dir()
 
-        self.display_result(f"[INFO] 分析完成，图表保存在 {out_dir}")
+        base_msg = f"[INFO] 分析完成，图表保存在 {out_dir}"
+        if summary_text:
+            self.display_result(f"{base_msg}\n{summary_text}")
+        else:
+            self.display_result(base_msg)
 
         added_paths: Set[str] = set()
 
@@ -1262,9 +1277,15 @@ class Ui_MainWindow(object):
         for name in fallback_names:
             _mark(os.path.join(out_dir, name))
 
-        summary_csv = os.path.join(self._default_results_dir(), "summary_by_file.csv")
-        if os.path.exists(summary_csv):
+        if summary_csv:
             _mark(summary_csv)
+        else:
+            default_summary = os.path.join(self._default_results_dir(), "summary_by_file.csv")
+            if os.path.exists(default_summary):
+                _mark(default_summary)
+
+        if summary_json:
+            _mark(summary_json)
 
         if out_dir and os.path.isdir(out_dir):
             _mark(out_dir)
@@ -1273,6 +1294,7 @@ class Ui_MainWindow(object):
         self.btn_analysis.setEnabled(True); self.reset_button_progress(self.btn_analysis)
         QtWidgets.QMessageBox.critical(None, "分析失败", msg)
         self.display_result(f"[错误] 分析失败: {msg}")
+        self._analysis_summary = None
 
     # --------- 模型预测（支持 Pipeline / 模型+scaler / 仅模型） ----------
     def _on_predict(self):
@@ -1286,14 +1308,6 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{e}"); return
         if df.empty:
             QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。"); return
-
-        truth_col = None
-        truth_series = None
-        if pd is not None:
-            try:
-                truth_col, truth_series = infer_ground_truth_labels(df)
-            except Exception:
-                truth_col, truth_series = None, None
 
         from joblib import load as joblib_load
 
@@ -1352,65 +1366,12 @@ class Ui_MainWindow(object):
             if need_k <= 0:
                 QtWidgets.QMessageBox.warning(None, "无法确定列数", "StandardScaler 未包含 n_features_in_ 信息。")
                 return
-
-            preferred_cols = list(getattr(scaler, "feature_names_in_", []))
-            cols: List[str]
-            if preferred_cols:
-                cols = [str(col) for col in preferred_cols]
-            else:
-                cols = []
-                for col in use_df.columns:
-                    if col in META_COLUMNS:
-                        continue
-                    lower = str(col).lower()
-                    if lower.startswith("__"):
-                        continue
-                    if any(key in lower for key in LABEL_KEYWORDS):
-                        continue
-                    cols.append(col)
-
-            if not cols:
-                QtWidgets.QMessageBox.warning(None, "未找到特征列", "当前数据集中没有可用于预测的特征列。")
-                return
-
-            seen: Set[str] = set()
-            ordered_cols: List[str] = []
-            for col in cols:
-                if col in seen:
-                    continue
-                if col not in use_df.columns:
-                    use_df[col] = 0
-                ordered_cols.append(col)
-                seen.add(col)
-
-            if len(ordered_cols) < need_k:
-                extra_candidates: List[str] = []
-                for col in use_df.columns:
-                    if col in seen:
-                        continue
-                    try:
-                        pd.to_numeric(use_df[col])
-                    except Exception:
-                        continue
-                    extra_candidates.append(col)
-                for col in extra_candidates:
-                    ordered_cols.append(col)
-                    seen.add(col)
-                    if len(ordered_cols) >= need_k:
-                        break
-
-            if len(ordered_cols) > need_k:
-                ordered_cols = ordered_cols[:need_k]
-
-            if len(ordered_cols) != need_k:
-                QtWidgets.QMessageBox.warning(
-                    None,
-                    "列数不匹配",
-                    f"根据现有规则筛选后的列数为 {len(ordered_cols)}，但模型需要 {need_k} 列，请确认输入数据是否与训练时一致。",
-                )
-                return
-
-            X = use_df[ordered_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
+            dlg = FeaturePickDialog(list(use_df.columns), need_k)
+            if dlg.exec_() != QtWidgets.QDialog.Accepted: return
+            cols = dlg.selected_columns()
+            for c in cols:
+                if c not in use_df.columns: use_df[c] = 0
+            X = use_df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
         else:
             X = use_df.apply(pd.to_numeric, errors="coerce").fillna(0.0).values
 
@@ -1437,32 +1398,9 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}"); return
 
         out_df = df.copy()
-        pred_labels, pred_flags = normalize_prediction_output(list(pred))
-        out_df["prediction"] = pred_labels
-        out_df["is_malicious"] = pred_flags
+        out_df["prediction"] = pred
         if score is not None:
             out_df["anomaly_score"] = score
-
-        acc_text = ""
-        if truth_series is not None and pd is not None:
-            try:
-                truth_bool = truth_series.astype(bool)
-                pred_bool = pd.Series([flag == 1 for flag in pred_flags], index=df.index)
-                comp = (pred_bool == truth_bool)
-                comp = comp.dropna()
-                if not comp.empty:
-                    acc_val = float(comp.mean())
-                    acc_pct = f"{acc_val * 100:.2f}%"
-                    if truth_col:
-                        acc_text = f"准确率：{acc_pct}（基于 {truth_col} 列）"
-                    else:
-                        acc_text = f"准确率：{acc_pct}"
-                    gt_name = truth_col or "ground_truth"
-                    if gt_name in out_df.columns:
-                        gt_name = f"{gt_name}_ground_truth"
-                    out_df[gt_name] = ["异常" if flag else "正常" for flag in truth_bool.tolist()]
-            except Exception:
-                acc_text = ""
 
         pred_dir = self._prediction_out_dir()
         os.makedirs(pred_dir, exist_ok=True)
@@ -1473,10 +1411,7 @@ class Ui_MainWindow(object):
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "保存失败", f"无法写出预测结果：{e}"); return
 
-        msg = f"[INFO] 预测完成：{out_csv}"
-        if acc_text:
-            msg += f"\n{acc_text}"
-        self.display_result(msg)
+        self.display_result(f"[INFO] 预测完成：{out_csv}")
         self._add_output(out_csv)
         self._open_csv_paged(out_csv)
 
@@ -1520,8 +1455,8 @@ class Ui_MainWindow(object):
     def _on_clear(self):
         if getattr(self, "worker", None) and self.worker.isRunning():
             self.worker.requestInterruption()
-        if getattr(self, "vector_worker", None) and self.vector_worker.isRunning():
-            self.vector_worker.requestInterruption()
+        if getattr(self, "preprocess_worker", None) and self.preprocess_worker.isRunning():
+            self.preprocess_worker.requestInterruption()
 
         self.results_text.setUpdatesEnabled(False)
         self.table_view.setUpdatesEnabled(False)

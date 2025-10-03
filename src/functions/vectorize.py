@@ -1,4 +1,4 @@
-"""特征 CSV 的向量化工具，生成可直接用于模型训练的数据集。"""
+"""特征 CSV 数据预处理，将其整理成可直接用于模型训练的标准化数据集。"""
 
 from __future__ import annotations
 
@@ -7,14 +7,33 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple
-from uuid import uuid4
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import tempfile
+from pandas.api.types import (
+    is_bool_dtype,
+    is_categorical_dtype,
+    is_datetime64_any_dtype,
+    is_numeric_dtype,
+)
 
 ProgressCallback = Optional[Callable[[int], None]]
+
+# 在预处理后仍保留的原始元信息列，用于训练时按文件等维度汇总
+RESERVED_META_COLUMNS = [
+    "__source_file__",
+    "__source_path__",
+    "pcap_file",
+    "flow_id",
+    "src_ip",
+    "dst_ip",
+    "src_port",
+    "dst_port",
+    "protocol",
+]
+
+MISSING_TOKEN = "<MISSING>"
 
 
 def _notify(cb: ProgressCallback, value: int) -> None:
@@ -32,214 +51,68 @@ def _load_feature_csv(csv_path: str) -> pd.DataFrame:
     return df
 
 
-def _vectorize_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, List[str]]]:
-    """将任意 DataFrame 转换为仅包含数值列的矩阵，并返回分类列映射。"""
-
-    numeric_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
-    numeric_part = pd.DataFrame(index=df.index)
-    if numeric_cols:
-        numeric_part = df[numeric_cols].apply(pd.to_numeric, errors="coerce").astype("float32")
-
-    categorical_cols = [c for c in df.columns if c not in numeric_cols]
-    categorical_maps: Dict[str, List[str]] = {}
-    categorical_parts = []
-
-    for col in categorical_cols:
-        series = df[col]
-        # 将缺失值统一标记，保证 factorize 不返回 -1
-        filled = series.fillna("<NA>")
-        if filled.dtype == object:
-            normalized = filled.astype(str)
-        else:
-            normalized = filled.astype(str)
-        codes, uniques = pd.factorize(normalized, sort=True)
-        categorical_maps[col] = [str(u) for u in uniques]
-        categorical_parts.append(pd.Series(codes.astype("float32"), name=f"{col}__id"))
-
-    pieces = []
-    if not numeric_part.empty:
-        pieces.append(numeric_part)
-    if categorical_parts:
-        pieces.append(pd.concat(categorical_parts, axis=1))
-
-    if not pieces:
-        raise ValueError("未找到可向量化的列")
-
-    matrix = pd.concat(pieces, axis=1)
-    # 统一为 float32，缺失值后续在写入 numpy 数组时再处理，避免在 DataFrame
-    # 阶段额外拷贝一份巨大的矩阵导致的内存峰值。
-    matrix = matrix.astype("float32", copy=False)
-    return matrix, categorical_maps
-
-
-def _matrix_to_numpy(
-    matrix: pd.DataFrame,
-    *,
-    dtype: str = "float32",
-    allow_memmap: bool = True,
-) -> Tuple[np.ndarray, Optional[str]]:
-    """
-    将 DataFrame 转换为 numpy 数组。
-
-    pandas 在极宽的矩阵（列非常多，行很少）的场景下会在 ``DataFrame.to_numpy``
-    中一次性申请一整块连续内存，即便数据量并不算大也可能因为内存碎片
-    或平台限制导致失败。这里首先尝试直接转换；若失败则退化为手动按列
-    分块复制到目标数组/内存映射文件，避免在转换过程中额外的巨大临时内存。
-    """
-
-    target_dtype = np.dtype(dtype)
-    try:
-        arr = matrix.to_numpy(dtype=target_dtype, copy=False)
-        if np.issubdtype(arr.dtype, np.floating):
-            np.nan_to_num(arr, copy=False)
-        return arr, None
-    except Exception as exc:  # pragma: no cover - fallback path在宽矩阵上触发
-        is_memory_issue = isinstance(exc, MemoryError) or exc.__class__.__name__ == "_ArrayMemoryError"
-        if not is_memory_issue and "Unable to allocate" not in str(exc):
-            raise
-        first_error = exc
-
-    rows, cols = matrix.shape
-    if rows == 0 or cols == 0:
-        raise RuntimeError("数据为空，无法转换为数组。")
-
-    def _iter_column_chunks(chunk_target_bytes: int):
-        cells_per_chunk = max(1, chunk_target_bytes // max(1, target_dtype.itemsize))
-        chunk_cols = cells_per_chunk // max(1, rows)
-        if chunk_cols <= 0:
-            chunk_cols = 1
-        chunk_cols = min(cols, max(1, chunk_cols))
-
-        for start in range(0, cols, chunk_cols):
-            end = min(cols, start + chunk_cols)
-            try:
-                chunk = matrix.iloc[:, start:end].to_numpy(dtype=target_dtype, copy=False)
-            except MemoryError as exc:
-                raise MemoryError(
-                    "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
-                ) from exc
-            if np.issubdtype(chunk.dtype, np.floating):
-                np.nan_to_num(chunk, copy=False)
-            yield start, end, chunk
-
-    def _copy_into(target: np.ndarray | np.memmap) -> None:
-        for start, end, chunk in _iter_column_chunks(8 * 1024 * 1024):
-            try:
-                target[:, start:end] = chunk
-            except MemoryError as exc:
-                raise MemoryError(
-                    "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
-                ) from exc
-
-    try:
-        arr = np.empty((rows, cols), dtype=target_dtype)
-        _copy_into(arr)
-        arr.setflags(write=False)
-        return arr, None
-    except MemoryError:
-        if not allow_memmap:
-            raise MemoryError(
-                "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
-            ) from first_error
-
-    temp_dir = tempfile.gettempdir()
-    temp_path = os.path.join(temp_dir, f"vectorize_{uuid4().hex}.npy")
-    try:
-        mm = np.lib.format.open_memmap(
-            temp_path,
-            mode="w+",
-            dtype=target_dtype,
-            shape=(rows, cols),
-        )
-        _copy_into(mm)
-        mm.flush()
-        mm.flags.writeable = False
-        return mm, temp_path
-    except Exception:
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-        raise MemoryError(
-            "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
-        ) from first_error
-
-
-def vectorize_csv(
-    csv_path: str,
-    output_path: str,
-    *,
-    progress_cb: ProgressCallback = None,
-) -> Dict[str, object]:
-    """将单个特征 CSV 向量化并保存为 .npz。"""
-
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV 文件不存在: {csv_path}")
-
-    _notify(progress_cb, 5)
-    df = _load_feature_csv(csv_path)
-
-    # 不参与训练但需要在清单中保留的列
-    meta_cols = ["__source_file__", "__source_path__"]
-    clean_df = df.drop(columns=meta_cols, errors="ignore")
-
-    _notify(progress_cb, 35)
-    matrix, cat_maps = _vectorize_dataframe(clean_df)
-    columns = matrix.columns.to_list()
-    rows, cols = matrix.shape
-
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-
-    X, memmap_path = _matrix_to_numpy(matrix)
-    del matrix
-    np.savez_compressed(
-        output_path,
-        X=X,
-        columns=columns,
-        source_csv=os.path.abspath(csv_path),
-    )
-
-    if isinstance(X, np.memmap):
-        X.flush()
-        del X
-    if memmap_path:
-        try:
-            os.remove(memmap_path)
-        except OSError:
-            pass
-
-    meta: Dict[str, object] = {
-        "vector_path": output_path,
-        "source_csv": os.path.abspath(csv_path),
-        "rows": int(rows),
-        "cols": int(cols),
-        "columns": columns,
+def _prepare_numeric(series: pd.Series) -> tuple[pd.Series, Dict[str, float]]:
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.isna().all():
+        fill_value = 0.0
+    else:
+        fill_value = float(numeric.median(skipna=True))
+        if np.isnan(fill_value):
+            fill_value = float(numeric.dropna().iloc[0]) if numeric.dropna().any() else 0.0
+    filled = numeric.fillna(fill_value).astype("float32")
+    stats = {
+        "fill_value": float(fill_value),
+        "min": float(filled.min(initial=0.0)),
+        "max": float(filled.max(initial=0.0)),
+        "mean": float(filled.mean()),
+        "std": float(filled.std(ddof=0)),
     }
-
-    if cat_maps:
-        cat_path = output_path.replace(".npz", "_cats.json")
-        with open(cat_path, "w", encoding="utf-8") as fh:
-            json.dump(cat_maps, fh, ensure_ascii=False, indent=2)
-        meta["categorical_map_path"] = cat_path
-
-    _notify(progress_cb, 100)
-    return meta
+    return filled, stats
 
 
-def vectorize_feature_dir(
+def _prepare_boolean(series: pd.Series) -> tuple[pd.Series, Dict[str, float]]:
+    bool_series = series.fillna(False).astype(bool)
+    numeric = bool_series.astype("int32")
+    stats = {
+        "fill_value": 0.0,
+        "min": float(numeric.min()),
+        "max": float(numeric.max()),
+        "mean": float(numeric.mean()),
+        "std": float(numeric.std(ddof=0)),
+    }
+    return numeric, stats
+
+
+def _prepare_categorical(series: pd.Series, column: str) -> tuple[pd.Series, Dict[str, object]]:
+    filled = series.fillna(MISSING_TOKEN)
+    if is_datetime64_any_dtype(filled):
+        filled = filled.astype(str)
+    elif not is_categorical_dtype(filled):
+        filled = filled.astype(str)
+    normalized = filled.str.strip().replace("", MISSING_TOKEN)
+    codes, uniques = pd.factorize(normalized, sort=True)
+    encoded = pd.Series(codes.astype("int32"), name=f"{column}__code", index=series.index)
+    metadata = {
+        "source_column": column,
+        "labels": [str(u) for u in uniques],
+        "missing_token": MISSING_TOKEN,
+    }
+    return encoded, metadata
+
+
+def preprocess_feature_dir(
     feature_dir: str,
     output_dir: str,
     *,
     progress_cb: ProgressCallback = None,
 ) -> Dict[str, object]:
-    """批量读取特征 CSV 并生成统一的训练数据集。"""
+    """批量读取特征 CSV，执行数据预处理并输出统一的训练数据集。"""
 
     if not os.path.isdir(feature_dir):
         raise FileNotFoundError(f"目录不存在: {feature_dir}")
 
     patterns = ["*.csv", "*.CSV"]
-    csv_files = []
+    csv_files: List[str] = []
     for pattern in patterns:
         csv_files.extend(glob.glob(os.path.join(feature_dir, pattern)))
     csv_files = sorted(set(csv_files))
@@ -249,25 +122,25 @@ def vectorize_feature_dir(
 
     os.makedirs(output_dir, exist_ok=True)
 
-    frames: List[pd.DataFrame] = []
-    manifest_rows: List[Dict[str, object]] = []
-    total_files = len(csv_files)
-    row_cursor = 0
-
-    max_workers = min(8, max(1, os.cpu_count() or 4))
     frames_map: Dict[str, pd.DataFrame] = {}
+    total_files = len(csv_files)
+    max_workers = min(8, max(1, os.cpu_count() or 4))
 
     if total_files > 1 and max_workers > 1:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_map = {executor.submit(_load_feature_csv, path): path for path in csv_files}
-            for completed_idx, future in enumerate(as_completed(future_map), start=1):
+            for idx, future in enumerate(as_completed(future_map), start=1):
                 path = future_map[future]
                 frames_map[path] = future.result()
-                _notify(progress_cb, 5 + int(20 * completed_idx / total_files))
+                _notify(progress_cb, 5 + int(20 * idx / total_files))
     else:
         for idx, csv_path in enumerate(csv_files, start=1):
             frames_map[csv_path] = _load_feature_csv(csv_path)
             _notify(progress_cb, 5 + int(20 * idx / total_files))
+
+    frames: List[pd.DataFrame] = []
+    manifest_rows: List[Dict[str, object]] = []
+    row_cursor = 0
 
     for idx, csv_path in enumerate(csv_files, start=1):
         df = frames_map[csv_path]
@@ -286,56 +159,96 @@ def vectorize_feature_dir(
             }
         )
         row_cursor += rows
-        _notify(progress_cb, 25 + int(15 * idx / total_files))
+        _notify(progress_cb, 30 + int(15 * idx / total_files))
 
     full_df = pd.concat(frames, ignore_index=True)
     if full_df.empty:
-        raise RuntimeError("聚合后的特征数据为空，无法向量化。")
+        raise RuntimeError("聚合后的特征数据为空，无法进行预处理。")
 
-    # 保留原始文件清单用于训练集切分
-    metadata_cols = ["__source_file__", "__source_path__"]
-    working_df = full_df.drop(columns=metadata_cols, errors="ignore")
+    meta_cols_in_df = [col for col in RESERVED_META_COLUMNS if col in full_df.columns]
 
-    _notify(progress_cb, 50)
-    matrix, cat_maps = _vectorize_dataframe(working_df)
-    columns = matrix.columns.to_list()
-    rows, cols = matrix.shape
-    X, memmap_path = _matrix_to_numpy(matrix)
-    del matrix
-    dataset_name = f"dataset_vectors_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    dataset_path = os.path.join(output_dir, f"{dataset_name}.npz")
-    np.savez_compressed(
-        dataset_path,
-        X=X,
-        columns=columns,
-    )
+    working_df = full_df.copy()
 
-    if isinstance(X, np.memmap):
-        X.flush()
-        del X
-    if memmap_path:
-        try:
-            os.remove(memmap_path)
-        except OSError:
-            pass
+    processed_columns: Dict[str, pd.Series] = {}
+    column_profiles: List[Dict[str, object]] = []
+    categorical_maps: Dict[str, Dict[str, object]] = {}
+    fill_strategies: Dict[str, float] = {}
 
+    for column in working_df.columns:
+        if column in meta_cols_in_df:
+            continue
+
+        series = working_df[column]
+
+        if is_bool_dtype(series):
+            encoded, stats = _prepare_boolean(series)
+            processed_columns[column] = encoded
+            column_profiles.append(
+                {
+                    "name": column,
+                    "kind": "boolean",
+                    **stats,
+                }
+            )
+            fill_strategies[column] = stats["fill_value"]
+        elif is_numeric_dtype(series):
+            encoded, stats = _prepare_numeric(series)
+            processed_columns[column] = encoded
+            column_profiles.append(
+                {
+                    "name": column,
+                    "kind": "numeric",
+                    **stats,
+                }
+            )
+            fill_strategies[column] = stats["fill_value"]
+        else:
+            encoded, meta = _prepare_categorical(series, column)
+            processed_columns[encoded.name] = encoded
+            categorical_maps[encoded.name] = meta
+            column_profiles.append(
+                {
+                    "name": encoded.name,
+                    "kind": "categorical_encoded",
+                    "source_column": column,
+                    "unique": len(meta["labels"]),
+                }
+            )
+
+    if not processed_columns:
+        raise RuntimeError("没有找到可用于训练的特征列。")
+
+    feature_df = pd.DataFrame(processed_columns, index=working_df.index)
+
+    if meta_cols_in_df:
+        meta_df = full_df[meta_cols_in_df]
+        processed_df = pd.concat([meta_df, feature_df], axis=1)
+    else:
+        processed_df = feature_df
+
+    dataset_name = f"dataset_preprocessed_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    dataset_path = os.path.join(output_dir, f"{dataset_name}.csv")
     manifest_path = os.path.join(output_dir, f"{dataset_name}_manifest.csv")
+    meta_path = os.path.join(output_dir, f"{dataset_name}_meta.json")
+
+    processed_df.to_csv(dataset_path, index=False, encoding="utf-8")
+
     manifest_df = pd.DataFrame(manifest_rows)
     manifest_df.to_csv(manifest_path, index=False, encoding="utf-8")
 
-    meta_path = os.path.join(output_dir, f"{dataset_name}_meta.json")
+    feature_columns = [col for col in processed_df.columns if col not in meta_cols_in_df]
+
     meta_payload = {
-        "dataset_path": dataset_path,
-        "manifest_path": manifest_path,
-        "rows": int(rows),
-        "cols": int(cols),
-        "columns": columns,
+        "type": "preprocessed_dataset",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "source_feature_dir": os.path.abspath(feature_dir),
+        "rows": int(len(processed_df)),
+        "feature_columns": feature_columns,
+        "meta_columns": meta_cols_in_df,
+        "fill_values": fill_strategies,
+        "categorical_maps": categorical_maps,
+        "column_profiles": column_profiles,
     }
-    if cat_maps:
-        cat_map_path = os.path.join(output_dir, f"{dataset_name}_cats.json")
-        with open(cat_map_path, "w", encoding="utf-8") as fh:
-            json.dump(cat_maps, fh, ensure_ascii=False, indent=2)
-        meta_payload["categorical_map_path"] = cat_map_path
 
     with open(meta_path, "w", encoding="utf-8") as fh:
         json.dump(meta_payload, fh, ensure_ascii=False, indent=2)
@@ -346,7 +259,7 @@ def vectorize_feature_dir(
         "dataset_path": dataset_path,
         "manifest_path": manifest_path,
         "meta_path": meta_path,
-        "total_rows": int(rows),
-        "total_cols": int(cols),
+        "total_rows": int(len(processed_df)),
+        "total_cols": int(len(feature_columns)),
         "files": csv_files,
     }
