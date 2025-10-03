@@ -10,7 +10,11 @@ from src.functions.feature_extractor import (
     extract_features as fe_single,
     extract_features_dir as fe_dir,
 )
-from src.functions.unsupervised_train import train_unsupervised_on_split as run_train
+from src.functions.unsupervised_train import (
+    train_unsupervised_on_split as run_train,
+    infer_ground_truth_labels,
+    normalize_prediction_output,
+)
 from src.functions.analyze_results import analyze_results as run_analysis
 from src.functions.vectorize import vectorize_feature_dir as vec_dir
 
@@ -968,8 +972,14 @@ class Ui_MainWindow(object):
         os.makedirs(out_dir, exist_ok=True)
 
         export_df = None
-        if "prediction" in df.columns:
-            export_df = df[df["prediction"] == -1].copy()
+        if "prediction" in df.columns and pd is not None:
+            try:
+                values = df["prediction"].tolist()
+            except Exception:
+                values = list(df["prediction"])
+            _, flags = normalize_prediction_output(values)
+            mask = pd.Series(flags, index=df.index).astype(bool)
+            export_df = df[mask].copy()
         elif "anomaly_score" in df.columns:
             export_df = df[df["anomaly_score"] > 0].copy()
         else:
@@ -1156,6 +1166,14 @@ class Ui_MainWindow(object):
         msg = (f"results:\n- {res.get('results_csv')}\n- {res.get('summary_csv')}\n"
                f"models:\n- {res.get('model_path')}\n- {res.get('scaler_path')}\n"
                f"flows={res.get('flows')} malicious={res.get('malicious')}")
+        acc = res.get("accuracy")
+        acc_col = res.get("accuracy_column")
+        if isinstance(acc, (int, float)):
+            acc_pct = f"{acc * 100:.2f}%"
+            if acc_col:
+                msg += f"\n准确率：{acc_pct}（基于 {acc_col} 列）"
+            else:
+                msg += f"\n准确率：{acc_pct}"
         self.display_result(f"[INFO] 训练完成：\n{msg}")
         for k in ("results_csv", "summary_csv", "model_path", "scaler_path"):
             p = res.get(k)
@@ -1267,6 +1285,14 @@ class Ui_MainWindow(object):
         if df.empty:
             QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。"); return
 
+        truth_col = None
+        truth_series = None
+        if pd is not None:
+            try:
+                truth_col, truth_series = infer_ground_truth_labels(df)
+            except Exception:
+                truth_col, truth_series = None, None
+
         from joblib import load as joblib_load
 
         mdl_path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1356,9 +1382,32 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}"); return
 
         out_df = df.copy()
-        out_df["prediction"] = pred
+        pred_labels, pred_flags = normalize_prediction_output(list(pred))
+        out_df["prediction"] = pred_labels
+        out_df["is_malicious"] = pred_flags
         if score is not None:
             out_df["anomaly_score"] = score
+
+        acc_text = ""
+        if truth_series is not None and pd is not None:
+            try:
+                truth_bool = truth_series.astype(bool)
+                pred_bool = pd.Series([flag == 1 for flag in pred_flags], index=df.index)
+                comp = (pred_bool == truth_bool)
+                comp = comp.dropna()
+                if not comp.empty:
+                    acc_val = float(comp.mean())
+                    acc_pct = f"{acc_val * 100:.2f}%"
+                    if truth_col:
+                        acc_text = f"准确率：{acc_pct}（基于 {truth_col} 列）"
+                    else:
+                        acc_text = f"准确率：{acc_pct}"
+                    gt_name = truth_col or "ground_truth"
+                    if gt_name in out_df.columns:
+                        gt_name = f"{gt_name}_ground_truth"
+                    out_df[gt_name] = ["异常" if flag else "正常" for flag in truth_bool.tolist()]
+            except Exception:
+                acc_text = ""
 
         pred_dir = self._prediction_out_dir()
         os.makedirs(pred_dir, exist_ok=True)
@@ -1369,7 +1418,10 @@ class Ui_MainWindow(object):
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "保存失败", f"无法写出预测结果：{e}"); return
 
-        self.display_result(f"[INFO] 预测完成：{out_csv}")
+        msg = f"[INFO] 预测完成：{out_csv}"
+        if acc_text:
+            msg += f"\n{acc_text}"
+        self.display_result(msg)
         self._add_output(out_csv)
         self._open_csv_paged(out_csv)
 

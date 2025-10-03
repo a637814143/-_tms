@@ -58,8 +58,8 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
     plt.savefig(out2)
     plt.close()
 
-    # 3) Top20 异常包（分数越小越异常）
-    top20 = df.sort_values("anomaly_score").head(20)
+    # 3) Top20 异常包（分数越高越异常）
+    top20 = df.sort_values("anomaly_score", ascending=False).head(20)
     out3 = os.path.join(out_dir, "top20_packets.csv")
     top20.to_csv(out3, index=False, encoding="utf-8")
 
