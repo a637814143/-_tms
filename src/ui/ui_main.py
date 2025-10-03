@@ -14,6 +14,8 @@ from src.functions.unsupervised_train import (
     train_unsupervised_on_split as run_train,
     infer_ground_truth_labels,
     normalize_prediction_output,
+    META_COLUMNS,
+    LABEL_KEYWORDS,
 )
 from src.functions.analyze_results import analyze_results as run_analysis
 from src.functions.vectorize import vectorize_feature_dir as vec_dir
@@ -1350,12 +1352,65 @@ class Ui_MainWindow(object):
             if need_k <= 0:
                 QtWidgets.QMessageBox.warning(None, "无法确定列数", "StandardScaler 未包含 n_features_in_ 信息。")
                 return
-            dlg = FeaturePickDialog(list(use_df.columns), need_k)
-            if dlg.exec_() != QtWidgets.QDialog.Accepted: return
-            cols = dlg.selected_columns()
-            for c in cols:
-                if c not in use_df.columns: use_df[c] = 0
-            X = use_df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
+
+            preferred_cols = list(getattr(scaler, "feature_names_in_", []))
+            cols: List[str]
+            if preferred_cols:
+                cols = [str(col) for col in preferred_cols]
+            else:
+                cols = []
+                for col in use_df.columns:
+                    if col in META_COLUMNS:
+                        continue
+                    lower = str(col).lower()
+                    if lower.startswith("__"):
+                        continue
+                    if any(key in lower for key in LABEL_KEYWORDS):
+                        continue
+                    cols.append(col)
+
+            if not cols:
+                QtWidgets.QMessageBox.warning(None, "未找到特征列", "当前数据集中没有可用于预测的特征列。")
+                return
+
+            seen: Set[str] = set()
+            ordered_cols: List[str] = []
+            for col in cols:
+                if col in seen:
+                    continue
+                if col not in use_df.columns:
+                    use_df[col] = 0
+                ordered_cols.append(col)
+                seen.add(col)
+
+            if len(ordered_cols) < need_k:
+                extra_candidates: List[str] = []
+                for col in use_df.columns:
+                    if col in seen:
+                        continue
+                    try:
+                        pd.to_numeric(use_df[col])
+                    except Exception:
+                        continue
+                    extra_candidates.append(col)
+                for col in extra_candidates:
+                    ordered_cols.append(col)
+                    seen.add(col)
+                    if len(ordered_cols) >= need_k:
+                        break
+
+            if len(ordered_cols) > need_k:
+                ordered_cols = ordered_cols[:need_k]
+
+            if len(ordered_cols) != need_k:
+                QtWidgets.QMessageBox.warning(
+                    None,
+                    "列数不匹配",
+                    f"根据现有规则筛选后的列数为 {len(ordered_cols)}，但模型需要 {need_k} 列，请确认输入数据是否与训练时一致。",
+                )
+                return
+
+            X = use_df[ordered_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
         else:
             X = use_df.apply(pd.to_numeric, errors="coerce").fillna(0.0).values
 
