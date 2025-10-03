@@ -66,7 +66,9 @@ def _vectorize_dataframe(df: pd.DataFrame) -> tuple[pd.DataFrame, Dict[str, List
         raise ValueError("未找到可向量化的列")
 
     matrix = pd.concat(pieces, axis=1)
-    matrix = matrix.fillna(0.0).astype("float32")
+    # 统一为 float32，缺失值后续在写入 numpy 数组时再处理，避免在 DataFrame
+    # 阶段额外拷贝一份巨大的矩阵导致的内存峰值。
+    matrix = matrix.astype("float32", copy=False)
     return matrix, categorical_maps
 
 
@@ -80,7 +82,10 @@ def _matrix_to_numpy(
 
     target_dtype = np.dtype(dtype)
     try:
-        return matrix.to_numpy(dtype=target_dtype, copy=False), None
+        arr = matrix.to_numpy(dtype=target_dtype, copy=False)
+        if np.issubdtype(arr.dtype, np.floating):
+            np.nan_to_num(arr, copy=False)
+        return arr, None
     except MemoryError:
         if not allow_memmap:
             raise
@@ -107,6 +112,8 @@ def _matrix_to_numpy(
             end = min(rows, start + chunk_rows)
             try:
                 chunk = matrix.iloc[start:end].to_numpy(dtype=target_dtype, copy=True)
+                if np.issubdtype(chunk.dtype, np.floating):
+                    np.nan_to_num(chunk, copy=False)
             except MemoryError as exc:
                 raise MemoryError(
                     "向量化时内存不足，建议减少一次处理的文件数量或过滤部分特征后重试。"
