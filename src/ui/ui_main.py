@@ -10,7 +10,13 @@ from src.functions.feature_extractor import (
     extract_features as fe_single,
     extract_features_dir as fe_dir,
 )
-from src.functions.unsupervised_train import train_unsupervised_on_split as run_train
+from src.functions.unsupervised_train import (
+    train_unsupervised_on_split as run_train,
+    infer_ground_truth_labels,
+    normalize_prediction_output,
+    META_COLUMNS,
+    LABEL_KEYWORDS,
+)
 from src.functions.analyze_results import analyze_results as run_analysis
 from src.functions.vectorize import vectorize_feature_dir as vec_dir
 
@@ -158,7 +164,7 @@ class FeatureWorker(QtCore.QThread):
 
 
 class DirFeatureWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(list)
+    finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
@@ -170,8 +176,8 @@ class DirFeatureWorker(QtCore.QThread):
 
     def run(self):
         try:
-            csvs = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
-            self.finished.emit(csvs)
+            result = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
+            self.finished.emit(result)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -886,6 +892,7 @@ class Ui_MainWindow(object):
             files=file_list if os.path.isdir(path) else None,
             proto_filter=proto, port_whitelist_text=wl, port_blacklist_text=bl,
             fast=True,
+            fast_time_budget=1.0,
         )
         self.worker.progress.connect(lambda p: self.set_button_progress(self.btn_view, p))
         self.worker.finished.connect(self._on_worker_finished)
@@ -904,6 +911,7 @@ class Ui_MainWindow(object):
         out_csv = getattr(df, "attrs", {}).get("out_csv", None)
         files_total = getattr(df, "attrs", {}).get("files_total", None)
         errs = getattr(df, "attrs", {}).get("errors", "")
+        fast_summary = getattr(df, "attrs", {}).get("fast_summary", False)
 
         dst_dir = self._default_csv_info_dir()
         os.makedirs(dst_dir, exist_ok=True)
@@ -930,7 +938,21 @@ class Ui_MainWindow(object):
                 head_txt = df.head(20).to_string()
             except Exception:
                 head_txt = "(预览生成失败)"
-            self.display_result(f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}", append=False)
+            if fast_summary:
+                truncated_count = 0
+                if hasattr(df, "columns") and "truncated" in df.columns:
+                    try:
+                        truncated_count = int(df["truncated"].sum())
+                    except Exception:
+                        truncated_count = 0
+                note = "（快速模式，仅展示核心统计" + (
+                    f"；其中 {truncated_count} 个因时间限制被截断" if truncated_count else ""
+                ) + "）"
+            else:
+                note = "（表格仅显示前 {limit} 行；全部已写入 CSV）".format(
+                    limit=PREVIEW_LIMIT_FOR_TABLE
+                )
+            self.display_result(f"[INFO] 解析完成{note}.\n{head_txt}", append=False)
             rows = len(df) if hasattr(df, "__len__") else 0
             self.bottom_label.setText(f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个  @2025")
         if errs:
@@ -952,8 +974,14 @@ class Ui_MainWindow(object):
         os.makedirs(out_dir, exist_ok=True)
 
         export_df = None
-        if "prediction" in df.columns:
-            export_df = df[df["prediction"] == -1].copy()
+        if "prediction" in df.columns and pd is not None:
+            try:
+                values = df["prediction"].tolist()
+            except Exception:
+                values = list(df["prediction"])
+            _, flags = normalize_prediction_output(values)
+            mask = pd.Series(flags, index=df.index).astype(bool)
+            export_df = df[mask].copy()
         elif "anomaly_score" in df.columns:
             export_df = df[df["anomaly_score"] > 0].copy()
         else:
@@ -1010,22 +1038,35 @@ class Ui_MainWindow(object):
         except Exception:
             pass
 
-    def _on_fe_dir_finished(self, csv_list: List[str]):
+    def _on_fe_dir_finished(self, payload):
         self.btn_fe.setEnabled(True)
         self.set_button_progress(self.btn_fe, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
-        self.display_result(f"[INFO] 目录特征提取完成：共 {len(csv_list)} 个 CSV")
-        for p in csv_list:
-            if os.path.exists(p): self._add_output(p)
-        if csv_list:
-            first = csv_list[0]
+        info = payload if isinstance(payload, dict) else {}
+        csv_path = info.get("csv_path")
+        manifest_path = info.get("manifest_path")
+        files = info.get("files") or []
+        total_rows = info.get("total_rows")
+
+        summary = f"[INFO] 目录特征提取完成：合并 {len(files)} 个文件"
+        if total_rows is not None:
+            summary += f"，共 {total_rows} 条记录"
+        if csv_path:
+            summary += f"，输出：{csv_path}"
+        self.display_result(summary)
+
+        if csv_path and os.path.exists(csv_path):
+            self._add_output(csv_path)
             try:
-                df = pd.read_csv(first, nrows=50, encoding="utf-8")
+                df = pd.read_csv(csv_path, nrows=50, encoding="utf-8")
                 self.populate_table_from_df(df)
-                self._last_out_csv = first
-                self._open_csv_paged(first)
+                self._last_out_csv = csv_path
+                self._open_csv_paged(csv_path)
             except Exception:
                 pass
+
+        if manifest_path and os.path.exists(manifest_path):
+            self._add_output(manifest_path)
 
     def _on_fe_error(self, msg):
         self.btn_fe.setEnabled(True); self.reset_button_progress(self.btn_fe)
@@ -1127,6 +1168,14 @@ class Ui_MainWindow(object):
         msg = (f"results:\n- {res.get('results_csv')}\n- {res.get('summary_csv')}\n"
                f"models:\n- {res.get('model_path')}\n- {res.get('scaler_path')}\n"
                f"flows={res.get('flows')} malicious={res.get('malicious')}")
+        acc = res.get("accuracy")
+        acc_col = res.get("accuracy_column")
+        if isinstance(acc, (int, float)):
+            acc_pct = f"{acc * 100:.2f}%"
+            if acc_col:
+                msg += f"\n准确率：{acc_pct}（基于 {acc_col} 列）"
+            else:
+                msg += f"\n准确率：{acc_pct}"
         self.display_result(f"[INFO] 训练完成：\n{msg}")
         for k in ("results_csv", "summary_csv", "model_path", "scaler_path"):
             p = res.get(k)
@@ -1238,6 +1287,14 @@ class Ui_MainWindow(object):
         if df.empty:
             QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。"); return
 
+        truth_col = None
+        truth_series = None
+        if pd is not None:
+            try:
+                truth_col, truth_series = infer_ground_truth_labels(df)
+            except Exception:
+                truth_col, truth_series = None, None
+
         from joblib import load as joblib_load
 
         mdl_path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1295,12 +1352,65 @@ class Ui_MainWindow(object):
             if need_k <= 0:
                 QtWidgets.QMessageBox.warning(None, "无法确定列数", "StandardScaler 未包含 n_features_in_ 信息。")
                 return
-            dlg = FeaturePickDialog(list(use_df.columns), need_k)
-            if dlg.exec_() != QtWidgets.QDialog.Accepted: return
-            cols = dlg.selected_columns()
-            for c in cols:
-                if c not in use_df.columns: use_df[c] = 0
-            X = use_df[cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
+
+            preferred_cols = list(getattr(scaler, "feature_names_in_", []))
+            cols: List[str]
+            if preferred_cols:
+                cols = [str(col) for col in preferred_cols]
+            else:
+                cols = []
+                for col in use_df.columns:
+                    if col in META_COLUMNS:
+                        continue
+                    lower = str(col).lower()
+                    if lower.startswith("__"):
+                        continue
+                    if any(key in lower for key in LABEL_KEYWORDS):
+                        continue
+                    cols.append(col)
+
+            if not cols:
+                QtWidgets.QMessageBox.warning(None, "未找到特征列", "当前数据集中没有可用于预测的特征列。")
+                return
+
+            seen: Set[str] = set()
+            ordered_cols: List[str] = []
+            for col in cols:
+                if col in seen:
+                    continue
+                if col not in use_df.columns:
+                    use_df[col] = 0
+                ordered_cols.append(col)
+                seen.add(col)
+
+            if len(ordered_cols) < need_k:
+                extra_candidates: List[str] = []
+                for col in use_df.columns:
+                    if col in seen:
+                        continue
+                    try:
+                        pd.to_numeric(use_df[col])
+                    except Exception:
+                        continue
+                    extra_candidates.append(col)
+                for col in extra_candidates:
+                    ordered_cols.append(col)
+                    seen.add(col)
+                    if len(ordered_cols) >= need_k:
+                        break
+
+            if len(ordered_cols) > need_k:
+                ordered_cols = ordered_cols[:need_k]
+
+            if len(ordered_cols) != need_k:
+                QtWidgets.QMessageBox.warning(
+                    None,
+                    "列数不匹配",
+                    f"根据现有规则筛选后的列数为 {len(ordered_cols)}，但模型需要 {need_k} 列，请确认输入数据是否与训练时一致。",
+                )
+                return
+
+            X = use_df[ordered_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
         else:
             X = use_df.apply(pd.to_numeric, errors="coerce").fillna(0.0).values
 
@@ -1327,9 +1437,32 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}"); return
 
         out_df = df.copy()
-        out_df["prediction"] = pred
+        pred_labels, pred_flags = normalize_prediction_output(list(pred))
+        out_df["prediction"] = pred_labels
+        out_df["is_malicious"] = pred_flags
         if score is not None:
             out_df["anomaly_score"] = score
+
+        acc_text = ""
+        if truth_series is not None and pd is not None:
+            try:
+                truth_bool = truth_series.astype(bool)
+                pred_bool = pd.Series([flag == 1 for flag in pred_flags], index=df.index)
+                comp = (pred_bool == truth_bool)
+                comp = comp.dropna()
+                if not comp.empty:
+                    acc_val = float(comp.mean())
+                    acc_pct = f"{acc_val * 100:.2f}%"
+                    if truth_col:
+                        acc_text = f"准确率：{acc_pct}（基于 {truth_col} 列）"
+                    else:
+                        acc_text = f"准确率：{acc_pct}"
+                    gt_name = truth_col or "ground_truth"
+                    if gt_name in out_df.columns:
+                        gt_name = f"{gt_name}_ground_truth"
+                    out_df[gt_name] = ["异常" if flag else "正常" for flag in truth_bool.tolist()]
+            except Exception:
+                acc_text = ""
 
         pred_dir = self._prediction_out_dir()
         os.makedirs(pred_dir, exist_ok=True)
@@ -1340,7 +1473,10 @@ class Ui_MainWindow(object):
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "保存失败", f"无法写出预测结果：{e}"); return
 
-        self.display_result(f"[INFO] 预测完成：{out_csv}")
+        msg = f"[INFO] 预测完成：{out_csv}"
+        if acc_text:
+            msg += f"\n{acc_text}"
+        self.display_result(msg)
         self._add_output(out_csv)
         self._open_csv_paged(out_csv)
 
