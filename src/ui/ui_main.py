@@ -39,11 +39,11 @@ PATHS = {
     "split": os.path.join(_DATA_BASE, "split"),
     "csv_info": os.path.join(_DATA_BASE, "CSV", "info"),
     "csv_feature": os.path.join(_DATA_BASE, "CSV", "feature"),
+    "csv_preprocess": os.path.join(_DATA_BASE, "CSV", "DP"),
     "models": os.path.join(_DATA_BASE, "models"),
     "results_analysis": os.path.join(_DATA_BASE, "results", "analysis"),
     "results_pred": os.path.join(_DATA_BASE, "results", "modelprediction"),
     "results_abnormal": os.path.join(_DATA_BASE, "results", "abnormal"),
-    "results_vector": os.path.join(_DATA_BASE, "results", "vector"),
 }
 for _p in PATHS.values():
     os.makedirs(_p, exist_ok=True)
@@ -578,7 +578,7 @@ class Ui_MainWindow(object):
     def _default_split_dir(self):
         return PATHS["split"]
     def _default_results_dir(self):
-        return os.path.join(self._project_root(), "results")
+        return PATHS["results_analysis"]
     def _default_models_dir(self):
         return PATHS["models"]
     def _default_csv_info_dir(self):
@@ -592,7 +592,7 @@ class Ui_MainWindow(object):
     def _abnormal_out_dir(self):
         return PATHS["results_abnormal"]
     def _preprocess_out_dir(self):
-        return PATHS["results_vector"]
+        return PATHS["csv_preprocess"]
     def _browse_compat(self):
         p, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择 pcap 文件", "", "pcap (*.pcap *.pcapng);;所有文件 (*)")
         if not p:
