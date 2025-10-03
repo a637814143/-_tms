@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Callable, Dict, List, Optional
 
@@ -143,8 +144,23 @@ def vectorize_feature_dir(
     total_files = len(csv_files)
     row_cursor = 0
 
+    max_workers = min(8, max(1, os.cpu_count() or 4))
+    frames_map: Dict[str, pd.DataFrame] = {}
+
+    if total_files > 1 and max_workers > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(_load_feature_csv, path): path for path in csv_files}
+            for completed_idx, future in enumerate(as_completed(future_map), start=1):
+                path = future_map[future]
+                frames_map[path] = future.result()
+                _notify(progress_cb, 5 + int(20 * completed_idx / total_files))
+    else:
+        for idx, csv_path in enumerate(csv_files, start=1):
+            frames_map[csv_path] = _load_feature_csv(csv_path)
+            _notify(progress_cb, 5 + int(20 * idx / total_files))
+
     for idx, csv_path in enumerate(csv_files, start=1):
-        df = _load_feature_csv(csv_path)
+        df = frames_map[csv_path]
         df["__source_file__"] = os.path.basename(csv_path)
         df["__source_path__"] = os.path.abspath(csv_path)
         frames.append(df)
@@ -160,7 +176,7 @@ def vectorize_feature_dir(
             }
         )
         row_cursor += rows
-        _notify(progress_cb, 10 + int(30 * idx / total_files))
+        _notify(progress_cb, 25 + int(15 * idx / total_files))
 
     full_df = pd.concat(frames, ignore_index=True)
     if full_df.empty:
