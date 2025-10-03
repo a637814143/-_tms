@@ -1,235 +1,1617 @@
-"""自适应异常检测集成器。
+# -*- coding: utf-8 -*-
+from PyQt5 import QtCore, QtGui, QtWidgets
+import sys, os, platform, subprocess, math, shutil, json
+import numpy as np
+from typing import List, Optional, Set
+from datetime import datetime
 
-该模块提供 ``EnsembleAnomalyDetector``，通过多模型投票和分位数阈值
-自动校准，实现比单一 IsolationForest 更稳定的检测表现。
+# ---- 业务函数（保持导入路径）----
+from src.functions.info import get_pcap_features as info
+from src.functions.feature_extractor import (
+    extract_features as fe_single,
+    extract_features_dir as fe_dir,
+)
+from src.functions.unsupervised_train import train_unsupervised_on_split as run_train
+from src.functions.analyze_results import analyze_results as run_analysis
+from src.functions.preprocess import preprocess_feature_dir as preprocess_dir
+
+try:
+    import pandas as pd
+except Exception:
+    pd = None
+
+APP_STYLE = """
+QWidget { background-color: #F7F8FA; font-family: "Microsoft YaHei", "PingFang SC","SF Pro Text"; color:#1d1d1f; font-size:13px; }
+QTextEdit, QTableView { background-color: #FFFFFF; border:1px solid #E3E6EB; border-radius:8px; }
+QLineEdit, QSpinBox, QComboBox { background:#FFFFFF; border:1px solid #D7DBE2; border-radius:8px; padding:6px; }
+QPushButton { background:#EEF1F6; border:0; border-radius:10px; padding:8px 12px; min-height:30px;}
+QPushButton:hover { background:#E2E8F0; } QPushButton:pressed { background:#D9E0EA; }
+QHeaderView::section { background:#F3F5F9; padding:6px; border:1px solid #E6E9EF; }
+QGroupBox { border:1px solid #E6E9EF; border-radius:10px; margin-top:10px; }
+QGroupBox::title { subcontrol-origin: margin; left:12px; padding:0 6px; background:transparent; }
 """
 
-from __future__ import annotations
+# 仅表格预览上限（全部数据都会落盘）
+PREVIEW_LIMIT_FOR_TABLE = 50
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
+# ======= 固定输出路径（与你之前一致）=======
+_DATA_BASE = r"D:\pythonProject8\data"
+PATHS = {
+    "split": os.path.join(_DATA_BASE, "split"),
+    "csv_info": os.path.join(_DATA_BASE, "CSV", "info"),
+    "csv_feature": os.path.join(_DATA_BASE, "CSV", "feature"),
+    "csv_preprocess": os.path.join(_DATA_BASE, "CSV", "DP"),
+    "models": os.path.join(_DATA_BASE, "models"),
+    "results_analysis": os.path.join(_DATA_BASE, "results", "analysis"),
+    "results_pred": os.path.join(_DATA_BASE, "results", "modelprediction"),
+    "results_abnormal": os.path.join(_DATA_BASE, "results", "abnormal"),
+}
+for _p in PATHS.values():
+    os.makedirs(_p, exist_ok=True)
 
-import numpy as np
-from sklearn.base import BaseEstimator, OutlierMixin
-from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
-from sklearn.svm import OneClassSVM
+# =============== 表格模型与行高亮 ===============
+class PandasFrameModel(QtCore.QAbstractTableModel):
+    def __init__(self, df: "pd.DataFrame", parent=None):
+        super().__init__(parent)
+        self._df = df if df is not None else pd.DataFrame()
+
+    def rowCount(self, p=QtCore.QModelIndex()):
+        return 0 if p.isValid() else len(self._df)
+
+    def columnCount(self, p=QtCore.QModelIndex()):
+        return 0 if p.isValid() else len(self._df.columns)
+
+    def data(self, idx, role=QtCore.Qt.DisplayRole):
+        if not idx.isValid():
+            return None
+        if role in (QtCore.Qt.DisplayRole, QtCore.Qt.ToolTipRole):
+            try:
+                v = self._df.iat[idx.row(), idx.column()]
+                if pd is not None and pd.isna(v):
+                    return ""
+                return "" if v is None else str(v)
+            except Exception:
+                return ""
+        return None
+
+    def headerData(self, sec, ori, role=QtCore.Qt.DisplayRole):
+        if role != QtCore.Qt.DisplayRole:
+            return None
+        if ori == QtCore.Qt.Horizontal:
+            try:
+                return str(self._df.columns[sec])
+            except Exception:
+                return str(sec)
+        return str(sec)
 
 
-def _normalize_scores(arr: np.ndarray) -> np.ndarray:
-    """将不同算法的得分缩放到统一尺度。"""
+class RowHighlighter(QtWidgets.QStyledItemDelegate):
+    def __init__(self, df_provider, parent=None):
+        super().__init__(parent)
+        self.df_provider = df_provider
 
-    arr = np.asarray(arr, dtype=float)
-    if arr.ndim != 1:
-        arr = arr.ravel()
+    def paint(self, painter, option, index):
+        df = self.df_provider()
+        if df is not None and "__TAG__" in df.columns:
+            r = index.row()
+            try:
+                tag = str(df.iloc[r].get("__TAG__", "")).strip()
+            except Exception:
+                tag = ""
+            if tag:
+                painter.save()
+                painter.fillRect(option.rect, QtGui.QColor(255, 204, 204))
+                painter.restore()
+        super().paint(painter, option, index)
 
-    finite_mask = np.isfinite(arr)
-    if not finite_mask.any():
-        return np.zeros_like(arr, dtype=float)
-
-    safe = arr[finite_mask]
-    mean = float(np.mean(safe))
-    std = float(np.std(safe))
-    if std <= 1e-9:
-        std = max(1e-9, float(np.max(np.abs(safe)) or 1.0))
-
-    normed = np.zeros_like(arr, dtype=float)
-    normed[finite_mask] = (safe - mean) / std
-    normed[~finite_mask] = 0.0
-    return normed
+    def helpEvent(self, event, view, option, index):
+        df = self.df_provider()
+        if df is not None and "__TAG__" in df.columns:
+            r = index.row()
+            try:
+                tag = str(df.iloc[r].get("__TAG__", "")).strip()
+            except Exception:
+                tag = ""
+            if tag:
+                QtWidgets.QToolTip.showText(event.globalPos(), f"自动标注：{tag}")
+                return True
+        return super().helpEvent(event, view, option, index)
 
 
-@dataclass
-class DetectorInfo:
-    name: str
-    estimator: OutlierMixin
-    weight: float
+# =============== 后台线程 ===============
+class InfoWorker(QtCore.QThread):
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int)
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.kwargs = kwargs
+
+    def run(self):
+        try:
+            kw = dict(self.kwargs)
+            kw["progress_cb"] = self.progress.emit
+            kw["cancel_cb"] = self.isInterruptionRequested
+            df = info(**kw)
+            self.progress.emit(100)
+            self.finished.emit(df)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
-class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
-    """多模型投票的异常检测器。
+class FeatureWorker(QtCore.QThread):
+    finished = QtCore.pyqtSignal(str)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int)
 
-    - IsolationForest 捕获全局稀疏异常
-    - LocalOutlierFactor(novelty=True) 捕获局部密度异常
-    - OneClassSVM 对复杂边界更敏感
+    def __init__(self, pcap_path, csv_path):
+        super().__init__()
+        self.pcap_path = pcap_path
+        self.csv_path = csv_path
 
-    通过归一化后的得分求平均，依据 ``contamination`` 自动选取阈值。
-    """
+    def run(self):
+        try:
+            fe_single(self.pcap_path, self.csv_path, progress_cb=self.progress.emit)
+            self.finished.emit(self.csv_path)
+        except Exception as e:
+            self.error.emit(str(e))
 
-    def __init__(
-        self,
-        *,
-        contamination: float = 0.05,
-        n_estimators: int = 200,
-        n_neighbors: int = 35,
-        svm_gamma: str = "scale",
-        random_state: int = 42,
-    ) -> None:
-        self.contamination = float(max(1e-4, min(0.49, contamination)))
-        self.n_estimators = int(max(32, n_estimators))
-        self.n_neighbors = int(max(5, n_neighbors))
-        self.svm_gamma = svm_gamma
-        self.random_state = random_state
 
-        self.detectors_: Dict[str, DetectorInfo] = {}
-        self.threshold_: Optional[float] = None
-        self.offset_: Optional[float] = None
-        self.feature_names_in_: Optional[np.ndarray] = None
-        self.fit_decision_scores_: Optional[np.ndarray] = None
-        self.fit_raw_scores_: Dict[str, np.ndarray] = {}
-        self.fit_votes_: Dict[str, np.ndarray] = {}
+class DirFeatureWorker(QtCore.QThread):
+    finished = QtCore.pyqtSignal(list)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int)
 
-    # sklearn API -----------------------------------------------------
-    def fit(self, X: np.ndarray, y=None):  # noqa: D401  (sklearn 兼容签名)
-        X = np.asarray(X, dtype=float)
-        if X.ndim != 2:
-            raise ValueError("X 必须为二维数组")
+    def __init__(self, split_dir, out_dir, workers=8):
+        super().__init__()
+        self.split_dir = split_dir
+        self.out_dir = out_dir
+        self.workers = workers
 
-        n_samples = X.shape[0]
-        if n_samples < 10:
-            raise ValueError("样本量过少，至少需要 10 条记录")
+    def run(self):
+        try:
+            csvs = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
+            self.finished.emit(csvs)
+        except Exception as e:
+            self.error.emit(str(e))
 
-        self.feature_names_in_ = None
-        self.fit_raw_scores_.clear()
-        self.fit_votes_.clear()
 
-        estimators: Iterable[DetectorInfo] = [
-            DetectorInfo(
-                "iforest",
-                IsolationForest(
-                    n_estimators=self.n_estimators,
-                    contamination=self.contamination,
-                    random_state=self.random_state,
-                    n_jobs=-1,
-                    warm_start=True,
-                ),
-                weight=1.0,
-            ),
-            DetectorInfo(
-                "lof",
-                LocalOutlierFactor(
-                    n_neighbors=min(self.n_neighbors, max(5, n_samples - 1)),
-                    contamination=self.contamination,
-                    novelty=True,
-                    metric="minkowski",
-                ),
-                weight=0.9,
-            ),
-            DetectorInfo(
-                "ocsvm",
-                OneClassSVM(
-                    kernel="rbf",
-                    gamma=self.svm_gamma,
-                    nu=self.contamination,
-                ),
-                weight=0.8,
-            ),
+class PreprocessWorker(QtCore.QThread):
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int)
+
+    def __init__(self, feature_dir, out_dir):
+        super().__init__()
+        self.feature_dir = feature_dir
+        self.out_dir = out_dir
+
+    def run(self):
+        try:
+            result = preprocess_dir(self.feature_dir, self.out_dir, progress_cb=self.progress.emit)
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class TrainWorker(QtCore.QThread):
+    finished = QtCore.pyqtSignal(dict)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int)
+
+    def __init__(self, input_path, results_dir, models_dir):
+        super().__init__()
+        self.input_path = input_path
+        self.results_dir = results_dir
+        self.models_dir = models_dir
+
+    def run(self):
+        try:
+            res = run_train(self.input_path, self.results_dir, self.models_dir, progress_cb=self.progress.emit)
+            self.finished.emit(res)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class AnalysisWorker(QtCore.QThread):
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int)
+
+    def __init__(self, results_csv, out_dir):
+        super().__init__()
+        self.results_csv = results_csv
+        self.out_dir = out_dir
+
+    def run(self):
+        try:
+            result = run_analysis(self.results_csv, self.out_dir, progress_cb=self.progress.emit)
+            if not isinstance(result, dict):
+                result = {"out_dir": self.out_dir}
+            elif "out_dir" not in result:
+                result["out_dir"] = self.out_dir
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
+
+# ======= 交互式列选择（用于 scaler+model 场景）=======
+class FeaturePickDialog(QtWidgets.QDialog):
+    def __init__(self, all_columns: List[str], need_k: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"选择并排序特征列（需要 {need_k} 列）")
+        self.resize(700, 420)
+        lay = QtWidgets.QVBoxLayout(self)
+
+        info = QtWidgets.QLabel("左侧可用列 → 添加到右侧并拖动排序；必须与训练时列数一致。")
+        lay.addWidget(info)
+
+        body = QtWidgets.QHBoxLayout()
+        lay.addLayout(body)
+
+        self.list_all = QtWidgets.QListWidget()
+        self.list_all.addItems(all_columns)
+        self.list_all.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+
+        mid = QtWidgets.QVBoxLayout()
+        btn_add = QtWidgets.QPushButton("→ 添加")
+        btn_remove = QtWidgets.QPushButton("← 移除")
+        btn_up = QtWidgets.QPushButton("上移")
+        btn_down = QtWidgets.QPushButton("下移")
+        mid.addStretch(1); mid.addWidget(btn_add); mid.addWidget(btn_remove); mid.addSpacing(10)
+        mid.addWidget(btn_up); mid.addWidget(btn_down); mid.addStretch(1)
+
+        self.list_sel = QtWidgets.QListWidget()
+        self.list_sel.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
+
+        body.addWidget(self.list_all, 5)
+        body.addLayout(mid, 1)
+        body.addWidget(self.list_sel, 5)
+
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        lay.addWidget(btns)
+
+        self.need_k = need_k
+        btn_add.clicked.connect(self._add)
+        btn_remove.clicked.connect(self._remove)
+        btn_up.clicked.connect(lambda: self._move(-1))
+        btn_down.clicked.connect(lambda: self._move(1))
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+    def _add(self):
+        for it in self.list_all.selectedItems():
+            self.list_sel.addItem(it.text())
+
+    def _remove(self):
+        for it in self.list_sel.selectedItems():
+            self.list_sel.takeItem(self.list_sel.row(it))
+
+    def _move(self, d):
+        rows = [self.list_sel.row(it) for it in self.list_sel.selectedItems()]
+        if not rows: return
+        r = rows[0]
+        nr = r + d
+        if 0 <= nr < self.list_sel.count():
+            it = self.list_sel.takeItem(r)
+            self.list_sel.insertItem(nr, it)
+            self.list_sel.setCurrentRow(nr)
+
+    def selected_columns(self) -> List[str]:
+        return [self.list_sel.item(i).text() for i in range(self.list_sel.count())]
+
+    def accept(self):
+        sel = self.selected_columns()
+        if len(sel) != self.need_k:
+            QtWidgets.QMessageBox.warning(self, "列数不一致", f"当前选择 {len(sel)} 列，需要 {self.need_k} 列。")
+            return
+        super().accept()
+
+
+# =============== 主 UI ===============
+class Ui_MainWindow(object):
+    # --------- 基本结构 ----------
+    def setupUi(self, MainWindow):
+        MainWindow.setObjectName("MainWindow")
+        MainWindow.resize(1100, 680)
+        MainWindow.setStyleSheet(APP_STYLE)
+
+        self.centralwidget = QtWidgets.QWidget(MainWindow)
+        self.main_layout = QtWidgets.QVBoxLayout(self.centralwidget)
+        self.main_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self.centralwidget)
+        self.main_layout.addWidget(self.splitter)
+
+        # 左侧滚动区
+        self.left_scroll = QtWidgets.QScrollArea()
+        self.left_scroll.setWidgetResizable(True)
+        self.left_container = QtWidgets.QWidget()
+        self.left_scroll.setWidget(self.left_container)
+        self.left_layout = QtWidgets.QVBoxLayout(self.left_container)
+        self.left_layout.setContentsMargins(4, 4, 4, 4)
+        self.left_layout.setSpacing(8)
+
+        self._build_path_bar()
+        self._build_param_panel()
+        self._build_center_tabs()
+        self._build_paging_toolbar()
+        self._build_output_list()
+        self._build_footer()
+
+        self.splitter.addWidget(self.left_scroll)
+
+        # 右侧按钮列
+        self._build_right_panel()
+        self.splitter.addWidget(self.right_frame)
+        self.splitter.setStretchFactor(0, 7)
+        self.splitter.setStretchFactor(1, 3)
+
+        MainWindow.setCentralWidget(self.centralwidget)
+        self._bind_signals()
+
+        # 状态缓存
+        self._last_preview_df: Optional["pd.DataFrame"] = None
+        self._last_out_csv: Optional[str] = None
+        self._analysis_summary: Optional[dict] = None
+
+        # 分页状态
+        self._csv_paged_path: Optional[str] = None
+        self._csv_total_rows: Optional[int] = None
+        self._csv_current_page: int = 1
+
+        # worker
+        self.worker: Optional[InfoWorker] = None
+        self.preprocess_worker: Optional[PreprocessWorker] = None
+
+        self.retranslateUi(MainWindow)
+        QtCore.QMetaObject.connectSlotsByName(MainWindow)
+
+    # --------- UI 子构建 ----------
+    def _build_path_bar(self):
+        self.file_bar = QtWidgets.QWidget(self.left_container)
+        fb = QtWidgets.QHBoxLayout(self.file_bar)
+        fb.setContentsMargins(8, 0, 8, 0)
+        fb.setSpacing(8)
+        self.file_label = QtWidgets.QLabel("选择流量文件或目录 (.pcap/.pcapng 或 split 目录):")
+        self.file_edit = QtWidgets.QLineEdit()
+        self.file_edit.setPlaceholderText("请选择文件或目录路径")
+        self.btn_pick_file = QtWidgets.QPushButton("选文件")
+        self.btn_pick_dir = QtWidgets.QPushButton("选目录")
+        self.btn_browse = QtWidgets.QPushButton("浏览(文件或目录)")
+        fb.addWidget(self.file_label, 2)
+        fb.addWidget(self.file_edit, 8)
+        fb.addWidget(self.btn_pick_file, 1)
+        fb.addWidget(self.btn_pick_dir, 1)
+        fb.addWidget(self.btn_browse, 2)
+        self.left_layout.addWidget(self.file_bar)
+
+    def _build_param_panel(self):
+        self.param_group = QtWidgets.QGroupBox("查看流量信息参数")
+        pg = QtWidgets.QGridLayout(self.param_group)
+        pg.setContentsMargins(10, 6, 10, 6)
+        pg.setHorizontalSpacing(12)
+        pg.setVerticalSpacing(6)
+
+        self.mode_label = QtWidgets.QLabel("查看模式：")
+        self.mode_combo = QtWidgets.QComboBox()
+        self._mode_map = {
+            "自动(文件=单文件/目录=全部)": "auto",
+            "单文件": "file",
+            "整个目录(从上到下)": "all",
+            "分批(按文件名排序)": "batch"
+        }
+        self.mode_combo.addItems(list(self._mode_map.keys()))
+
+        self.batch_label = QtWidgets.QLabel("batch_size：")
+        self.batch_spin = QtWidgets.QSpinBox()
+        self.batch_spin.setRange(1, 99999)
+        self.batch_spin.setValue(10)
+
+        self.start_label = QtWidgets.QLabel("start_index：")
+        self.start_spin = QtWidgets.QSpinBox()
+        self.start_spin.setRange(0, 10**9)
+        self.start_spin.setSingleStep(10)
+        self.start_spin.setValue(0)
+
+        self.workers_label = QtWidgets.QLabel("并发数：")
+        self.workers_spin = QtWidgets.QSpinBox()
+        self.workers_spin.setRange(1, 32)
+        self.workers_spin.setValue(8)
+
+        self.proto_label = QtWidgets.QLabel("协议：")
+        self.proto_combo = QtWidgets.QComboBox()
+        self.proto_combo.addItems(["TCP+UDP", "仅TCP", "仅UDP"])
+
+        self.whitelist_label = QtWidgets.QLabel("端口白名单(任一命中保留)：")
+        self.whitelist_edit = QtWidgets.QLineEdit()
+        self.whitelist_edit.setPlaceholderText("例: 80,443,53")
+
+        self.blacklist_label = QtWidgets.QLabel("端口黑名单(任一命中排除)：")
+        self.blacklist_edit = QtWidgets.QLineEdit()
+        self.blacklist_edit.setPlaceholderText("例: 135,137,138,139")
+
+        self.fast_check = QtWidgets.QCheckBox("极速模式（UI开关保留）")
+        self.fast_check.setChecked(True)
+
+        self.btn_prev = QtWidgets.QPushButton("上一批")
+        self.btn_next = QtWidgets.QPushButton("下一批")
+
+        r = 0
+        pg.addWidget(self.mode_label, r, 0); pg.addWidget(self.mode_combo, r, 1, 1, 5); r += 1
+        pg.addWidget(self.batch_label, r, 0); pg.addWidget(self.batch_spin, r, 1)
+        pg.addWidget(self.start_label, r, 2); pg.addWidget(self.start_spin, r, 3)
+        pg.addWidget(self.workers_label, r, 4); pg.addWidget(self.workers_spin, r, 5); r += 1
+        pg.addWidget(self.proto_label, r, 0); pg.addWidget(self.proto_combo, r, 1)
+        pg.addWidget(self.whitelist_label, r, 2); pg.addWidget(self.whitelist_edit, r, 3, 1, 3); r += 1
+        pg.addWidget(self.blacklist_label, r, 0); pg.addWidget(self.blacklist_edit, r, 1, 1, 4)
+        pg.addWidget(self.fast_check, r, 5); r += 1
+        pg.addWidget(self.btn_prev, r, 0, 1, 3); pg.addWidget(self.btn_next, r, 3, 1, 3); r += 1
+
+        self.left_layout.addWidget(self.param_group)
+        self.mode_combo.currentIndexChanged.connect(self._update_batch_controls)
+        self._update_batch_controls()
+
+    def _build_center_tabs(self):
+        self.display_tabs = QtWidgets.QTabWidget(self.left_container)
+
+        self.results_widget = QtWidgets.QWidget()
+        rl = QtWidgets.QVBoxLayout(self.results_widget)
+        rl.setContentsMargins(6, 6, 6, 6)
+        self.results_text = QtWidgets.QTextEdit()
+        self.results_text.setReadOnly(True)
+        rl.addWidget(self.results_text)
+        self.display_tabs.addTab(self.results_widget, "结果（文本）")
+
+        self.table_widget = QtWidgets.QWidget()
+        tl = QtWidgets.QVBoxLayout(self.table_widget)
+        tl.setContentsMargins(6, 6, 6, 6)
+        self.table_view = QtWidgets.QTableView()
+        self.table_view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table_view.horizontalHeader().setStretchLastSection(True)
+        self.table_view.verticalHeader().setDefaultSectionSize(22)
+        self.table_widget.setMinimumHeight(22 * 16 + 40)
+        tl.addWidget(self.table_view)
+        self.display_tabs.addTab(self.table_widget, "流量表格")
+
+        self.left_layout.addWidget(self.display_tabs, stretch=3)
+
+    def _build_paging_toolbar(self):
+        bar = QtWidgets.QWidget(self.left_container)
+        hb = QtWidgets.QHBoxLayout(bar)
+        hb.setContentsMargins(4, 0, 4, 0); hb.setSpacing(8)
+
+        self.btn_page_prev = QtWidgets.QPushButton("上一页")
+        self.btn_page_next = QtWidgets.QPushButton("下一页")
+        self.page_info = QtWidgets.QLabel("第 0/0 页")
+        self.page_size_label = QtWidgets.QLabel("每页行数：")
+        self.page_size_spin = QtWidgets.QSpinBox()
+        self.page_size_spin.setRange(20, 200000)
+        self.page_size_spin.setSingleStep(10)
+        self.page_size_spin.setValue(50)
+        self.btn_show_all = QtWidgets.QPushButton("显示全部（可能较慢）")
+
+        hb.addWidget(self.btn_page_prev); hb.addWidget(self.btn_page_next)
+        hb.addSpacing(8); hb.addWidget(self.page_info); hb.addStretch(1)
+        hb.addWidget(self.page_size_label); hb.addWidget(self.page_size_spin)
+        hb.addSpacing(8); hb.addWidget(self.btn_show_all)
+
+        self.left_layout.addWidget(bar)
+
+    def _build_output_list(self):
+        self.out_group = QtWidgets.QGroupBox("输出文件（双击打开所在目录，右键复制路径）")
+        og = QtWidgets.QVBoxLayout(self.out_group)
+        og.setContentsMargins(8, 6, 8, 8)
+        self.output_list = QtWidgets.QListWidget()
+        self.output_list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        og.addWidget(self.output_list)
+        self.left_layout.addWidget(self.out_group, stretch=1)
+
+    def _build_footer(self):
+        self.bottom_bar = QtWidgets.QWidget(self.left_container)
+        self.bottom_bar.setFixedHeight(22)
+        bb = QtWidgets.QHBoxLayout(self.bottom_bar)
+        bb.setContentsMargins(6, 0, 6, 0); bb.addStretch()
+        self.bottom_label = QtWidgets.QLabel("@2025  恶意流量检测系统")
+        self.bottom_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        bb.addWidget(self.bottom_label)
+        self.left_layout.addWidget(self.bottom_bar)
+
+    def _build_right_panel(self):
+        self.right_frame = QtWidgets.QFrame(self.centralwidget)
+        self.right_layout = QtWidgets.QVBoxLayout(self.right_frame)
+        self.right_layout.setContentsMargins(6, 6, 6, 6)
+        self.right_layout.setSpacing(10)
+
+        self.btn_view = QtWidgets.QPushButton("查看流量信息")
+        self.btn_fe = QtWidgets.QPushButton("提取特征")
+        self.btn_vector = QtWidgets.QPushButton("数据预处理")
+        self.btn_train = QtWidgets.QPushButton("训练模型")
+        self.btn_analysis = QtWidgets.QPushButton("运行分析")
+        self.btn_predict = QtWidgets.QPushButton("加载模型预测")
+        self.btn_export = QtWidgets.QPushButton("导出结果（异常）")
+        self.btn_clear = QtWidgets.QPushButton("清空显示")
+
+        for b in [
+            self.btn_view,
+            self.btn_fe,
+            self.btn_vector,
+            self.btn_train,
+            self.btn_analysis,
+            self.btn_predict,
+            self.btn_export,
+            self.btn_clear,
+        ]:
+            self.right_layout.addWidget(b); self.right_layout.addSpacing(2)
+
+        self.right_layout.addStretch(1)
+        self.right_frame.setMinimumWidth(200)
+
+    def _bind_signals(self):
+        self.btn_pick_file.clicked.connect(self._choose_file)
+        self.btn_pick_dir.clicked.connect(self._choose_dir)
+        self.btn_browse.clicked.connect(self._browse_compat)
+
+        self.btn_prev.clicked.connect(self._on_prev_batch)
+        self.btn_next.clicked.connect(self._on_next_batch)
+
+        # 所有功能均使用顶部路径
+        self.btn_view.clicked.connect(self._on_view_info)
+        self.btn_export.clicked.connect(self._on_export_results)
+        self.btn_clear.clicked.connect(self._on_clear)
+        self.btn_fe.clicked.connect(self._on_extract_features)
+        self.btn_vector.clicked.connect(self._on_preprocess_features)
+        self.btn_train.clicked.connect(self._on_train_model)
+        self.btn_analysis.clicked.connect(self._on_run_analysis)
+        self.btn_predict.clicked.connect(self._on_predict)
+
+        self.btn_page_prev.clicked.connect(self._on_page_prev)
+        self.btn_page_next.clicked.connect(self._on_page_next)
+        self.page_size_spin.valueChanged.connect(self._on_page_size_changed)
+        self.btn_show_all.clicked.connect(self._show_full_preview)
+
+        self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
+        self.output_list.itemDoubleClicked.connect(self._on_output_double_click)
+
+    # --------- 路径小工具 ----------
+    def _project_root(self):
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    def _default_split_dir(self):
+        return PATHS["split"]
+    def _default_results_dir(self):
+        return PATHS["results_analysis"]
+    def _default_models_dir(self):
+        return PATHS["models"]
+    def _default_csv_info_dir(self):
+        return PATHS["csv_info"]
+    def _default_csv_feature_dir(self):
+        return PATHS["csv_feature"]
+    def _analysis_out_dir(self):
+        return PATHS["results_analysis"]
+    def _prediction_out_dir(self):
+        return PATHS["results_pred"]
+    def _abnormal_out_dir(self):
+        return PATHS["results_abnormal"]
+    def _preprocess_out_dir(self):
+        return PATHS["csv_preprocess"]
+
+    def _latest_pipeline_bundle(self):
+        models_dir = self._default_models_dir()
+        latest_path = os.path.join(models_dir, "latest_iforest_pipeline.joblib")
+        latest_meta = os.path.join(models_dir, "latest_iforest_metadata.json")
+        if os.path.exists(latest_path):
+            return latest_path, latest_meta if os.path.exists(latest_meta) else None
+
+        candidates = []
+        prefix = "iforest_pipeline_"
+        suffix = ".joblib"
+        for name in os.listdir(models_dir):
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                continue
+            path = os.path.join(models_dir, name)
+            stamp = name[len(prefix):-len(suffix)]
+            meta = os.path.join(models_dir, f"iforest_metadata_{stamp}.json")
+            candidates.append((os.path.getmtime(path), path, meta if os.path.exists(meta) else None))
+
+        if not candidates:
+            return None, None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        _, path, meta = candidates[0]
+        return path, meta
+    def _browse_compat(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择 pcap 文件", "", "pcap (*.pcap *.pcapng);;所有文件 (*)")
+        if not p:
+            d = QtWidgets.QFileDialog.getExistingDirectory(None, "选择包含多个小包的目录（如 data/split）", self._default_split_dir())
+            if d:
+                self.file_edit.setText(d); self.display_result(f"已选择目录: {d}", True)
+            return
+        self.file_edit.setText(p); self.display_result(f"已选择文件: {p}", True)
+
+    def _choose_file(self):
+        p, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择 pcap 文件", "", "pcap (*.pcap *.pcapng);;所有文件 (*)")
+        if p:
+            self.file_edit.setText(p); self.display_result(f"已选择文件: {p}", True)
+
+    def _choose_dir(self):
+        d = QtWidgets.QFileDialog.getExistingDirectory(None, "选择包含多个小包的目录（如 data/split）", self._default_split_dir())
+        if d:
+            self.file_edit.setText(d); self.display_result(f"已选择目录: {d}", True)
+
+    def display_result(self, text, append=True):
+        (self.results_text.append if append else self.results_text.setPlainText)(text)
+
+    def _update_batch_controls(self):
+        is_batch = (self._mode_map.get(self.mode_combo.currentText(), "auto") == "batch")
+        for w in (self.batch_spin, self.start_spin, self.btn_prev, self.btn_next):
+            w.setEnabled(is_batch)
+
+    def _list_sorted(self, d: str) -> List[str]:
+        try:
+            names = [n for n in os.listdir(d) if n.lower().endswith((".pcap", ".pcapng"))]
+        except Exception:
+            names = []
+        names.sort()
+        return [os.path.join(d, n) for n in names]
+
+    # ——按钮进度视觉条——
+    def set_button_progress(self, button: QtWidgets.QPushButton, progress: int):
+        p = max(0, min(100, int(progress))) / 100.0
+        button.setStyleSheet(
+            f'QPushButton{{border:0;border-radius:10px;padding:8px 12px;'
+            f'background:qlineargradient(x1:0,y1:0,x2:1,y2:0,' 
+            f'stop:0 #69A1FF, stop:{p:.3f} #69A1FF, stop:{p:.3f} #EEF1F6, stop:1 #EEF1F6);}}'
+            'QPushButton:hover{background:#E2E8F0;} QPushButton:pressed{background:#D9E0EA;}'
+        )
+
+    def reset_button_progress(self, button: QtWidgets.QPushButton):
+        button.setStyleSheet("")
+
+    # --------- 分页器 ----------
+    def _open_csv_paged(self, csv_path: str):
+        if not os.path.exists(csv_path):
+            QtWidgets.QMessageBox.warning(None, "CSV 不存在", csv_path); return
+        self._csv_paged_path = csv_path
+        total = 0
+        with open(csv_path, "rb") as f:
+            for _ in f: total += 1
+        self._csv_total_rows = max(0, total - 1)
+        self._csv_current_page = 1
+        self._load_page(self._csv_current_page)
+
+    def _load_page(self, page: int):
+        if not self._csv_paged_path or self._csv_total_rows is None: return
+        page_size = self.page_size_spin.value()
+        total_pages = max(1, math.ceil(self._csv_total_rows / page_size))
+        page = max(1, min(total_pages, page))
+        skip = (page - 1) * page_size
+        try:
+            df = pd.read_csv(self._csv_paged_path, skiprows=range(1, 1 + skip), nrows=page_size, encoding="utf-8")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, "分页读取失败", str(e)); return
+        self._csv_current_page = page
+        self.page_info.setText(f"第 {page}/{total_pages} 页（共 {self._csv_total_rows} 行）")
+        self.populate_table_from_df(df)
+
+    def _on_page_prev(self):
+        if self._csv_current_page > 1: self._load_page(self._csv_current_page - 1)
+
+    def _on_page_next(self):
+        if self._csv_total_rows is None: return
+        size = self.page_size_spin.value()
+        total_pages = max(1, math.ceil(self._csv_total_rows / size))
+        if self._csv_current_page < total_pages:
+            self._load_page(self._csv_current_page + 1)
+
+    def _on_page_size_changed(self, _):
+        if self._csv_paged_path: self._load_page(1)
+
+    def _show_full_preview(self):
+        csv_path = None
+        for p in [self._csv_paged_path, self._last_out_csv]:
+            if p and os.path.exists(p): csv_path = p; break
+        if not csv_path:
+            QtWidgets.QMessageBox.warning(None, "没有 CSV", "请先查看流量信息或导出带标注 CSV。"); return
+        app = QtWidgets.QApplication.instance()
+        app.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            df = pd.read_csv(csv_path, encoding="utf-8")
+            self.populate_table_from_df(df)
+            self.display_result(f"[INFO] 已加载全部 {len(df)} 行。")
+            self._csv_paged_path = None; self._csv_total_rows = None; self._csv_current_page = 1
+            self.page_info.setText("第 1/1 页")
+        finally:
+            app.restoreOverrideCursor()
+
+    # --------- 表格渲染 ----------
+    def _auto_tag_dataframe(self, df: "pd.DataFrame"):
+        if pd is None or df is None:
+            return df
+        if df.empty:
+            return df
+
+        tag_col = "__TAG__"
+        df[tag_col] = ""
+
+        def _ensure_mask(mask):
+            if isinstance(mask, pd.Series):
+                return mask.fillna(False)
+            return pd.Series(mask, index=df.index).fillna(False)
+
+        def _append_reason(mask, reason: str):
+            mask = _ensure_mask(mask)
+            if not mask.any():
+                return
+            current = df.loc[mask, tag_col].astype(str)
+            df.loc[mask, tag_col] = [
+                reason if not s or not s.strip() else f"{s};{reason}"
+                for s in current
+            ]
+
+        def _append_reason_from_values(mask, values: "pd.Series", prefix: str):
+            mask = _ensure_mask(mask)
+            if not mask.any():
+                return
+            if not isinstance(values, pd.Series):
+                values = pd.Series(values, index=df.index)
+            vals = values.loc[mask].astype(str).str.strip().str[:40]
+            current = df.loc[mask, tag_col].astype(str)
+            df.loc[mask, tag_col] = [
+                (f"{prefix}{val}" if not s or not s.strip() else f"{s};{prefix}{val}")
+                for s, val in zip(current, vals)
+            ]
+
+        if "prediction" in df.columns:
+            series = df["prediction"]
+            try:
+                if pd.api.types.is_numeric_dtype(series):
+                    mask_pred = pd.to_numeric(series, errors="coerce").fillna(0) < 0
+                else:
+                    text = series.astype(str).str.lower()
+                    mask_pred = text.isin({"-1", "anomaly", "abnormal", "malicious", "恶意", "异常"}) | text.str.contains(
+                        "attack|threat|anomaly|异常|恶意", case=False, na=False
+                    )
+            except Exception:
+                mask_pred = pd.Series(False, index=df.index)
+            _append_reason(mask_pred, "模型预测异常")
+
+        if "anomaly_score" in df.columns:
+            series = pd.to_numeric(df["anomaly_score"], errors="coerce")
+            finite = series.dropna()
+            if not finite.empty:
+                if (finite <= 0).any() and (finite >= 0).any():
+                    threshold = 0
+                else:
+                    threshold = finite.quantile(0.98) if len(finite) > 10 else finite.max()
+                mask_score = series > threshold
+                _append_reason(mask_score, "异常得分偏高")
+
+        bool_like_names = {
+            "is_anomaly",
+            "anomaly",
+            "is_attack",
+            "is_malicious",
+            "malicious",
+            "threat",
+        }
+        for col in df.columns:
+            if str(col).lower() in bool_like_names:
+                series = df[col].astype(str).str.strip().str.lower()
+                mask_bool = series.isin({"1", "true", "yes", "y", "异常", "恶意", "attack", "malicious", "是"})
+                _append_reason(mask_bool, f"{col} 指示异常")
+
+        suspicious_column_keywords = ("label", "result", "status", "type", "attack", "threat", "alert", "category", "tag")
+        safe_values = {"", "normal", "benign", "none", "ok", "-", "合法", "正常", "无"}
+        safe_values = {s.lower() for s in safe_values}
+        suspicious_values = [
+            "异常", "攻击", "恶意", "malicious", "threat", "suspicious", "可疑", "beacon", "flood",
+            "bot", "c2", "command", "shell", "scan", "exploit", "入侵", "泄露", "exfil"
         ]
 
-        decision_stack = []
-        weight_stack = []
-
-        # 对于样本非常多的情况，OneClassSVM 会较慢，采样训练提升速度
-        max_svm_samples = 50000
-        if n_samples > max_svm_samples:
-            idx = np.random.default_rng(self.random_state).choice(
-                n_samples, size=max_svm_samples, replace=False
-            )
-            svm_subset = X[idx]
-        else:
-            svm_subset = X
-
-        for info in estimators:
-            estimator = info.estimator
-            if isinstance(estimator, OneClassSVM) and svm_subset is not X:
-                estimator.fit(svm_subset)
-            else:
-                estimator.fit(X)
-
-            if hasattr(estimator, "decision_function"):
-                dec = estimator.decision_function(X)
-            elif hasattr(estimator, "score_samples"):
-                dec = estimator.score_samples(X)
-            else:
-                # 退化情况：仅返回 predict 结果
-                dec = estimator.predict(X)
-
-            decision_stack.append(_normalize_scores(dec))
-            weight_stack.append(float(info.weight))
-            self.fit_raw_scores_[info.name] = np.asarray(dec, dtype=float)
-            if hasattr(estimator, "predict"):
+        for col in df.columns:
+            lower = str(col).lower()
+            if lower == tag_col.lower():
+                continue
+            if any(key in lower for key in suspicious_column_keywords):
                 try:
-                    pred = estimator.predict(X)
+                    text_series = df[col].astype(str).str.strip()
                 except Exception:
-                    pred = np.where(np.asarray(dec, dtype=float) <= 0, -1, 1)
+                    continue
+
+                def _is_suspicious(value: str) -> bool:
+                    if not value:
+                        return False
+                    lv = value.lower()
+                    if lv in safe_values:
+                        return False
+                    return any(keyword in lv for keyword in suspicious_values)
+
+                mask = text_series.apply(_is_suspicious)
+                _append_reason_from_values(mask, text_series, f"{col}: ")
+
+        return df
+
+    def populate_table_from_df(self, df: "pd.DataFrame"):
+        if pd is None: raise RuntimeError("pandas required")
+        if pd is not None and isinstance(df, pd.DataFrame):
+            df = self._auto_tag_dataframe(df)
+        self._last_preview_df = df
+        show_df = df.head(PREVIEW_LIMIT_FOR_TABLE).copy() if (len(df) > PREVIEW_LIMIT_FOR_TABLE and not self._csv_paged_path) else df
+        self.table_view.setUpdatesEnabled(False)
+        try:
+            m = PandasFrameModel(show_df, self.table_view)
+            proxy = QtCore.QSortFilterProxyModel(self.table_view)
+            proxy.setSourceModel(m); proxy.setFilterKeyColumn(-1)
+            self.table_view.setModel(proxy)
+            self.table_view.setSortingEnabled(True)
+            self.table_view.resizeColumnsToContents()
+            def _current_df():
+                src = proxy.sourceModel(); return getattr(src, "_df", None)
+            self.table_view.setItemDelegate(RowHighlighter(_current_df, self.table_view))
+            self.display_tabs.setCurrentWidget(self.table_widget)
+        finally:
+            self.table_view.setUpdatesEnabled(True)
+    # --------- 批次按钮 ----------
+    def _on_prev_batch(self):
+        if not self.btn_prev.isEnabled(): return
+        step = max(1, self.batch_spin.value())
+        self.start_spin.setValue(max(0, self.start_spin.value() - step))
+        self._on_view_info()
+
+    def _on_next_batch(self):
+        if not self.btn_next.isEnabled(): return
+        step = max(1, self.batch_spin.value())
+        self.start_spin.setValue(self.start_spin.value() + step)
+        self._on_view_info()
+
+    # --------- 查看流量 ----------
+    def _cancel_running(self):
+        if getattr(self, "worker", None) and self.worker.isRunning():
+            self.worker.requestInterruption()
+
+    def _on_view_info(self):
+        self._cancel_running()
+        path = self.file_edit.text().strip()
+        if not path:
+            self.display_result("请先在顶部选择文件或目录"); return
+
+        mode = self._mode_map.get(self.mode_combo.currentText(), "auto")
+        batch = self.batch_spin.value()
+        start = self.start_spin.value()
+        workers = self.workers_spin.value()
+        proto_map = {"TCP+UDP": "both", "仅TCP": "tcp", "仅UDP": "udp"}
+        proto = proto_map.get(self.proto_combo.currentText(), "both")
+        wl = self.whitelist_edit.text().strip()
+        bl = self.blacklist_edit.text().strip()
+
+        file_list = []
+        if os.path.isdir(path):
+            allf = self._list_sorted(path)
+            if mode == "batch":
+                s = max(0, start); e = min(len(allf), s + max(1, batch)); file_list = allf[s:e]
+            elif mode in ("auto", "all"):
+                file_list = allf
             else:
-                pred = np.where(np.asarray(dec, dtype=float) <= 0, -1, 1)
-            self.fit_votes_[info.name] = np.asarray(pred, dtype=int)
-            self.detectors_[info.name] = info
+                pick, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择单个 pcap 文件", path, "pcap (*.pcap *.pcapng);;所有文件 (*)")
+                if not pick:
+                    self.display_result("[INFO] 已取消选择单文件"); return
+                path = pick; file_list = [path]
+        else:
+            file_list = [path]
 
-        stacked = np.vstack(decision_stack)
-        weights = np.asarray(weight_stack, dtype=float)
-        weights = weights / weights.sum()
-        combined = np.average(stacked, axis=0, weights=weights)
+        self.display_result(f"[INFO] 即将解析的文件（按顺序）共 {len(file_list)} 个：")
+        for p in file_list[:100]: self.display_result(" - " + p)
+        if len(file_list) > 100: self.display_result(f" ...（其余 {len(file_list) - 100} 个省略显示）")
+        self.display_result(f"[INFO] 正在解析 {path} ...", True)
 
-        self.fit_decision_scores_ = combined.astype(float)
-        self.threshold_ = float(np.quantile(combined, self.contamination))
-        self.offset_ = float(np.mean(combined))
+        self.btn_view.setEnabled(False); self.set_button_progress(self.btn_view, 0)
 
-        return self
+        self.worker = InfoWorker(
+            path=path, workers=workers,
+            mode=("all" if mode == "auto" and os.path.isdir(path) else ("file" if mode == "auto" and os.path.isfile(path) else mode)),
+            batch_size=batch, start_index=start,
+            files=file_list if os.path.isdir(path) else None,
+            proto_filter=proto, port_whitelist_text=wl, port_blacklist_text=bl,
+            fast=True,
+        )
+        self.worker.progress.connect(lambda p: self.set_button_progress(self.btn_view, p))
+        self.worker.finished.connect(self._on_worker_finished)
+        self.worker.error.connect(self._on_worker_error)
+        self.worker.start()
 
-    def decision_function(self, X: np.ndarray) -> np.ndarray:
-        scores = self._compute_decision_scores(X)
-        if self.threshold_ is None:
-            raise RuntimeError("模型尚未拟合")
-        return scores - self.threshold_
+    def _on_worker_finished(self, df):
+        self.btn_view.setEnabled(True)
+        self.set_button_progress(self.btn_view, 100)
+        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_view))
+        self.worker = None
 
-    def score_samples(self, X: np.ndarray) -> np.ndarray:
-        scores = self._compute_decision_scores(X)
-        return scores.astype(float)
+        if pd is not None and isinstance(df, pd.DataFrame):
+            df = self._auto_tag_dataframe(df)
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        scores = self.score_samples(X)
-        if self.threshold_ is None:
-            raise RuntimeError("模型尚未拟合")
-        return np.where(scores <= self.threshold_, -1, 1)
+        out_csv = getattr(df, "attrs", {}).get("out_csv", None)
+        files_total = getattr(df, "attrs", {}).get("files_total", None)
+        errs = getattr(df, "attrs", {}).get("errors", "")
 
-    # 内部方法 ---------------------------------------------------------
-    def _compute_decision_scores(self, X: np.ndarray) -> np.ndarray:
-        if not self.detectors_:
-            raise RuntimeError("模型尚未拟合")
-
-        X = np.asarray(X, dtype=float)
-        if X.ndim != 2:
-            raise ValueError("X 必须为二维数组")
-
-        decision_stack = []
-        weights = []
-        for name, info in self.detectors_.items():
-            estimator = info.estimator
-            if hasattr(estimator, "decision_function"):
-                dec = estimator.decision_function(X)
-            elif hasattr(estimator, "score_samples"):
-                dec = estimator.score_samples(X)
+        dst_dir = self._default_csv_info_dir()
+        os.makedirs(dst_dir, exist_ok=True)
+        try:
+            if out_csv and os.path.exists(out_csv):
+                dst = os.path.join(dst_dir, f"pcap_info_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+                shutil.copy2(out_csv, dst)
+                self._open_csv_paged(dst)
+                self._last_out_csv = dst
+                self._add_output(dst)
             else:
-                dec = estimator.predict(X)
-            if name in self.fit_raw_scores_:
-                # 使用训练阶段的统计量进行标准化
-                ref = _normalize_scores(self.fit_raw_scores_[name])
-                ref_mean = float(np.mean(ref))
-                ref_std = float(np.std(ref) or 1.0)
+                tmp_csv = os.path.join(dst_dir, f"pcap_info_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+                df.to_csv(tmp_csv, index=False, encoding="utf-8")
+                self._open_csv_paged(tmp_csv)
+                self._last_out_csv = tmp_csv
+                self._add_output(tmp_csv)
+        except Exception as e:
+            self.display_result(f"[WARN] 落盘失败：{e}")
+
+        if df is None or (hasattr(df, "empty") and df.empty):
+            self.display_result("解析完成，但未找到流量数据。")
+        else:
+            try:
+                head_txt = df.head(20).to_string()
+            except Exception:
+                head_txt = "(预览生成失败)"
+            self.display_result(f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}", append=False)
+            rows = len(df) if hasattr(df, "__len__") else 0
+            self.bottom_label.setText(f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个  @2025")
+        if errs:
+            for e in errs.split("\n"):
+                if e.strip(): self.display_result(e)
+
+    def _on_worker_error(self, msg):
+        self.btn_view.setEnabled(True); self.reset_button_progress(self.btn_view)
+        self.worker = None
+        QtWidgets.QMessageBox.critical(None, "解析失败", msg)
+        self.display_result(f"[错误] 解析失败: {msg}")
+
+    # --------- 导出异常 ----------
+    def _on_export_results(self):
+        out_dir = self._abnormal_out_dir()
+        os.makedirs(out_dir, exist_ok=True)
+
+        summary_payload = self._analysis_summary if isinstance(self._analysis_summary, dict) else {}
+        export_payload = summary_payload.get("export_payload") if isinstance(summary_payload.get("export_payload"), dict) else None
+        metrics_payload = summary_payload.get("metrics") if isinstance(summary_payload.get("metrics"), dict) else None
+
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        written_any = False
+
+        if export_payload:
+            anomaly_count = int(export_payload.get("anomaly_count", 0))
+            anomaly_files = [str(x) for x in export_payload.get("anomaly_files", []) if x]
+            single_status = export_payload.get("single_file_status")
+
+            summary_txt = [f"异常包数量: {anomaly_count}"]
+            if anomaly_files:
+                summary_txt.append("异常包名: " + ", ".join(anomaly_files))
             else:
-                ref_mean = 0.0
-                ref_std = 1.0
-            normalized = (np.asarray(dec, dtype=float) - ref_mean) / ref_std
-            decision_stack.append(normalized)
-            weights.append(float(info.weight))
+                summary_txt.append("异常包名: 无")
+            if single_status:
+                summary_txt.append(f"单文件结论: {single_status}")
 
-        stacked = np.vstack(decision_stack)
-        weights_arr = np.asarray(weights, dtype=float)
-        weights_arr = weights_arr / weights_arr.sum()
-        combined = np.average(stacked, axis=0, weights=weights_arr)
-        return combined.astype(float)
+            summary_txt_display = "\n".join(summary_txt)
+            self.display_result(f"[INFO] 导出摘要：\n{summary_txt_display}")
+
+            summary_txt_path = os.path.join(out_dir, f"abnormal_summary_{timestamp}.txt")
+            with open(summary_txt_path, "w", encoding="utf-8") as fh:
+                fh.write(summary_txt_display)
+            self._add_output(summary_txt_path)
+            written_any = True
+
+            if metrics_payload and metrics_payload.get("anomalous_files") and pd is not None:
+                try:
+                    df_files = pd.DataFrame(metrics_payload["anomalous_files"])
+                    if not df_files.empty:
+                        csv_path = os.path.join(out_dir, f"abnormal_files_{timestamp}.csv")
+                        df_files.to_csv(csv_path, index=False, encoding="utf-8")
+                        self._add_output(csv_path)
+                        written_any = True
+                except Exception as exc:
+                    self.display_result(f"[WARN] 导出异常文件列表失败：{exc}")
+
+            if anomaly_count == 0:
+                QtWidgets.QMessageBox.information(None, "没有异常", "当前分析结果中未检测到异常流量。")
+                return
+
+        df = self._last_preview_df
+        if df is None or (hasattr(df, "empty") and df.empty):
+            if written_any:
+                return
+            QtWidgets.QMessageBox.warning(None, "没有数据", "请先查看或加载带预测的数据。")
+            return
+
+        export_df = None
+        if "prediction" in df.columns:
+            export_df = df[df["prediction"] == -1].copy()
+        elif "anomaly_score" in df.columns:
+            export_df = df[df["anomaly_score"] > 0].copy()
+        else:
+            if not written_any:
+                QtWidgets.QMessageBox.information(None, "无异常标记", "没有 prediction 或 anomaly_score 列，无法筛选异常。")
+            return
+        if export_df.empty:
+            if not written_any:
+                QtWidgets.QMessageBox.information(None, "没有异常", "当前数据中未检测到异常行。")
+            return
+
+        outp = os.path.join(out_dir, f"abnormal_{timestamp}.csv")
+        export_df.to_csv(outp, index=False, encoding="utf-8")
+        self._add_output(outp)
+        self.display_result(f"[INFO] 已导出异常CSV：{outp}")
+        self._open_csv_paged(outp)
+
+    # --------- 提取特征（按顶部路径） ----------
+    def _on_extract_features(self):
+        path = self.file_edit.text().strip()
+        if not path:
+            QtWidgets.QMessageBox.warning(None, "未选择路径", "请先在顶部选择 pcap 文件或目录。"); return
+
+        out_dir = self._default_csv_feature_dir()
+        os.makedirs(out_dir, exist_ok=True)
+
+        if os.path.isdir(path):
+            self.display_result(f"[INFO] 目录特征提取：{path} -> {out_dir}")
+            self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
+            self.dir_fe_worker = DirFeatureWorker(path, out_dir, workers=self.workers_spin.value())
+            self.dir_fe_worker.progress.connect(lambda p: self.set_button_progress(self.btn_fe, p))
+            self.dir_fe_worker.finished.connect(self._on_fe_dir_finished)
+            self.dir_fe_worker.error.connect(self._on_fe_error)
+            self.dir_fe_worker.start()
+        else:
+            base = os.path.splitext(os.path.basename(path))[0]
+            csv = os.path.join(out_dir, f"{base}_features_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+            self.display_result(f"[INFO] 单文件特征提取：{path} -> {csv}")
+            self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
+            self.fe_worker = FeatureWorker(path, csv)
+            self.fe_worker.progress.connect(lambda p: self.set_button_progress(self.btn_fe, p))
+            self.fe_worker.finished.connect(self._on_fe_finished)
+            self.fe_worker.error.connect(self._on_fe_error)
+            self.fe_worker.start()
+
+    def _on_fe_finished(self, csv):
+        self.btn_fe.setEnabled(True)
+        self.set_button_progress(self.btn_fe, 100)
+        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
+        self.display_result(f"[INFO] 特征提取完成，CSV已保存: {csv}")
+        self._add_output(csv)
+        try:
+            df = pd.read_csv(csv, nrows=50, encoding="utf-8")
+            self.populate_table_from_df(df)
+            self._last_out_csv = csv
+            self._open_csv_paged(csv)
+        except Exception:
+            pass
+
+    def _on_fe_dir_finished(self, csv_list: List[str]):
+        self.btn_fe.setEnabled(True)
+        self.set_button_progress(self.btn_fe, 100)
+        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
+        self.display_result(f"[INFO] 目录特征提取完成：共 {len(csv_list)} 个 CSV")
+        for p in csv_list:
+            if os.path.exists(p): self._add_output(p)
+        if csv_list:
+            first = csv_list[0]
+            try:
+                df = pd.read_csv(first, nrows=50, encoding="utf-8")
+                self.populate_table_from_df(df)
+                self._last_out_csv = first
+                self._open_csv_paged(first)
+            except Exception:
+                pass
+
+    def _on_fe_error(self, msg):
+        self.btn_fe.setEnabled(True); self.reset_button_progress(self.btn_fe)
+        QtWidgets.QMessageBox.critical(None, "特征提取失败", msg)
+        self.display_result(f"[错误] 特征提取失败: {msg}")
+
+    # --------- 数据预处理（基于特征 CSV） ----------
+    def _on_preprocess_features(self):
+        feature_dir = self._default_csv_feature_dir()
+        if not os.path.isdir(feature_dir):
+            QtWidgets.QMessageBox.warning(None, "目录不存在", f"特征目录不存在：{feature_dir}")
+            return
+
+        csv_files = [n for n in os.listdir(feature_dir) if n.lower().endswith(".csv")]
+        if not csv_files:
+            QtWidgets.QMessageBox.information(None, "没有特征数据", "请先完成特征提取后再进行数据预处理。")
+            return
+
+        out_dir = self._preprocess_out_dir()
+        os.makedirs(out_dir, exist_ok=True)
+
+        self.display_result(f"[INFO] 数据预处理：{feature_dir} -> {out_dir}")
+        self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
+        self.preprocess_worker = PreprocessWorker(feature_dir, out_dir)
+        self.preprocess_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
+        self.preprocess_worker.finished.connect(self._on_preprocess_finished)
+        self.preprocess_worker.error.connect(self._on_preprocess_error)
+        self.preprocess_worker.start()
+
+    def _on_preprocess_finished(self, result):
+        self.btn_vector.setEnabled(True)
+        self.set_button_progress(self.btn_vector, 100)
+        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_vector))
+        self.preprocess_worker = None
+
+        data = result if isinstance(result, dict) else {}
+        dataset = data.get("dataset_path")
+        manifest = data.get("manifest_path")
+        meta_path = data.get("meta_path")
+        total_rows = data.get("total_rows")
+        total_cols = data.get("total_cols")
+
+        if dataset:
+            self._add_output(dataset)
+        if manifest:
+            self._add_output(manifest)
+            try:
+                df = pd.read_csv(manifest, nrows=50, encoding="utf-8")
+                self.populate_table_from_df(df)
+                self._last_out_csv = manifest
+                self._open_csv_paged(manifest)
+            except Exception:
+                pass
+        if meta_path:
+            self._add_output(meta_path)
+
+        summary = f"[INFO] 数据预处理完成：{total_rows or 0} 条记录，{total_cols or 0} 个特征。"
+        if dataset:
+            summary += f" 数据集：{dataset}"
+        self.display_result(summary)
+
+    def _on_preprocess_error(self, msg):
+        self.btn_vector.setEnabled(True)
+        self.reset_button_progress(self.btn_vector)
+        QtWidgets.QMessageBox.critical(None, "数据预处理失败", msg)
+        self.display_result(f"[错误] 数据预处理失败: {msg}")
+        self.preprocess_worker = None
+
+    # --------- 训练模型（按顶部路径） ----------
+    def _on_train_model(self):
+        selected_path = self.file_edit.text().strip()
+        preprocess_dir = self._preprocess_out_dir()
+
+        if selected_path and os.path.exists(selected_path):
+            path = selected_path
+        else:
+            path = preprocess_dir
+            if selected_path:
+                self.display_result(f"[WARN] 选择的路径不存在，自动改用预处理目录：{preprocess_dir}")
+            else:
+                self.display_result(f"[INFO] 未选择路径，默认使用预处理目录：{preprocess_dir}")
+
+        res_dir = self._default_results_dir()
+        mdl_dir = self._default_models_dir()
+        os.makedirs(res_dir, exist_ok=True); os.makedirs(mdl_dir, exist_ok=True)
+
+        self.display_result(f"[INFO] 开始训练，输入: {path}")
+        self.btn_train.setEnabled(False); self.set_button_progress(self.btn_train, 1)
+        self.train_worker = TrainWorker(path, res_dir, mdl_dir)
+        self.train_worker.progress.connect(lambda p: self.set_button_progress(self.btn_train, p))
+        self.train_worker.finished.connect(self._on_train_finished)
+        self.train_worker.error.connect(self._on_train_error)
+        self.train_worker.start()
+
+    def _on_train_finished(self, res):
+        self.btn_train.setEnabled(True)
+        self.set_button_progress(self.btn_train, 100)
+        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_train))
+        msg_lines = [
+            "results:",
+            f"- {res.get('results_csv')}",
+            f"- {res.get('summary_csv')}",
+            "models:",
+            f"- 最新管线: {res.get('pipeline_latest') or res.get('model_path')}",
+            f"- 元数据: {res.get('metadata_latest') or res.get('metadata_path')}",
+            f"- 标准化器: {res.get('scaler_path')}",
+            f"样本总数={res.get('flows')} 异常数={res.get('malicious')}",
+        ]
+        if res.get("threshold") is not None:
+            msg_lines.append(f"自动阈值={res.get('threshold'):.6f}")
+        if res.get("vote_threshold") is not None:
+            msg_lines.append(f"投票阈值={res.get('vote_threshold'):.2f}")
+        if res.get("estimated_precision") is not None:
+            msg_lines.append(f"异常置信度均值≈{res.get('estimated_precision'):.2%}")
+        msg = "\n".join(msg_lines)
+        self.display_result(f"[INFO] 训练完成：\n{msg}")
+        for k in ("results_csv", "summary_csv", "model_path", "scaler_path", "pipeline_latest", "metadata_latest", "metadata_path"):
+            p = res.get(k)
+            if p and os.path.exists(p): self._add_output(p)
+        if res.get("results_csv") and os.path.exists(res["results_csv"]):
+            self._open_csv_paged(res["results_csv"])
+
+    def _on_train_error(self, msg):
+        self.btn_train.setEnabled(True); self.reset_button_progress(self.btn_train)
+        QtWidgets.QMessageBox.critical(None, "训练失败", msg)
+        self.display_result(f"[错误] 训练失败: {msg}")
+
+    # --------- 运行分析 ----------
+    def _on_run_analysis(self):
+        out_dir = self._analysis_out_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        auto = os.path.join(self._default_results_dir(), "iforest_results.csv")
+        if os.path.exists(auto):
+            csv = auto
+        else:
+            csv, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择检测结果CSV", "", "CSV Files (*.csv)")
+            if not csv:
+                self.display_result("请先选择结果CSV"); return
+
+        self.display_result(f"[INFO] 正在分析结果 -> {out_dir}")
+        self._analysis_summary = None
+        self.btn_analysis.setEnabled(False); self.set_button_progress(self.btn_analysis, 1)
+        self.analysis_worker = AnalysisWorker(csv, out_dir)
+        self.analysis_worker.progress.connect(lambda p: self.set_button_progress(self.btn_analysis, p))
+        self.analysis_worker.finished.connect(self._on_analysis_finished)
+        self.analysis_worker.error.connect(self._on_analysis_error)
+        self.analysis_worker.start()
+
+    def _on_analysis_finished(self, result):
+        self.btn_analysis.setEnabled(True)
+        self.set_button_progress(self.btn_analysis, 100)
+        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_analysis))
+        out_dir = None
+        plot_paths: List[str] = []
+        top20_csv: Optional[str] = None
+        summary_csv: Optional[str] = None
+        summary_text: Optional[str] = None
+        summary_json: Optional[str] = None
+
+        if isinstance(result, dict):
+            self._analysis_summary = result
+            out_dir = result.get("out_dir") or None
+            plots = result.get("plots") or []
+            if isinstance(plots, (list, tuple)):
+                plot_paths = [p for p in plots if isinstance(p, str)]
+            elif isinstance(plots, str):
+                plot_paths = [plots]
+            top20_csv = result.get("top20_csv") if isinstance(result.get("top20_csv"), str) else None
+            summary_csv = result.get("summary_csv") if isinstance(result.get("summary_csv"), str) else None
+            summary_text = result.get("summary_text") if isinstance(result.get("summary_text"), str) else None
+            summary_json = result.get("summary_json") if isinstance(result.get("summary_json"), str) else None
+        else:
+            out_dir = str(result) if result is not None else None
+
+        if not out_dir:
+            out_dir = self._analysis_out_dir()
+
+        base_msg = f"[INFO] 分析完成，图表保存在 {out_dir}"
+        if summary_text:
+            self.display_result(f"{base_msg}\n{summary_text}")
+        else:
+            self.display_result(base_msg)
+
+        added_paths: Set[str] = set()
+
+        def _mark(path: str):
+            if path and os.path.exists(path) and path not in added_paths:
+                self._add_output(path)
+                added_paths.add(path)
+
+        for p in plot_paths:
+            _mark(p)
+
+        if top20_csv:
+            _mark(top20_csv)
+            if pd is not None and os.path.exists(top20_csv):
+                try:
+                    df = pd.read_csv(top20_csv, encoding="utf-8")
+                    if not df.empty:
+                        self.populate_table_from_df(df)
+                        self._last_out_csv = top20_csv
+                        self._open_csv_paged(top20_csv)
+                except Exception:
+                    pass
+
+        fallback_names = [
+            "top10_malicious_ratio.png",
+            "anomaly_score_distribution.png",
+            "top20_packets.csv",
+        ]
+        for name in fallback_names:
+            _mark(os.path.join(out_dir, name))
+
+        if summary_csv:
+            _mark(summary_csv)
+        else:
+            default_summary = os.path.join(self._default_results_dir(), "summary_by_file.csv")
+            if os.path.exists(default_summary):
+                _mark(default_summary)
+
+        if summary_json:
+            _mark(summary_json)
+
+        if out_dir and os.path.isdir(out_dir):
+            _mark(out_dir)
+
+    def _on_analysis_error(self, msg):
+        self.btn_analysis.setEnabled(True); self.reset_button_progress(self.btn_analysis)
+        QtWidgets.QMessageBox.critical(None, "分析失败", msg)
+        self.display_result(f"[错误] 分析失败: {msg}")
+        self._analysis_summary = None
+
+    # --------- 模型预测（支持 Pipeline / 模型+scaler / 仅模型） ----------
+    def _on_predict(self):
+        csv_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None, "选择特征CSV", self._default_csv_feature_dir(), "CSV (*.csv)"
+        )
+        if not csv_path:
+            return
+        try:
+            df = pd.read_csv(csv_path, encoding="utf-8")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{e}")
+            return
+        if df.empty:
+            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
+            return
+
+        from joblib import load as joblib_load
+
+        pipeline_path, meta_path = self._latest_pipeline_bundle()
+        if not pipeline_path or not os.path.exists(pipeline_path):
+            QtWidgets.QMessageBox.warning(None, "缺少模型", "未找到最新的管线模型，请先完成一次训练。")
+            return
+
+        try:
+            pipeline = joblib_load(pipeline_path)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, "加载失败", f"无法加载模型：{e}")
+            return
+
+        metadata = {}
+        if meta_path and os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    metadata = json.load(fh)
+            except Exception:
+                metadata = {}
+
+        feature_columns = metadata.get("feature_columns") if isinstance(metadata, dict) else None
+        threshold = metadata.get("threshold") if isinstance(metadata, dict) else None
+        score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
+        vote_mean_meta = metadata.get("vote_mean") if isinstance(metadata, dict) else None
+        vote_threshold_meta = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
+
+        use_df = df.copy()
+        if feature_columns:
+            missing_cols = [c for c in feature_columns if c not in use_df.columns]
+            for col in missing_cols:
+                use_df[col] = 0
+            X_df = use_df[feature_columns]
+        else:
+            X_df = use_df.select_dtypes(include=[np.number])
+            if X_df.empty:
+                X_df = use_df.apply(pd.to_numeric, errors="coerce")
+
+        X_df = X_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+        X = X_df.to_numpy(dtype=float, copy=False)
+
+        named_steps = getattr(pipeline, "named_steps", {}) if hasattr(pipeline, "named_steps") else {}
+        detector = named_steps.get("detector") if isinstance(named_steps, dict) else None
+        scaler = named_steps.get("scaler") if isinstance(named_steps, dict) else None
+
+        X_scaled = None
+
+        if detector is None:
+            QtWidgets.QMessageBox.critical(None, "模型不完整", "当前模型缺少集成检测器，请重新训练。")
+            return
+
+        try:
+            preds = pipeline.predict(X)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}")
+            return
+
+        scores = getattr(detector, "last_combined_scores_", None)
+        if scores is None:
+            try:
+                if scaler is not None:
+                    X_scaled = scaler.transform(X)
+                else:
+                    X_scaled = X
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(None, "缩放失败", f"标准化失败：{e}")
+                try:
+                    X_scaled = X if scaler is None else scaler.fit_transform(X)
+                except Exception:
+                    X_scaled = X
+            try:
+                scores = detector.score_samples(X_scaled)
+            except Exception:
+                scores = np.zeros(len(X), dtype=float)
+        scores = np.asarray(scores, dtype=float)
+
+        vote_ratio = getattr(detector, "last_vote_ratio_", None)
+        if vote_ratio is None:
+            vote_blocks = []
+            if X_scaled is None:
+                try:
+                    X_scaled = scaler.transform(X) if scaler is not None else X
+                except Exception:
+                    X_scaled = X
+            for info in getattr(detector, "detectors_", {}).values():
+                est = getattr(info, "estimator", None)
+                if est is None or not hasattr(est, "predict"):
+                    continue
+                try:
+                    sub_pred = est.predict(X_scaled)
+                    vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
+                except Exception:
+                    continue
+            if vote_blocks:
+                vote_ratio = np.vstack(vote_blocks).mean(axis=0)
+        if vote_ratio is None:
+            fallback_vote = 0.5 if vote_mean_meta is None else float(vote_mean_meta)
+            vote_ratio = np.full(len(X), fallback_vote, dtype=float)
+        vote_ratio = np.asarray(vote_ratio, dtype=float)
+
+        if threshold is None:
+            threshold = getattr(detector, "threshold_", None)
+        if threshold is None:
+            threshold = float(np.quantile(scores, 0.05)) if len(scores) else 0.0
+
+        vote_threshold = vote_threshold_meta
+        if vote_threshold is None:
+            vote_threshold = getattr(detector, "vote_threshold_", None)
+        if vote_threshold is None:
+            vote_threshold = float(np.mean(vote_ratio)) if len(vote_ratio) else 0.5
+        vote_threshold = float(np.clip(vote_threshold, 0.0, 1.0))
+
+        if score_std is None:
+            score_std = float(np.std(scores) or 1.0)
+
+        conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
+        vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
+        anomaly_confidence = np.clip((conf_from_score + vote_component) / 2.0, 0.0, 1.0)
+
+        out_df = df.copy()
+        out_df["prediction"] = preds
+        out_df["is_malicious"] = (preds == -1).astype(int)
+        out_df["anomaly_score"] = scores
+        out_df["anomaly_confidence"] = anomaly_confidence
+        out_df["vote_ratio"] = vote_ratio
+
+        malicious = int(out_df["is_malicious"].sum())
+        total = int(len(out_df))
+        ratio = (malicious / total) if total else 0.0
+        status = "异常" if malicious else "正常"
+
+        out_dir = self._prediction_out_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = os.path.splitext(os.path.basename(csv_path))[0]
+        out_csv = os.path.join(out_dir, f"prediction_{base}_{stamp}.csv")
+        try:
+            out_df.to_csv(out_csv, index=False, encoding="utf-8")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, "保存失败", f"无法写出预测结果：{e}")
+            return
+
+        score_min = float(np.min(scores)) if len(scores) else 0.0
+        score_max = float(np.max(scores)) if len(scores) else 0.0
+        msg = [
+            f"模型预测完成：{out_csv}",
+            f"整体判定：{status}",
+            f"检测包数：{total}",
+            f"异常包数：{malicious} ({ratio:.2%})",
+            f"自动阈值：{threshold:.6f}",
+            f"投票阈值：{vote_threshold:.2f}",
+            f"分数范围：{score_min:.4f} ~ {score_max:.4f}",
+            f"平均异常置信度：{float(anomaly_confidence.mean()):.2%}",
+        ]
+        self.display_result("\n".join(msg))
+
+        self._add_output(out_csv)
+        self._last_out_csv = out_csv
+        self._open_csv_paged(out_csv)
+
+    # --------- 输出列表 ----------
+    def _add_output(self, path):
+        if not path: return
+        it = QtWidgets.QListWidgetItem(os.path.basename(path))
+        it.setToolTip(path); it.setData(QtCore.Qt.UserRole, path)
+        self.output_list.addItem(it); self.output_list.scrollToBottom()
+
+    def _on_output_double_click(self, it):
+        self._reveal_in_folder(it.data(QtCore.Qt.UserRole))
+
+    def _on_output_ctx_menu(self, pos):
+        it = self.output_list.itemAt(pos)
+        if not it: return
+        p = it.data(QtCore.Qt.UserRole)
+        m = QtWidgets.QMenu(self.output_list)
+        a1 = m.addAction("复制完整路径")
+        a2 = m.addAction("将此路径写入上方输入框")
+        a3 = m.addAction("在资源管理器中显示")
+        act = m.exec_(self.output_list.mapToGlobal(pos))
+        if act == a1: QtWidgets.QApplication.clipboard().setText(p)
+        elif act == a2: self.file_edit.setText(p)
+        elif act == a3: self._reveal_in_folder(p)
+
+    def _reveal_in_folder(self, path):
+        try:
+            sysname = platform.system().lower()
+            if sysname.startswith("win"):
+                if os.path.isdir(path): os.startfile(path)
+                else: subprocess.run(["explorer", "/select,", os.path.normpath(path)])
+            elif sysname == "darwin":
+                subprocess.run(["open", "-R", path])
+            else:
+                subprocess.run(["xdg-open", path if os.path.isdir(path) else os.path.dirname(path)])
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(None, "打开失败", f"无法打开资源管理器：{e}")
+
+    # --------- 清空 ----------
+    def _on_clear(self):
+        if getattr(self, "worker", None) and self.worker.isRunning():
+            self.worker.requestInterruption()
+        if getattr(self, "preprocess_worker", None) and self.preprocess_worker.isRunning():
+            self.preprocess_worker.requestInterruption()
+
+        self.results_text.setUpdatesEnabled(False)
+        self.table_view.setUpdatesEnabled(False)
+        self.output_list.setUpdatesEnabled(False)
+        try:
+            self.results_text.clear()
+            self.table_view.setSortingEnabled(False)
+            self.table_view.setModel(None)
+            self.display_tabs.setCurrentWidget(self.results_widget)
+            self.output_list.clear()
+            self.bottom_label.setText("@2025  恶意流量检测系统")
+            self._csv_paged_path = None
+            self._csv_total_rows = None
+            self._csv_current_page = 1
+            self.page_info.setText("第 0/0 页")
+            self._last_preview_df = None
+            self._last_out_csv = None
+            self.reset_button_progress(self.btn_view)
+            self.reset_button_progress(self.btn_fe)
+            self.reset_button_progress(self.btn_vector)
+            self.reset_button_progress(self.btn_train)
+            self.reset_button_progress(self.btn_analysis)
+        finally:
+            self.results_text.setUpdatesEnabled(True)
+            self.table_view.setUpdatesEnabled(True)
+            self.output_list.setUpdatesEnabled(True)
+
+    def retranslateUi(self, MainWindow):
+        _translate = QtCore.QCoreApplication.translate
+        MainWindow.setWindowTitle(_translate("MainWindow", "恶意流量检测系统 — 主功能页面"))
 
 
-__all__ = ["EnsembleAnomalyDetector"]
+class MainWindow(QtWidgets.QMainWindow):
+    """PyQt 主窗口封装，方便直接运行该脚本启动 GUI。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ui = Ui_MainWindow()
+        self.ui.setupUi(self)
+
+
+def main() -> int:
+    """启动 Qt 应用并展示主窗口。"""
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication(sys.argv)
+        owns_app = True
+    else:
+        owns_app = False
+
+    window = MainWindow()
+    window.show()
+
+    if owns_app:
+        return app.exec_()
+
+    # 若外部已有 QApplication，则仅返回 0，保持兼容
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

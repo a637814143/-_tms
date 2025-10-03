@@ -50,6 +50,8 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
     malicious_ratio_global = float(malicious_total / total_rows) if total_rows else 0.0
 
     avg_confidence = None
+    vote_ratio_quantiles = None
+    vote_threshold_hint = None
     if "anomaly_confidence" in df.columns:
         try:
             conf_series = df["anomaly_confidence"].astype("float32", copy=False)
@@ -59,6 +61,14 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
                 avg_confidence = float(conf_series.mean())
         except Exception:
             avg_confidence = None
+    if "vote_ratio" in df.columns:
+        try:
+            vote_series = df["vote_ratio"].astype("float32", copy=False)
+            vote_ratio_quantiles = vote_series.quantile([0.5, 0.75, 0.9]).to_dict()
+            vote_threshold_hint = float(vote_ratio_quantiles.get(0.75, vote_series.mean()))
+        except Exception:
+            vote_ratio_quantiles = None
+            vote_threshold_hint = None
 
     grouped = df.groupby("pcap_file", dropna=False)
     summary = grouped["is_malicious"].agg([("malicious_count", lambda s: int((s.astype("float32") > 0).sum())),
@@ -157,6 +167,8 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
     ]
     if avg_confidence is not None:
         summary_lines.append(f"异常置信度均值：{avg_confidence:.2%}")
+    if vote_threshold_hint is not None:
+        summary_lines.append(f"投票占比建议阈值：≥ {vote_threshold_hint:.2f}")
     if single_file_status:
         summary_lines.append(f"单文件判定：{single_file_status}")
     if anomalous_files:
@@ -181,6 +193,8 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
         "score_threshold": score_threshold,
         "ratio_threshold": ratio_threshold,
         "avg_confidence": avg_confidence,
+        "vote_ratio_quantiles": vote_ratio_quantiles,
+        "vote_threshold_hint": vote_threshold_hint,
         "anomalous_files": anomalous_files,
         "anomaly_score_quantiles": anomaly_score_quantiles,
         "single_file_status": single_file_status,
