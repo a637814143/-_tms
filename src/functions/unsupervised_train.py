@@ -173,20 +173,35 @@ def _train_from_dataframe(
     pipeline.fit(X)
     detector: EnsembleAnomalyDetector = pipeline.named_steps["detector"]
 
-    scores = detector.fit_decision_scores_ if detector.fit_decision_scores_ is not None else detector.score_samples(pipeline.named_steps["scaler"].transform(X))
-    threshold = detector.threshold_ if detector.threshold_ is not None else float(np.quantile(scores, contamination))
+    scores = None
+    if detector.last_combined_scores_ is not None:
+        scores = detector.last_combined_scores_
+    elif detector.fit_decision_scores_ is not None:
+        scores = detector.fit_decision_scores_
+    else:
+        scores = detector.score_samples(pipeline.named_steps["scaler"].transform(X))
+    scores = np.asarray(scores, dtype=float)
 
     preds = pipeline.predict(X)
     is_malicious = (preds == -1).astype(int)
 
-    if detector.fit_votes_:
+    vote_ratio = None
+    if detector.last_vote_ratio_ is not None:
+        vote_ratio = detector.last_vote_ratio_
+    elif detector.fit_votes_:
         vote_ratio = np.vstack([np.where(v == -1, 1.0, 0.0) for v in detector.fit_votes_.values()]).mean(axis=0)
     else:
         vote_ratio = np.ones_like(is_malicious, dtype=float)
+    vote_ratio = np.asarray(vote_ratio, dtype=float)
+
+    threshold = detector.threshold_ if detector.threshold_ is not None else float(np.quantile(scores, contamination))
+    vote_threshold = detector.vote_threshold_ if detector.vote_threshold_ is not None else float(np.mean(vote_ratio))
+    vote_threshold = float(np.clip(vote_threshold, 0.0, 1.0))
 
     score_std = float(np.std(scores) or 1.0)
     conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
-    anomaly_confidence = np.clip((conf_from_score + vote_ratio) / 2.0, 0.0, 1.0)
+    vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
+    anomaly_confidence = np.clip((conf_from_score + vote_component) / 2.0, 0.0, 1.0)
 
     working_df["anomaly_score"] = scores
     working_df["vote_ratio"] = vote_ratio
@@ -250,6 +265,7 @@ def _train_from_dataframe(
         "threshold": float(threshold),
         "score_std": float(score_std),
         "vote_mean": float(np.mean(vote_ratio)),
+        "vote_threshold": float(vote_threshold),
         "detectors": list(detector.detectors_.keys()),
         "estimated_precision": float(anomaly_confidence[is_malicious == 1].mean() if is_malicious.any() else 0.0),
         "estimated_anomaly_ratio": float(is_malicious.mean()),
@@ -283,6 +299,7 @@ def _train_from_dataframe(
         "contamination": contamination,
         "feature_columns": feature_columns,
         "threshold": float(threshold),
+        "vote_threshold": float(vote_threshold),
         "estimated_precision": metadata["estimated_precision"],
     }
 

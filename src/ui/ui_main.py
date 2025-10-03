@@ -1213,6 +1213,8 @@ class Ui_MainWindow(object):
         ]
         if res.get("threshold") is not None:
             msg_lines.append(f"自动阈值={res.get('threshold'):.6f}")
+        if res.get("vote_threshold") is not None:
+            msg_lines.append(f"投票阈值={res.get('vote_threshold'):.2f}")
         if res.get("estimated_precision") is not None:
             msg_lines.append(f"异常置信度均值≈{res.get('estimated_precision'):.2%}")
         msg = "\n".join(msg_lines)
@@ -1374,6 +1376,7 @@ class Ui_MainWindow(object):
         threshold = metadata.get("threshold") if isinstance(metadata, dict) else None
         score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
         vote_mean_meta = metadata.get("vote_mean") if isinstance(metadata, dict) else None
+        vote_threshold_meta = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
 
         use_df = df.copy()
         if feature_columns:
@@ -1393,56 +1396,79 @@ class Ui_MainWindow(object):
         detector = named_steps.get("detector") if isinstance(named_steps, dict) else None
         scaler = named_steps.get("scaler") if isinstance(named_steps, dict) else None
 
+        X_scaled = None
+
+        if detector is None:
+            QtWidgets.QMessageBox.critical(None, "模型不完整", "当前模型缺少集成检测器，请重新训练。")
+            return
+
         try:
             preds = pipeline.predict(X)
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}")
             return
 
-        scores = None
-        vote_ratio = None
-        if detector is not None and scaler is not None:
+        scores = getattr(detector, "last_combined_scores_", None)
+        if scores is None:
             try:
-                X_scaled = scaler.transform(X)
+                if scaler is not None:
+                    X_scaled = scaler.transform(X)
+                else:
+                    X_scaled = X
+            except Exception as e:
+                QtWidgets.QMessageBox.warning(None, "缩放失败", f"标准化失败：{e}")
+                try:
+                    X_scaled = X if scaler is None else scaler.fit_transform(X)
+                except Exception:
+                    X_scaled = X
+            try:
                 scores = detector.score_samples(X_scaled)
-                vote_blocks = []
-                for info in getattr(detector, "detectors_", {}).values():
-                    est = getattr(info, "estimator", None)
-                    if est is None or not hasattr(est, "predict"):
-                        continue
-                    try:
-                        sub_pred = est.predict(X_scaled)
-                        vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
-                    except Exception:
-                        continue
-                if vote_blocks:
-                    vote_ratio = np.vstack(vote_blocks).mean(axis=0)
             except Exception:
-                scores = None
+                scores = np.zeros(len(X), dtype=float)
+        scores = np.asarray(scores, dtype=float)
 
-        if scores is None:
-            try:
-                scores = pipeline.decision_function(X)
-            except Exception:
-                scores = None
-
-        if scores is None:
-            scores = np.zeros(len(X))
-
+        vote_ratio = getattr(detector, "last_vote_ratio_", None)
+        if vote_ratio is None:
+            vote_blocks = []
+            if X_scaled is None:
+                try:
+                    X_scaled = scaler.transform(X) if scaler is not None else X
+                except Exception:
+                    X_scaled = X
+            for info in getattr(detector, "detectors_", {}).values():
+                est = getattr(info, "estimator", None)
+                if est is None or not hasattr(est, "predict"):
+                    continue
+                try:
+                    sub_pred = est.predict(X_scaled)
+                    vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
+                except Exception:
+                    continue
+            if vote_blocks:
+                vote_ratio = np.vstack(vote_blocks).mean(axis=0)
         if vote_ratio is None:
             fallback_vote = 0.5 if vote_mean_meta is None else float(vote_mean_meta)
             vote_ratio = np.full(len(X), fallback_vote, dtype=float)
+        vote_ratio = np.asarray(vote_ratio, dtype=float)
 
-        if threshold is None and detector is not None:
+        if threshold is None:
             threshold = getattr(detector, "threshold_", None)
         if threshold is None:
             threshold = float(np.quantile(scores, 0.05)) if len(scores) else 0.0
+
+        vote_threshold = vote_threshold_meta
+        if vote_threshold is None:
+            vote_threshold = getattr(detector, "vote_threshold_", None)
+        if vote_threshold is None:
+            vote_threshold = float(np.mean(vote_ratio)) if len(vote_ratio) else 0.5
+        vote_threshold = float(np.clip(vote_threshold, 0.0, 1.0))
 
         if score_std is None:
             score_std = float(np.std(scores) or 1.0)
 
         conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
-        anomaly_confidence = np.clip((conf_from_score + vote_ratio) / 2.0, 0.0, 1.0)
+        vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
+        anomaly_confidence = np.clip((conf_from_score + vote_component) / 2.0, 0.0, 1.0)
 
         out_df = df.copy()
         out_df["prediction"] = preds
@@ -1475,6 +1501,7 @@ class Ui_MainWindow(object):
             f"检测包数：{total}",
             f"异常包数：{malicious} ({ratio:.2%})",
             f"自动阈值：{threshold:.6f}",
+            f"投票阈值：{vote_threshold:.2f}",
             f"分数范围：{score_min:.4f} ~ {score_max:.4f}",
             f"平均异常置信度：{float(anomaly_confidence.mean()):.2%}",
         ]
@@ -1567,18 +1594,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.setupUi(self)
 
 
-def main():
+def main() -> int:
     """启动 Qt 应用并展示主窗口。"""
     app = QtWidgets.QApplication.instance()
-    owns_app = app is None
-    if owns_app:
+    if app is None:
         app = QtWidgets.QApplication(sys.argv)
+        owns_app = True
+    else:
+        owns_app = False
+
     window = MainWindow()
     window.show()
+
     if owns_app:
-        sys.exit(app.exec_())
-    return window
+        return app.exec_()
+
+    # 若外部已有 QApplication，则仅返回 0，保持兼容
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

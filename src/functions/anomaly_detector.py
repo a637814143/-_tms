@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, Optional, Tuple
 
 import numpy as np
 from sklearn.base import BaseEstimator, OutlierMixin
@@ -73,11 +73,15 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
 
         self.detectors_: Dict[str, DetectorInfo] = {}
         self.threshold_: Optional[float] = None
+        self.vote_threshold_: Optional[float] = None
         self.offset_: Optional[float] = None
         self.feature_names_in_: Optional[np.ndarray] = None
         self.fit_decision_scores_: Optional[np.ndarray] = None
+        self.fit_vote_ratios_: Optional[np.ndarray] = None
         self.fit_raw_scores_: Dict[str, np.ndarray] = {}
         self.fit_votes_: Dict[str, np.ndarray] = {}
+        self.last_combined_scores_: Optional[np.ndarray] = None
+        self.last_vote_ratio_: Optional[np.ndarray] = None
 
     # sklearn API -----------------------------------------------------
     def fit(self, X: np.ndarray, y=None):  # noqa: D401  (sklearn 兼容签名)
@@ -92,6 +96,8 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.feature_names_in_ = None
         self.fit_raw_scores_.clear()
         self.fit_votes_.clear()
+        self.last_combined_scores_ = None
+        self.last_vote_ratio_ = None
 
         estimators: Iterable[DetectorInfo] = [
             DetectorInfo(
@@ -127,6 +133,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         ]
 
         decision_stack = []
+        vote_stack = []
         weight_stack = []
 
         # 对于样本非常多的情况，OneClassSVM 会较慢，采样训练提升速度
@@ -154,16 +161,20 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                 # 退化情况：仅返回 predict 结果
                 dec = estimator.predict(X)
 
-            decision_stack.append(_normalize_scores(dec))
+            normalized = _normalize_scores(dec)
+            decision_stack.append(normalized)
             weight_stack.append(float(info.weight))
-            self.fit_raw_scores_[info.name] = np.asarray(dec, dtype=float)
+            raw_scores = np.asarray(dec, dtype=float)
+            self.fit_raw_scores_[info.name] = raw_scores
             if hasattr(estimator, "predict"):
                 try:
                     pred = estimator.predict(X)
                 except Exception:
-                    pred = np.where(np.asarray(dec, dtype=float) <= 0, -1, 1)
+                    pred = np.where(raw_scores <= 0, -1, 1)
             else:
-                pred = np.where(np.asarray(dec, dtype=float) <= 0, -1, 1)
+                pred = np.where(raw_scores <= 0, -1, 1)
+            votes = np.where(np.asarray(pred, dtype=int) == -1, 1.0, 0.0)
+            vote_stack.append(votes)
             self.fit_votes_[info.name] = np.asarray(pred, dtype=int)
             self.detectors_[info.name] = info
 
@@ -172,30 +183,56 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         weights = weights / weights.sum()
         combined = np.average(stacked, axis=0, weights=weights)
 
+        vote_matrix = np.vstack(vote_stack) if vote_stack else np.zeros((0, n_samples))
+        if vote_matrix.size:
+            vote_ratio = np.clip(vote_matrix.mean(axis=0), 0.0, 1.0)
+        else:
+            vote_ratio = np.zeros(n_samples, dtype=float)
+
         self.fit_decision_scores_ = combined.astype(float)
+        self.fit_vote_ratios_ = vote_ratio.astype(float)
+        self.last_combined_scores_ = self.fit_decision_scores_.copy()
+        self.last_vote_ratio_ = self.fit_vote_ratios_.copy()
+
         self.threshold_ = float(np.quantile(combined, self.contamination))
         self.offset_ = float(np.mean(combined))
+
+        suspect_count = max(1, int(np.ceil(self.contamination * n_samples)))
+        ranked_idx = np.argsort(combined)[:suspect_count]
+        if ranked_idx.size and vote_ratio.size:
+            candidates = vote_ratio[ranked_idx]
+            self.vote_threshold_ = float(np.clip(np.quantile(candidates, 0.25), 0.1, 1.0))
+        else:
+            self.vote_threshold_ = float(np.clip(np.mean(vote_ratio) if vote_ratio.size else 0.5, 0.1, 1.0))
 
         return self
 
     def decision_function(self, X: np.ndarray) -> np.ndarray:
-        scores = self._compute_decision_scores(X)
+        scores, _ = self._compute_decision_details(X)
         if self.threshold_ is None:
             raise RuntimeError("模型尚未拟合")
         return scores - self.threshold_
 
     def score_samples(self, X: np.ndarray) -> np.ndarray:
-        scores = self._compute_decision_scores(X)
+        scores, _ = self._compute_decision_details(X)
         return scores.astype(float)
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        scores = self.score_samples(X)
+        scores, vote_ratio = self._compute_decision_details(X)
         if self.threshold_ is None:
             raise RuntimeError("模型尚未拟合")
-        return np.where(scores <= self.threshold_, -1, 1)
+        threshold = float(self.threshold_)
+        vote_threshold = float(self.vote_threshold_ if self.vote_threshold_ is not None else 0.5)
+        anomalies = (scores <= threshold) & (vote_ratio >= vote_threshold)
+        if not np.any(anomalies) and len(scores):
+            top_k = max(1, int(np.ceil(self.contamination * len(scores))))
+            idx = np.argsort(scores)[:top_k]
+            anomalies = np.zeros(len(scores), dtype=bool)
+            anomalies[idx] = True
+        return np.where(anomalies, -1, 1)
 
     # 内部方法 ---------------------------------------------------------
-    def _compute_decision_scores(self, X: np.ndarray) -> np.ndarray:
+    def _compute_decision_details(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         if not self.detectors_:
             raise RuntimeError("模型尚未拟合")
 
@@ -204,6 +241,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
             raise ValueError("X 必须为二维数组")
 
         decision_stack = []
+        vote_stack = []
         weights = []
         for name, info in self.detectors_.items():
             estimator = info.estimator
@@ -214,22 +252,39 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
             else:
                 dec = estimator.predict(X)
             if name in self.fit_raw_scores_:
-                # 使用训练阶段的统计量进行标准化
                 ref = _normalize_scores(self.fit_raw_scores_[name])
                 ref_mean = float(np.mean(ref))
                 ref_std = float(np.std(ref) or 1.0)
             else:
                 ref_mean = 0.0
                 ref_std = 1.0
-            normalized = (np.asarray(dec, dtype=float) - ref_mean) / ref_std
+            arr = np.asarray(dec, dtype=float)
+            normalized = (arr - ref_mean) / ref_std
             decision_stack.append(normalized)
             weights.append(float(info.weight))
+            if hasattr(estimator, "predict"):
+                try:
+                    pred = estimator.predict(X)
+                except Exception:
+                    pred = np.where(arr <= 0, -1, 1)
+            else:
+                pred = np.where(arr <= 0, -1, 1)
+            vote_stack.append(np.where(np.asarray(pred, dtype=int) == -1, 1.0, 0.0))
 
         stacked = np.vstack(decision_stack)
         weights_arr = np.asarray(weights, dtype=float)
         weights_arr = weights_arr / weights_arr.sum()
         combined = np.average(stacked, axis=0, weights=weights_arr)
-        return combined.astype(float)
+
+        if vote_stack:
+            vote_ratio = np.clip(np.mean(np.vstack(vote_stack), axis=0), 0.0, 1.0)
+        else:
+            vote_ratio = np.zeros(combined.shape[0], dtype=float)
+
+        self.last_combined_scores_ = combined.astype(float)
+        self.last_vote_ratio_ = vote_ratio.astype(float)
+
+        return self.last_combined_scores_, self.last_vote_ratio_
 
 
 __all__ = ["EnsembleAnomalyDetector"]
