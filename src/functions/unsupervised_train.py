@@ -266,6 +266,7 @@ def _train_from_dataframe(
         "score_std": float(score_std),
         "vote_mean": float(np.mean(vote_ratio)),
         "vote_threshold": float(vote_threshold),
+        "threshold_breakdown": detector.threshold_breakdown_,
         "detectors": list(detector.detectors_.keys()),
         "estimated_precision": float(anomaly_confidence[is_malicious == 1].mean() if is_malicious.any() else 0.0),
         "estimated_anomaly_ratio": float(is_malicious.mean()),
@@ -301,6 +302,7 @@ def _train_from_dataframe(
         "threshold": float(threshold),
         "vote_threshold": float(vote_threshold),
         "estimated_precision": metadata["estimated_precision"],
+        "threshold_breakdown": detector.threshold_breakdown_,
     }
 
 

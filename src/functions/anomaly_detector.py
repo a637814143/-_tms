@@ -82,6 +82,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.fit_votes_: Dict[str, np.ndarray] = {}
         self.last_combined_scores_: Optional[np.ndarray] = None
         self.last_vote_ratio_: Optional[np.ndarray] = None
+        self.threshold_breakdown_: Optional[Dict[str, float]] = None
 
     # sklearn API -----------------------------------------------------
     def fit(self, X: np.ndarray, y=None):  # noqa: D401  (sklearn 兼容签名)
@@ -194,14 +195,35 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.last_combined_scores_ = self.fit_decision_scores_.copy()
         self.last_vote_ratio_ = self.fit_vote_ratios_.copy()
 
-        self.threshold_ = float(np.quantile(combined, self.contamination))
+        quantile_threshold = float(np.quantile(combined, self.contamination))
+        median = float(np.median(combined))
+        mad = float(np.median(np.abs(combined - median)))
+        if mad <= 1e-9:
+            robust_threshold = quantile_threshold
+        else:
+            dynamic_scale = 1.0 + 0.5 * max(0.0, np.log10(1.0 / max(self.contamination, 1e-4)))
+            robust_threshold = median - 1.4826 * mad * dynamic_scale
+        adaptive_threshold = float(min(quantile_threshold, robust_threshold))
+
+        self.threshold_ = adaptive_threshold
+        self.threshold_breakdown_ = {
+            "quantile": float(quantile_threshold),
+            "median": float(median),
+            "mad": float(mad),
+            "robust": float(robust_threshold),
+            "adaptive": float(adaptive_threshold),
+        }
         self.offset_ = float(np.mean(combined))
 
         suspect_count = max(1, int(np.ceil(self.contamination * n_samples)))
         ranked_idx = np.argsort(combined)[:suspect_count]
         if ranked_idx.size and vote_ratio.size:
             candidates = vote_ratio[ranked_idx]
-            self.vote_threshold_ = float(np.clip(np.quantile(candidates, 0.25), 0.1, 1.0))
+            quant_vote = float(np.quantile(candidates, 0.25))
+            median_vote = float(np.quantile(candidates, 0.5))
+            baseline = 0.4 if self.contamination > 0.1 else 0.5
+            desired = max(quant_vote, median_vote, baseline)
+            self.vote_threshold_ = float(np.clip(desired, 0.1, 1.0))
         else:
             self.vote_threshold_ = float(np.clip(np.mean(vote_ratio) if vote_ratio.size else 0.5, 0.1, 1.0))
 

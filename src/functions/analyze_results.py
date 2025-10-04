@@ -183,6 +183,11 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
                 f"  - {item['pcap_file']}: {item['malicious_count']}/{item['total']} ({item['malicious_ratio']:.2%}), 平均得分 {avg_score_txt}"
             )
 
+    if malicious_total > 0:
+        summary_lines.append("诊断：检测到异常流量，请重点排查。")
+    else:
+        summary_lines.append("诊断：未检测到明显异常流量。")
+
     summary_text = "\n".join(summary_lines)
 
     details_payload = {
@@ -205,6 +210,7 @@ def analyze_results(results_csv: str, out_dir: str, progress_cb=None) -> dict:
         "anomaly_count": malicious_total,
         "anomaly_files": [str(item.get("pcap_file")) for item in anomalous_files if item.get("pcap_file")],
         "single_file_status": single_file_status,
+        "status_text": "异常" if malicious_total > 0 else "正常",
     }
 
     summary_json_path = os.path.join(out_dir, "analysis_summary.json")

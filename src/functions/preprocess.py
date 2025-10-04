@@ -7,7 +7,7 @@ import json
 import math
 import os
 from datetime import datetime
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -155,25 +155,49 @@ def _process_single_dataframe(
     return processed_df, meta_cols, feature_columns
 
 
+FeatureSource = Union[str, Sequence[str]]
+
+
 def preprocess_feature_dir(
-    feature_dir: str,
+    feature_dir: FeatureSource,
     output_dir: str,
     *,
     progress_cb: ProgressCallback = None,
 ) -> Dict[str, object]:
     """批量读取特征 CSV，执行数据预处理并输出统一的训练数据集。"""
 
-    if not os.path.isdir(feature_dir):
-        raise FileNotFoundError(f"目录不存在: {feature_dir}")
-
-    patterns = ["*.csv", "*.CSV"]
+    resolved_source: Union[str, None] = None
     csv_files: List[str] = []
-    for pattern in patterns:
-        csv_files.extend(glob.glob(os.path.join(feature_dir, pattern)))
-    csv_files = sorted(set(csv_files))
+
+    if isinstance(feature_dir, (list, tuple, set)):
+        for entry in feature_dir:
+            if not isinstance(entry, str):
+                continue
+            path = os.path.abspath(entry)
+            if os.path.isfile(path):
+                csv_files.append(path)
+        if not csv_files:
+            raise RuntimeError("没有选择任何有效的特征 CSV 文件。")
+        try:
+            resolved_source = os.path.commonpath(csv_files)
+        except ValueError:
+            resolved_source = os.path.dirname(csv_files[0])
+    else:
+        resolved = os.path.abspath(str(feature_dir))
+        if os.path.isdir(resolved):
+            patterns = ["*.csv", "*.CSV"]
+            for pattern in patterns:
+                csv_files.extend(glob.glob(os.path.join(resolved, pattern)))
+            csv_files = sorted(set(csv_files))
+            resolved_source = resolved
+        elif os.path.isfile(resolved):
+            csv_files = [resolved]
+            resolved_source = os.path.dirname(resolved)
+        else:
+            raise FileNotFoundError(f"未找到特征数据来源: {feature_dir}")
 
     if not csv_files:
-        raise RuntimeError(f"目录下没有找到特征 CSV: {feature_dir}")
+        raise RuntimeError("未能在所选路径中找到特征 CSV 文件。")
 
     os.makedirs(output_dir, exist_ok=True)
 
@@ -309,7 +333,7 @@ def preprocess_feature_dir(
     meta_payload = {
         "type": "preprocessed_dataset",
         "created_at": datetime.now().isoformat(timespec="seconds"),
-        "source_feature_dir": os.path.abspath(feature_dir),
+        "source_feature_dir": os.path.abspath(resolved_source) if resolved_source else "",
         "rows": int(total_rows),
         "feature_columns": feature_columns,
         "meta_columns": meta_columns_global,
