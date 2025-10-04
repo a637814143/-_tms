@@ -202,14 +202,14 @@ def preprocess_feature_dir(
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = f"dataset_preprocessed_{timestamp}"
-    dataset_path = os.path.join(output_dir, f"{base_name}.csv")
+    dataset_path = os.path.join(output_dir, f"{base_name}.npy")
     manifest_path = os.path.join(output_dir, f"{base_name}_manifest.csv")
     meta_path = os.path.join(output_dir, f"{base_name}_meta.json")
 
     counter = 1
     while os.path.exists(dataset_path):
         base_name = f"dataset_preprocessed_{timestamp}_{counter}"
-        dataset_path = os.path.join(output_dir, f"{base_name}.csv")
+        dataset_path = os.path.join(output_dir, f"{base_name}.npy")
         manifest_path = os.path.join(output_dir, f"{base_name}_manifest.csv")
         meta_path = os.path.join(output_dir, f"{base_name}_meta.json")
         counter += 1
@@ -224,6 +224,8 @@ def preprocess_feature_dir(
     meta_columns_global: List[str] = []
     feature_columns_global: List[str] = []
     first_chunk = True
+    feature_parts: List[np.ndarray] = []
+    meta_accumulator: Dict[str, List[object]] = {}
 
     for idx, csv_path in enumerate(csv_files, start=1):
         df = _load_feature_csv(csv_path)
@@ -257,13 +259,13 @@ def preprocess_feature_dir(
         full_column_order = list(meta_columns_global) + feature_columns_global
         processed_df = processed_df.loc[:, full_column_order]
 
-        processed_df.to_csv(
-            dataset_path,
-            index=False,
-            encoding="utf-8",
-            mode="w" if first_chunk else "a",
-            header=first_chunk,
-        )
+        feature_values = processed_df.loc[:, feature_columns_global]
+        feature_parts.append(feature_values.to_numpy(dtype=np.float32, copy=False))
+
+        if meta_columns_global:
+            for col in meta_columns_global:
+                values = processed_df[col].tolist()
+                meta_accumulator.setdefault(col, []).extend(values)
 
         rows = int(len(processed_df))
         manifest_rows.append(
@@ -329,6 +331,11 @@ def preprocess_feature_dir(
             "missing_token": meta.get("missing_token", MISSING_TOKEN),
         }
 
+    if not feature_parts:
+        raise RuntimeError("未能生成任何特征矩阵。")
+
+    feature_matrix = np.vstack(feature_parts).astype(np.float32, copy=False)
+
     meta_payload = {
         "type": "preprocessed_dataset",
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -340,10 +347,30 @@ def preprocess_feature_dir(
         "categorical_maps": categorical_serializable,
         "column_profiles": column_profiles,
         "files": [os.path.abspath(p) for p in csv_files],
+        "dataset_format": "npy",
     }
+
+    meta_arrays: Dict[str, np.ndarray] = {}
+    for col in meta_columns_global:
+        values = meta_accumulator.get(col, [])
+        if values and len(values) != feature_matrix.shape[0]:
+            raise RuntimeError(
+                f"元信息列 {col} 的长度与特征矩阵不一致 ({len(values)} != {feature_matrix.shape[0]})"
+            )
+        meta_arrays[col] = np.asarray(values, dtype=object) if values else np.asarray([], dtype=object)
+
+    dataset_payload = {
+        "X": feature_matrix,
+        "columns": np.asarray(feature_columns, dtype=object),
+    }
+    if meta_arrays:
+        dataset_payload["meta_columns"] = np.asarray(meta_columns_global, dtype=object)
+        dataset_payload["meta_data"] = {col: arr for col, arr in meta_arrays.items()}
 
     with open(meta_path, "w", encoding="utf-8") as fh:
         json.dump(meta_payload, fh, ensure_ascii=False, indent=2)
+
+    np.save(dataset_path, dataset_payload, allow_pickle=True)
 
     _notify(progress_cb, 100)
 
@@ -353,5 +380,6 @@ def preprocess_feature_dir(
         "meta_path": meta_path,
         "total_rows": int(total_rows),
         "total_cols": int(len(feature_columns)),
+        "feature_columns": feature_columns,
         "files": csv_files,
     }

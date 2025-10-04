@@ -91,6 +91,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.supervised_model_: Optional[BaseEstimator] = None
         self.supervised_threshold_: Optional[float] = None
         self.supervised_input_dim_: Optional[int] = None
+        self.supervised_projector_: Optional[BaseEstimator] = None
         self.last_supervised_scores_: Optional[np.ndarray] = None
         self.threshold_breakdown_: Optional[Dict[str, float]] = None
 
@@ -118,9 +119,10 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.supervised_model_ = None
         self.supervised_threshold_ = None
         self.supervised_input_dim_ = None
+        self.supervised_projector_ = None
         self.last_supervised_scores_ = None
 
-        estimators: Iterable[DetectorInfo] = [
+        estimators: list[DetectorInfo] = [
             DetectorInfo(
                 "iforest",
                 IsolationForest(
@@ -131,27 +133,37 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                     warm_start=True,
                 ),
                 weight=1.0,
-            ),
-            DetectorInfo(
-                "lof",
-                LocalOutlierFactor(
-                    n_neighbors=min(self.n_neighbors, max(5, n_samples - 1)),
-                    contamination=self.contamination,
-                    novelty=True,
-                    metric="minkowski",
-                ),
-                weight=0.9,
-            ),
-            DetectorInfo(
-                "ocsvm",
-                OneClassSVM(
-                    kernel="rbf",
-                    gamma=self.svm_gamma,
-                    nu=self.contamination,
-                ),
-                weight=0.8,
-            ),
+            )
         ]
+
+        include_lof = X.shape[1] <= 1024
+        if include_lof:
+            estimators.append(
+                DetectorInfo(
+                    "lof",
+                    LocalOutlierFactor(
+                        n_neighbors=min(self.n_neighbors, max(5, n_samples - 1)),
+                        contamination=self.contamination,
+                        novelty=True,
+                        metric="minkowski",
+                    ),
+                    weight=0.9,
+                )
+            )
+
+        include_svm = X.shape[1] <= 1200
+        if include_svm:
+            estimators.append(
+                DetectorInfo(
+                    "ocsvm",
+                    OneClassSVM(
+                        kernel="rbf",
+                        gamma=self.svm_gamma,
+                        nu=self.contamination,
+                    ),
+                    weight=0.8,
+                )
+            )
 
         decision_stack = []
         vote_stack = []
@@ -410,12 +422,15 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
             arr = np.asarray(raw_input, dtype=float)
             if arr.ndim == 1:
                 arr = arr.reshape(-1, 1)
-            use_dim = arr.shape[1]
-            if self.supervised_input_dim_ is not None:
-                use_dim = min(self.supervised_input_dim_, use_dim)
-            self.last_supervised_scores_ = self.supervised_model_.predict_proba(
-                arr[:, :use_dim]
-            )[:, 1]
+            if self.supervised_projector_ is not None:
+                try:
+                    arr = self.supervised_projector_.transform(arr)
+                except Exception:
+                    if self.supervised_input_dim_ is not None:
+                        arr = arr[:, : self.supervised_input_dim_]
+            elif self.supervised_input_dim_ is not None:
+                arr = arr[:, : self.supervised_input_dim_]
+            self.last_supervised_scores_ = self.supervised_model_.predict_proba(arr)[:, 1]
         else:
             self.last_supervised_scores_ = None
 

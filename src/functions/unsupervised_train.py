@@ -5,13 +5,15 @@ import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
+from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.feature_selection import VarianceThreshold
+from sklearn.kernel_approximation import RBFSampler
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import QuantileTransformer, StandardScaler
@@ -70,6 +72,20 @@ NORMAL_TOKENS = {
     "正常登录",
     "成功",
     "成功登录",
+    "登录成功",
+    "登陆成功",
+    "成功登陆",
+    "成功登入",
+    "登入成功",
+    "4399",
+    "4399登录",
+    "4399成功登录",
+    "baidu",
+    "baidu.",
+    "百度",
+    "百度.",
+    "百度登录",
+    "百度成功登录",
     "0",
     "false",
     "no",
@@ -97,6 +113,10 @@ ANOMALY_TOKENS = {
     "failed",
     "failure",
     "error",
+    "失败",
+    "登录失败",
+    "登陆失败",
+    "登入失败",
     "非法",
     "恶意",
     "恶意流量",
@@ -117,6 +137,10 @@ ANOMALY_TOKENS = {
 
 def _is_npz(path: str) -> bool:
     return path.lower().endswith(".npz")
+
+
+def _is_npy(path: str) -> bool:
+    return path.lower().endswith(".npy")
 
 
 def _latest_npz_in_dir(directory: str) -> Optional[str]:
@@ -241,12 +265,17 @@ def _extract_ground_truth(df: pd.DataFrame) -> Tuple[Optional[str], Optional[np.
     return None, None
 
 
-def _latest_preprocessed_csv(directory: str) -> Optional[str]:
-    candidates = [
-        os.path.join(directory, name)
-        for name in os.listdir(directory)
-        if _is_preprocessed_csv(os.path.join(directory, name))
-    ]
+def _latest_preprocessed_dataset(directory: str) -> Optional[str]:
+    candidates: List[str] = []
+    for name in os.listdir(directory):
+        path = os.path.join(directory, name)
+        if _is_preprocessed_csv(path) or _is_npz(path) or _is_npy(path):
+            base = os.path.basename(path)
+            if not base.startswith("dataset_preprocessed_"):
+                continue
+            base_root, _ = os.path.splitext(path)
+            if os.path.exists(f"{base_root}_meta.json"):
+                candidates.append(path)
     if not candidates:
         return None
     candidates.sort(key=lambda p: os.path.getmtime(p))
@@ -256,6 +285,11 @@ def _latest_preprocessed_csv(directory: str) -> Optional[str]:
 def _manifest_path_for(dataset_path: str) -> str:
     base, _ = os.path.splitext(dataset_path)
     return f"{base}_manifest.csv"
+
+
+def _meta_path_for(dataset_path: str) -> str:
+    base, _ = os.path.splitext(dataset_path)
+    return f"{base}_meta.json"
 
 
 def _load_npz_dataset(dataset_path: str) -> Tuple[np.ndarray, list]:
@@ -277,6 +311,49 @@ def _load_npz_dataset(dataset_path: str) -> Tuple[np.ndarray, list]:
         raise ValueError("X 必须为 numpy.ndarray")
 
     return X.astype(float), columns
+
+
+def _load_npy_dataset(dataset_path: str) -> Tuple[np.ndarray, List[str], Dict[str, np.ndarray]]:
+    if not os.path.exists(dataset_path):
+        raise FileNotFoundError(f"数据集不存在: {dataset_path}")
+
+    payload = np.load(dataset_path, allow_pickle=True)
+    if isinstance(payload, np.ndarray) and payload.dtype == object and payload.shape == ():
+        payload = payload.item()
+    if not isinstance(payload, dict):
+        raise ValueError(f"NPY 文件格式不正确: {dataset_path}")
+
+    if "X" not in payload:
+        raise ValueError(f"NPY 文件缺少 'X' 键: {dataset_path}")
+
+    X = np.asarray(payload["X"], dtype=float)
+    columns_raw = payload.get("columns")
+    if columns_raw is None:
+        columns = [f"feature_{i}" for i in range(X.shape[1])]
+    else:
+        columns = [str(col) for col in list(np.asarray(columns_raw).ravel())]
+
+    meta_columns = payload.get("meta_columns")
+    meta_data_raw = payload.get("meta_data") or {}
+    meta_data: Dict[str, np.ndarray] = {}
+
+    if meta_columns is not None:
+        meta_column_list = [str(col) for col in list(np.asarray(meta_columns).ravel())]
+    else:
+        meta_column_list = list(meta_data_raw.keys())
+
+    for col in meta_column_list:
+        values = meta_data_raw.get(col)
+        if values is None:
+            continue
+        arr = np.asarray(values, dtype=object)
+        if arr.shape and arr.shape[0] != X.shape[0]:
+            raise ValueError(
+                f"元信息列 {col} 的长度 ({arr.shape[0]}) 与特征矩阵不一致 ({X.shape[0]})"
+            )
+        meta_data[col] = arr
+
+    return X.astype(float), columns, meta_data
 
 
 def _ensure_dirs(results_dir: str, models_dir: str) -> None:
@@ -371,21 +448,29 @@ def _train_from_dataframe(
         random_state=42,
     )
 
-    pipeline = Pipeline(
-        [
-            ("variance_filter", VarianceThreshold(threshold=1e-6)),
-            ("scaler", StandardScaler()),
-            (
-                "gaussianizer",
-                QuantileTransformer(
-                    output_distribution="normal",
-                    subsample=200000,
-                    random_state=42,
-                ),
+    pipeline_steps = [
+        ("variance_filter", VarianceThreshold(threshold=1e-6)),
+        ("scaler", StandardScaler()),
+        (
+            "gaussianizer",
+            QuantileTransformer(
+                output_distribution="normal",
+                subsample=200000,
+                random_state=42,
             ),
-            ("detector", detector),
-        ]
-    )
+        ),
+        (
+            "feature_expander",
+            RBFSampler(
+                n_components=2500,
+                gamma=0.2,
+                random_state=42,
+            ),
+        ),
+        ("detector", detector),
+    ]
+
+    pipeline = Pipeline(pipeline_steps)
 
     if progress_cb:
         progress_cb(70)
@@ -399,22 +484,33 @@ def _train_from_dataframe(
     except Exception:
         pass
     detector = pipeline.named_steps["detector"]
+    pre_detector = Pipeline(pipeline.steps[:-1])
+    transformed_features: Optional[np.ndarray] = None
 
     supervised_metrics = None
     if ground_truth is not None:
-        transformer = Pipeline(pipeline.steps[:-1])
-        transformed = transformer.transform(X)
+        transformed = pre_detector.transform(X)
+        transformed_features = transformed
         if transformed.ndim == 1:
             transformed = transformed.reshape(-1, 1)
+
+        svd = None
+        reduced = transformed
+        if transformed.shape[1] > 512:
+            target_dim = min(512, max(64, transformed.shape[1] // 4))
+            svd = TruncatedSVD(n_components=target_dim, random_state=42)
+            reduced = svd.fit_transform(transformed)
+
         supervised_model = HistGradientBoostingClassifier(
-            max_depth=7,
-            learning_rate=0.1,
-            max_iter=400,
+            max_depth=5,
+            learning_rate=0.08,
+            max_iter=200,
             l2_regularization=1.0,
+            early_stopping=True,
             random_state=42,
         )
-        supervised_model.fit(transformed, ground_truth)
-        supervised_proba = supervised_model.predict_proba(transformed)[:, 1]
+        supervised_model.fit(reduced, ground_truth)
+        supervised_proba = supervised_model.predict_proba(reduced)[:, 1]
         thr_candidates = np.linspace(0.1, 0.9, 41)
         best_thr = 0.5
         best_f1 = -1.0
@@ -430,7 +526,8 @@ def _train_from_dataframe(
                 best_rec = recall_score(ground_truth, preds, zero_division=0)
         detector.supervised_model_ = supervised_model
         detector.supervised_threshold_ = float(best_thr)
-        detector.supervised_input_dim_ = transformed.shape[1]
+        detector.supervised_input_dim_ = reduced.shape[1]
+        detector.supervised_projector_ = svd
         detector.last_supervised_scores_ = supervised_proba.astype(float)
         supervised_metrics = {
             "precision": float(best_prec),
@@ -445,8 +542,17 @@ def _train_from_dataframe(
     elif detector.fit_decision_scores_ is not None:
         scores = detector.fit_decision_scores_
     else:
-        scores = detector.score_samples(pipeline.named_steps["scaler"].transform(X))
+        if transformed_features is None:
+            transformed_features = pre_detector.transform(X)
+        scores = detector.score_samples(transformed_features)
     scores = np.asarray(scores, dtype=float)
+
+    feature_expander = pipeline.named_steps.get("feature_expander")
+    expanded_dim = None
+    if feature_expander is not None and hasattr(feature_expander, "n_components"):
+        expanded_dim = int(getattr(feature_expander, "n_components"))
+    elif transformed_features is not None:
+        expanded_dim = int(transformed_features.shape[1])
 
     preds = pipeline.predict(X)
     is_malicious = (preds == -1).astype(int)
@@ -534,6 +640,7 @@ def _train_from_dataframe(
         "contamination": contamination,
         "base_estimators": base_estimators,
         "feature_columns": feature_columns,
+        "expanded_dim": int(expanded_dim) if expanded_dim is not None else None,
         "threshold": float(threshold),
         "score_std": float(score_std),
         "score_min": float(np.min(scores)),
@@ -601,6 +708,7 @@ def _train_from_dataframe(
         "estimated_precision": metadata["estimated_precision"],
         "threshold_breakdown": detector.threshold_breakdown_,
         "feature_columns": feature_columns,
+        "expanded_dim": expanded_dim,
         "gaussianizer_path": gaussianizer_path,
         "ground_truth_column": ground_truth_column,
         "evaluation": metadata.get("evaluation"),
@@ -628,7 +736,7 @@ def _train_from_preprocessed_csv(
     manifest_col = None
     feature_columns_hint: Optional[List[str]] = None
 
-    meta_path = dataset_path.replace(".csv", "_meta.json")
+    meta_path = _meta_path_for(dataset_path)
     if os.path.exists(meta_path):
         try:
             with open(meta_path, "r", encoding="utf-8") as fh:
@@ -717,6 +825,74 @@ def _train_from_npz(
     )
 
 
+def _train_from_npy(
+    dataset_path: str,
+    *,
+    results_dir: str,
+    models_dir: str,
+    contamination: float,
+    base_estimators: int,
+    progress_cb=None,
+) -> dict:
+    X, columns, meta_data = _load_npy_dataset(dataset_path)
+    df = pd.DataFrame(X, columns=columns)
+
+    for col, values in meta_data.items():
+        try:
+            values_len = len(values)
+        except TypeError:
+            continue
+        if values_len == len(df):
+            df[col] = pd.Series(values)
+
+    manifest_path = _manifest_path_for(dataset_path)
+    manifest_col = None
+    if os.path.exists(manifest_path):
+        try:
+            manifest_df = pd.read_csv(manifest_path, encoding="utf-8")
+            expanded = []
+            for _, row in manifest_df.iterrows():
+                rows = int(row.get("rows", 0))
+                source_file = row.get("source_file") or row.get("source_path") or "unknown"
+                expanded.extend([source_file] * rows)
+            if len(expanded) == len(df):
+                df["__source_file__"] = expanded
+                manifest_col = "__source_file__"
+        except Exception as exc:
+            print(f"[WARN] 读取 manifest 失败 {manifest_path}: {exc}")
+
+    if "__source_file__" in df.columns:
+        manifest_col = "__source_file__"
+    elif "pcap_file" in df.columns:
+        manifest_col = "pcap_file"
+
+    feature_columns_hint: Optional[List[str]] = list(columns)
+    meta_path = _meta_path_for(dataset_path)
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta_payload = json.load(fh)
+            cols = meta_payload.get("feature_columns")
+            if isinstance(cols, list) and cols:
+                feature_columns_hint = [str(col) for col in cols]
+        except Exception as exc:
+            print(f"[WARN] 读取元数据失败 {meta_path}: {exc}")
+
+    if progress_cb:
+        progress_cb(40)
+
+    return _train_from_dataframe(
+        df,
+        results_dir=results_dir,
+        models_dir=models_dir,
+        contamination=contamination,
+        base_estimators=base_estimators,
+        progress_cb=progress_cb,
+        group_column=manifest_col,
+        feature_columns_hint=feature_columns_hint,
+    )
+
+
 def train_unsupervised_on_split(
     split_dir: str,
     results_dir: str,
@@ -728,7 +904,7 @@ def train_unsupervised_on_split(
 ):
     """
     无监督训练：
-    - 支持直接加载预处理 CSV 或 NPZ 数据集
+    - 支持直接加载预处理 CSV/NPY/NPZ 数据集
     - 对 PCAP 目录进行特征提取（多线程）后再训练
     """
 
@@ -742,7 +918,9 @@ def train_unsupervised_on_split(
         raise FileNotFoundError("未提供训练数据路径")
 
     if os.path.isfile(split_dir):
-        if _is_preprocessed_csv(split_dir):
+        if _is_preprocessed_csv(split_dir) or _is_npy(split_dir) or (
+            _is_npz(split_dir) and os.path.basename(split_dir).startswith("dataset_preprocessed_")
+        ):
             dataset_path = split_dir
         elif _is_npz(split_dir):
             dataset_path = split_dir
@@ -752,7 +930,7 @@ def train_unsupervised_on_split(
         else:
             raise FileNotFoundError(f"不支持的训练文件: {split_dir}")
     elif os.path.isdir(split_dir):
-        dataset_path = _latest_preprocessed_csv(split_dir)
+        dataset_path = _latest_preprocessed_dataset(split_dir)
         if dataset_path is None:
             dataset_path = _latest_npz_in_dir(split_dir)
         if dataset_path is None:
@@ -761,7 +939,8 @@ def train_unsupervised_on_split(
         raise FileNotFoundError(f"路径不存在: {split_dir}")
 
     if dataset_path:
-        if dataset_path.lower().endswith(".csv"):
+        ext = os.path.splitext(dataset_path)[1].lower()
+        if ext == ".csv":
             return _train_from_preprocessed_csv(
                 dataset_path,
                 results_dir=results_dir,
@@ -770,14 +949,25 @@ def train_unsupervised_on_split(
                 base_estimators=base_estimators,
                 progress_cb=progress_cb,
             )
-        return _train_from_npz(
-            dataset_path,
-            results_dir=results_dir,
-            models_dir=models_dir,
-            contamination=contamination,
-            base_estimators=base_estimators,
-            progress_cb=progress_cb,
-        )
+        if ext == ".npy":
+            return _train_from_npy(
+                dataset_path,
+                results_dir=results_dir,
+                models_dir=models_dir,
+                contamination=contamination,
+                base_estimators=base_estimators,
+                progress_cb=progress_cb,
+            )
+        if ext == ".npz":
+            return _train_from_npz(
+                dataset_path,
+                results_dir=results_dir,
+                models_dir=models_dir,
+                contamination=contamination,
+                base_estimators=base_estimators,
+                progress_cb=progress_cb,
+            )
+        raise FileNotFoundError(f"不支持的数据集格式: {dataset_path}")
 
     if not pcap_dir or not os.path.isdir(pcap_dir):
         raise FileNotFoundError(f"目录不存在: {pcap_dir or split_dir}")
