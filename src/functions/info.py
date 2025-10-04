@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 """从 PCAP 文件提取简化的流量特征。"""
 
-from __future__ import annotations
-
 import argparse
 import glob
 import importlib

@@ -1,7 +1,5 @@
 """特征 CSV 数据预处理，将其整理成可直接用于模型训练的标准化数据集。"""
 
-from __future__ import annotations
-
 import glob
 import json
 import math

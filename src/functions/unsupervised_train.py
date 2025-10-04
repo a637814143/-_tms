@@ -1,7 +1,5 @@
 """无监督异常检测训练流程。"""
 
-from __future__ import annotations
-
 import json
 import os
 import shutil

@@ -1,7 +1,5 @@
 """PCAP 分割工具。"""
 
-from __future__ import annotations
-
 import argparse
 import os
 from typing import List, Optional

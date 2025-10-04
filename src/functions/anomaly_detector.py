@@ -4,8 +4,6 @@
 自动校准，实现比单一 IsolationForest 更稳定的检测表现。
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
