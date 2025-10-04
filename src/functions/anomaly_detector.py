@@ -98,6 +98,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.threshold_breakdown_: Optional[Dict[str, float]] = None
         self.projection_model_: Optional[TruncatedSVD] = None
         self.projected_dim_: Optional[int] = None
+        self.training_anomaly_ratio_: Optional[float] = None
 
     # sklearn API -----------------------------------------------------
     def fit(self, X: np.ndarray, y=None):  # noqa: D401  (sklearn 兼容签名)
@@ -127,6 +128,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.last_supervised_scores_ = None
         self.projection_model_ = None
         self.projected_dim_ = None
+        self.training_anomaly_ratio_ = None
 
         projected_X = X
         use_projection = X.shape[1] > 512
@@ -345,6 +347,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                     self.calibration_threshold_ = float(best_thr)
                     self.calibration_report_ = best_metrics
                     self.last_calibrated_scores_ = proba.astype(float)
+        self._apply_false_positive_guard(combined, vote_ratio)
         return self
 
     def decision_function(self, X: np.ndarray) -> np.ndarray:
@@ -361,49 +364,20 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         scores, vote_ratio = self._compute_decision_details(X)
         if self.threshold_ is None:
             raise RuntimeError("模型尚未拟合")
-        threshold = float(self.threshold_)
         vote_threshold = float(
             self.vote_threshold_ if self.vote_threshold_ is not None else np.clip(np.mean(vote_ratio), 0.1, 1.0)
         )
-        base_anomalies = (scores <= threshold) & (vote_ratio >= vote_threshold)
-        anomalies = base_anomalies.copy()
-
-        if (
-            self.supervised_model_ is not None
-            and self.last_supervised_scores_ is not None
-        ):
-            cal_threshold = (
-                float(self.supervised_threshold_)
-                if self.supervised_threshold_ is not None
-                else 0.5
-            )
-            sup_scores = self.last_supervised_scores_.astype(float)
-            margin = max(0.05, min(0.2, 0.5 * (1.0 - cal_threshold)))
-            strong_sup = sup_scores >= (cal_threshold + margin)
-            consensus = base_anomalies & (sup_scores >= cal_threshold)
-            anomalies = consensus | strong_sup
-            if not np.any(anomalies):
-                anomalies = base_anomalies
-        elif self.calibrator_ is not None and self.last_calibrated_scores_ is not None:
-            cal_threshold = (
-                float(self.calibration_threshold_)
-                if self.calibration_threshold_ is not None
-                else 0.5
-            )
-            cal_scores = self.last_calibrated_scores_.astype(float)
-            margin = max(0.05, min(0.2, 0.5 * (1.0 - cal_threshold)))
-            strong_cal = cal_scores >= (cal_threshold + margin)
-            consensus = base_anomalies & (cal_scores >= cal_threshold)
-            anomalies = consensus | strong_cal
-            if not np.any(anomalies):
-                anomalies = base_anomalies
-        else:
-            anomalies = base_anomalies
-        if not np.any(anomalies) and len(scores):
-            top_k = max(1, int(np.ceil(self.contamination * len(scores))))
-            idx = np.argsort(scores)[:top_k]
-            anomalies = np.zeros(len(scores), dtype=bool)
-            anomalies[idx] = True
+        anomalies = self._finalize_anomaly_flags(
+            scores,
+            vote_ratio,
+            threshold=float(self.threshold_),
+            vote_threshold=vote_threshold,
+            supervised_scores=self.last_supervised_scores_,
+            supervised_threshold=self.supervised_threshold_,
+            calibration_scores=self.last_calibrated_scores_,
+            calibration_threshold=self.calibration_threshold_,
+            allow_empty_fallback=True,
+        )
         return np.where(anomalies, -1, 1)
 
     # 内部方法 ---------------------------------------------------------
@@ -492,6 +466,184 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         return self.last_combined_scores_, self.last_vote_ratio_
 
     # ------------------------------------------------------------------
+    def _finalize_anomaly_flags(
+        self,
+        scores: np.ndarray,
+        vote_ratio: np.ndarray,
+        *,
+        threshold: float,
+        vote_threshold: float,
+        supervised_scores: Optional[np.ndarray] = None,
+        supervised_threshold: Optional[float] = None,
+        calibration_scores: Optional[np.ndarray] = None,
+        calibration_threshold: Optional[float] = None,
+        allow_empty_fallback: bool = True,
+    ) -> np.ndarray:
+        scores_arr = np.asarray(scores, dtype=float).ravel()
+        vote_arr = np.asarray(vote_ratio, dtype=float).ravel()
+        if vote_arr.size not in (0, scores_arr.size):
+            if vote_arr.size == 1:
+                vote_arr = np.full_like(scores_arr, float(vote_arr.item()))
+            else:
+                vote_arr = np.resize(vote_arr, scores_arr.shape)
+
+        base = (scores_arr <= float(threshold)) & (
+            vote_arr >= float(np.clip(vote_threshold, 0.0, 1.0))
+        )
+        anomalies = base.copy()
+
+        if supervised_scores is not None:
+            sup_scores = np.asarray(supervised_scores, dtype=float).ravel()
+            if sup_scores.size not in (0, scores_arr.size):
+                if sup_scores.size == 1:
+                    sup_scores = np.full_like(scores_arr, float(sup_scores.item()))
+                else:
+                    sup_scores = np.resize(sup_scores, scores_arr.shape)
+            sup_thr = (
+                float(supervised_threshold)
+                if supervised_threshold is not None
+                else 0.5
+            )
+            margin = max(0.05, min(0.2, 0.5 * (1.0 - sup_thr)))
+            strong_sup = sup_scores >= (sup_thr + margin)
+            consensus = base & (sup_scores >= sup_thr)
+            anomalies = consensus | strong_sup
+            if not np.any(anomalies):
+                anomalies = base
+        elif calibration_scores is not None:
+            cal_scores = np.asarray(calibration_scores, dtype=float).ravel()
+            if cal_scores.size not in (0, scores_arr.size):
+                if cal_scores.size == 1:
+                    cal_scores = np.full_like(scores_arr, float(cal_scores.item()))
+                else:
+                    cal_scores = np.resize(cal_scores, scores_arr.shape)
+            cal_thr = (
+                float(calibration_threshold)
+                if calibration_threshold is not None
+                else 0.5
+            )
+            margin = max(0.05, min(0.2, 0.5 * (1.0 - cal_thr)))
+            strong_cal = cal_scores >= (cal_thr + margin)
+            consensus = base & (cal_scores >= cal_thr)
+            anomalies = consensus | strong_cal
+            if not np.any(anomalies):
+                anomalies = base
+
+        if allow_empty_fallback and not np.any(anomalies) and scores_arr.size:
+            top_k = max(1, int(np.ceil(self.contamination * scores_arr.size)))
+            idx = np.argsort(scores_arr)[:top_k]
+            fallback = np.zeros(scores_arr.size, dtype=bool)
+            fallback[idx] = True
+            anomalies = fallback
+
+        return anomalies
+
+    def _apply_false_positive_guard(self, scores: np.ndarray, vote_ratio: np.ndarray) -> None:
+        if self.threshold_ is None:
+            return
+
+        scores_arr = np.asarray(scores, dtype=float).ravel()
+        vote_arr = np.asarray(vote_ratio, dtype=float).ravel()
+
+        if scores_arr.size == 0:
+            self.training_anomaly_ratio_ = 0.0
+            if self.threshold_breakdown_ is not None:
+                self.threshold_breakdown_["observed_ratio"] = 0.0
+            return
+
+        vote_thr = float(
+            self.vote_threshold_ if self.vote_threshold_ is not None else np.clip(np.mean(vote_arr), 0.1, 1.0)
+        )
+        baseline_flags = self._finalize_anomaly_flags(
+            scores_arr,
+            vote_arr,
+            threshold=float(self.threshold_),
+            vote_threshold=vote_thr,
+            supervised_scores=None,
+            supervised_threshold=self.supervised_threshold_,
+            calibration_scores=self.last_calibrated_scores_,
+            calibration_threshold=self.calibration_threshold_,
+            allow_empty_fallback=False,
+        )
+        ratio = float(np.mean(baseline_flags)) if baseline_flags.size else 0.0
+        self.training_anomaly_ratio_ = ratio
+        if self.threshold_breakdown_ is not None:
+            self.threshold_breakdown_["observed_ratio"] = ratio
+
+        trigger_ratio = max(self.contamination * 3.0, 0.2)
+        if ratio <= trigger_ratio:
+            return
+
+        target_ratio = float(min(0.12, max(self.contamination * 1.5, 0.02)))
+        boosted_vote = float(
+            np.clip(vote_thr + max(0.05, (ratio - target_ratio) * 0.25), 0.5, 0.9)
+        )
+        high_quantile = float(min(0.5, max(target_ratio + 0.05, ratio * 0.8)))
+        if high_quantile <= target_ratio:
+            guard_info = {
+                "observed_ratio": ratio,
+                "target_ratio": target_ratio,
+                "trigger_ratio": trigger_ratio,
+                "threshold": float(self.threshold_),
+                "vote_threshold": vote_thr,
+            }
+            if self.threshold_breakdown_ is not None:
+                self.threshold_breakdown_["guard"] = guard_info
+            return
+
+        candidate_quants = np.linspace(target_ratio, high_quantile, num=64)
+        best_threshold = float(self.threshold_)
+        best_ratio = ratio
+        adjusted = False
+
+        for q in reversed(candidate_quants):
+            if not (0.0 < q < 1.0):
+                continue
+            cand_threshold = float(np.quantile(scores_arr, q))
+            flags = self._finalize_anomaly_flags(
+                scores_arr,
+                vote_arr,
+                threshold=cand_threshold,
+                vote_threshold=boosted_vote,
+                supervised_scores=None,
+                supervised_threshold=self.supervised_threshold_,
+                calibration_scores=self.last_calibrated_scores_,
+                calibration_threshold=self.calibration_threshold_,
+                allow_empty_fallback=False,
+            )
+            cand_ratio = float(np.mean(flags)) if flags.size else 0.0
+            if cand_ratio <= max(target_ratio, self.contamination):
+                best_threshold = cand_threshold
+                best_ratio = cand_ratio
+                adjusted = True
+                break
+            if cand_ratio < best_ratio:
+                best_threshold = cand_threshold
+                best_ratio = cand_ratio
+                adjusted = True
+
+        guard_info = {
+            "observed_ratio": ratio,
+            "target_ratio": target_ratio,
+            "trigger_ratio": trigger_ratio,
+            "threshold": float(self.threshold_),
+            "vote_threshold": vote_thr,
+        }
+
+        if adjusted:
+            self.threshold_ = best_threshold
+            self.vote_threshold_ = boosted_vote
+            self.training_anomaly_ratio_ = best_ratio
+            guard_info.update(
+                {
+                    "adjusted_ratio": best_ratio,
+                    "adjusted_threshold": float(best_threshold),
+                    "adjusted_vote_threshold": float(self.vote_threshold_),
+                }
+            )
+        if self.threshold_breakdown_ is not None:
+            self.threshold_breakdown_["guard"] = guard_info
+
     def _build_calibration_features(
         self,
         combined: np.ndarray,

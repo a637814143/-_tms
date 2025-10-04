@@ -644,6 +644,11 @@ def _train_from_dataframe(
     threshold = detector.threshold_ if detector.threshold_ is not None else float(np.quantile(scores, effective_contamination))
     vote_threshold = detector.vote_threshold_ if detector.vote_threshold_ is not None else float(np.mean(vote_ratio))
     vote_threshold = float(np.clip(vote_threshold, 0.0, 1.0))
+    training_ratio_value = (
+        float(detector.training_anomaly_ratio_)
+        if detector.training_anomaly_ratio_ is not None
+        else float(is_malicious.mean())
+    )
 
     score_std = float(np.std(scores) or 1.0)
     conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
@@ -736,6 +741,7 @@ def _train_from_dataframe(
         "vote_threshold": float(vote_threshold),
         "threshold_breakdown": detector.threshold_breakdown_,
         "detectors": list(detector.detectors_.keys()),
+        "training_anomaly_ratio": training_ratio_value,
         "estimated_precision": float(anomaly_confidence[is_malicious == 1].mean() if is_malicious.any() else 0.0),
         "estimated_anomaly_ratio": float(is_malicious.mean()),
         "results_csv": results_csv,
@@ -798,6 +804,7 @@ def _train_from_dataframe(
         "threshold_breakdown": detector.threshold_breakdown_,
         "feature_columns": feature_columns,
         "expanded_dim": expanded_dim,
+        "training_anomaly_ratio": training_ratio_value,
         "gaussianizer_path": gaussianizer_path,
         "ground_truth_column": ground_truth_column,
         "evaluation": metadata.get("evaluation"),
