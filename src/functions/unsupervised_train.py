@@ -320,6 +320,36 @@ def _meta_path_for(dataset_path: str) -> str:
     return f"{base}_meta.json"
 
 
+def _resolve_dataset_from_auxiliary(path: str) -> str:
+    """当用户误选 manifest/meta 辅助文件时，回退到对应的数据集文件。"""
+
+    if not path:
+        return path
+
+    lower = path.lower()
+
+    def _candidate(base: str) -> Optional[str]:
+        for ext in (".npy", ".npz", ".csv"):
+            candidate = f"{base}{ext}"
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    if lower.endswith("_manifest.csv"):
+        base = path[: -len("_manifest.csv")]
+        resolved = _candidate(base)
+        if resolved:
+            return resolved
+
+    if lower.endswith("_meta.json"):
+        base = path[: -len("_meta.json")]
+        resolved = _candidate(base)
+        if resolved:
+            return resolved
+
+    return path
+
+
 def _load_npz_dataset(dataset_path: str) -> Tuple[np.ndarray, list]:
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"数据集不存在: {dataset_path}")
@@ -978,6 +1008,17 @@ def train_unsupervised_on_split(
         raise FileNotFoundError("未提供训练数据路径")
 
     if os.path.isfile(split_dir):
+        user_selected_path = split_dir
+        resolved_dataset = _resolve_dataset_from_auxiliary(user_selected_path)
+        if resolved_dataset != user_selected_path:
+            if os.path.exists(resolved_dataset):
+                split_dir = resolved_dataset
+            else:
+                raise FileNotFoundError(
+                    "未找到与所选 manifest/meta 文件对应的数据集主文件，"
+                    "请重新选择预处理输出的 .npy/.npz/.csv 数据文件。"
+                )
+
         if _is_preprocessed_csv(split_dir) or _is_npy(split_dir) or (
             _is_npz(split_dir) and os.path.basename(split_dir).startswith("dataset_preprocessed_")
         ):
