@@ -54,6 +54,22 @@ NORMAL_TOKENS = {
     "legit",
     "legitimate",
     "clean",
+    "ok",
+    "allow",
+    "allowed",
+    "pass",
+    "passed",
+    "success",
+    "success.",
+    "successful",
+    "合法",
+    "良性",
+    "正常",
+    "正常.",
+    "正常流量",
+    "正常登录",
+    "成功",
+    "成功登录",
     "0",
     "false",
     "no",
@@ -67,6 +83,7 @@ ANOMALY_TOKENS = {
     "intrusion.",
     "anomaly",
     "anomaly.",
+    "abnormal",
     "malicious",
     "malicious.",
     "malware",
@@ -74,6 +91,24 @@ ANOMALY_TOKENS = {
     "spam",
     "ddos",
     "dos",
+    "denied",
+    "blocked",
+    "fail",
+    "failed",
+    "failure",
+    "error",
+    "非法",
+    "恶意",
+    "恶意流量",
+    "攻击",
+    "攻击流量",
+    "异常",
+    "异常流量",
+    "异常登录",
+    "可疑",
+    "可疑流量",
+    "嫌疑",
+    "嫌疑流量",
     "1",
     "true",
     "yes",
@@ -107,6 +142,8 @@ def _is_preprocessed_csv(path: str) -> bool:
 
 
 def _series_to_binary(series: pd.Series) -> Optional[np.ndarray]:
+    """尝试把标签列解析为 0/1。"""
+
     if series.empty:
         return None
 
@@ -130,30 +167,68 @@ def _series_to_binary(series: pd.Series) -> Optional[np.ndarray]:
         .str.strip()
         .str.lower()
     )
+
     if normalized.eq("unknown").all():
         return None
 
-    result = []
-    for value in normalized:
-        if value in NORMAL_TOKENS:
-            result.append(0)
-        elif value in ANOMALY_TOKENS:
-            result.append(1)
-        else:
-            parsed = None
-            try:
-                parsed = float(value)
-            except Exception:
-                parsed = None
-            if parsed is not None:
-                result.append(1 if parsed > 0 else 0)
-            else:
-                result.append(1)
+    parsed = np.full(len(normalized), fill_value=-1, dtype=int)
 
-    binary = np.asarray(result, dtype=int)
-    if np.unique(binary).size < 2:
+    for idx, value in enumerate(normalized):
+        if value in NORMAL_TOKENS:
+            parsed[idx] = 0
+        elif value in ANOMALY_TOKENS:
+            parsed[idx] = 1
+        else:
+            try:
+                numeric_value = float(value)
+            except Exception:
+                numeric_value = None
+            if numeric_value is not None:
+                parsed[idx] = 1 if numeric_value > 0 else 0
+
+    unresolved_mask = parsed == -1
+    if np.all(unresolved_mask):
+        # 完全未知的取值，尝试根据主频词推断
+        value_counts = normalized.value_counts()
+        if value_counts.size < 2:
+            return None
+        majority = value_counts.idxmax()
+        majority_mask = normalized.eq(majority).to_numpy()
+        parsed = np.where(majority_mask, 0, 1)
+    elif np.any(unresolved_mask):
+        unresolved_values = normalized[unresolved_mask]
+        known_normal = np.count_nonzero(parsed == 0)
+        known_anomaly = np.count_nonzero(parsed == 1)
+
+        unresolved_unique = unresolved_values.unique()
+        unresolved_ratio = len(unresolved_values) / len(parsed)
+
+        if known_normal == 0 and known_anomaly == 0:
+            # 没有任何已识别标签，仍退化为主频词推断
+            value_counts = normalized.value_counts()
+            if value_counts.size < 2:
+                return None
+            majority = value_counts.idxmax()
+            majority_mask = normalized.eq(majority).to_numpy()
+            parsed = np.where(majority_mask, 0, 1)
+        elif known_normal > 0 and known_anomaly == 0:
+            # 已知正常类别存在。若未知类别种类丰富，则把它们视为异常；
+            # 若仅出现单一取值且占比过大，则认为信息不足直接放弃。
+            if unresolved_unique.size == 1 and unresolved_ratio > 0.4:
+                return None
+            parsed[unresolved_mask] = 1
+        elif known_anomaly > 0 and known_normal == 0:
+            if unresolved_unique.size == 1 and unresolved_ratio > 0.4:
+                return None
+            parsed[unresolved_mask] = 0
+        else:
+            # 已经识别出正负样本，剩余全部按异常处理
+            parsed[unresolved_mask] = 1
+
+    unique = np.unique(parsed)
+    if unique.size < 2:
         return None
-    return binary
+    return parsed.astype(int)
 
 
 def _extract_ground_truth(df: pd.DataFrame) -> Tuple[Optional[str], Optional[np.ndarray]]:
