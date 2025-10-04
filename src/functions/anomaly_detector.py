@@ -11,9 +11,10 @@ import numpy as np
 from sklearn.base import BaseEstimator, OutlierMixin
 from sklearn.ensemble import IsolationForest
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.metrics import f1_score, fbeta_score, precision_score, recall_score
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.svm import OneClassSVM
+from sklearn.decomposition import TruncatedSVD
 
 
 def _normalize_scores(arr: np.ndarray) -> np.ndarray:
@@ -44,6 +45,7 @@ class DetectorInfo:
     name: str
     estimator: OutlierMixin
     weight: float
+    use_projected: bool = False
 
 
 class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
@@ -94,6 +96,8 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.supervised_projector_: Optional[BaseEstimator] = None
         self.last_supervised_scores_: Optional[np.ndarray] = None
         self.threshold_breakdown_: Optional[Dict[str, float]] = None
+        self.projection_model_: Optional[TruncatedSVD] = None
+        self.projected_dim_: Optional[int] = None
 
     # sklearn API -----------------------------------------------------
     def fit(self, X: np.ndarray, y=None):  # noqa: D401  (sklearn 兼容签名)
@@ -121,6 +125,22 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.supervised_input_dim_ = None
         self.supervised_projector_ = None
         self.last_supervised_scores_ = None
+        self.projection_model_ = None
+        self.projected_dim_ = None
+
+        projected_X = X
+        use_projection = X.shape[1] > 512
+        if use_projection:
+            target_dim = min(512, max(64, int(np.sqrt(X.shape[1]) * 6)))
+            self.projection_model_ = TruncatedSVD(
+                n_components=target_dim,
+                random_state=self.random_state,
+            )
+            projected_X = self.projection_model_.fit_transform(X)
+            self.projected_dim_ = int(projected_X.shape[1])
+
+        def _view(use_proj: bool) -> np.ndarray:
+            return projected_X if use_proj and self.projection_model_ is not None else X
 
         estimators: list[DetectorInfo] = [
             DetectorInfo(
@@ -133,10 +153,11 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                     warm_start=True,
                 ),
                 weight=1.0,
+                use_projected=False,
             )
         ]
 
-        include_lof = X.shape[1] <= 1024
+        include_lof = True if self.projection_model_ is not None else X.shape[1] <= 1024
         if include_lof:
             estimators.append(
                 DetectorInfo(
@@ -148,10 +169,11 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                         metric="minkowski",
                     ),
                     weight=0.9,
+                    use_projected=self.projection_model_ is not None,
                 )
             )
 
-        include_svm = X.shape[1] <= 1200
+        include_svm = True if self.projection_model_ is not None else X.shape[1] <= 1200
         if include_svm:
             estimators.append(
                 DetectorInfo(
@@ -162,6 +184,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                         nu=self.contamination,
                     ),
                     weight=0.8,
+                    use_projected=self.projection_model_ is not None,
                 )
             )
 
@@ -175,24 +198,31 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
             idx = np.random.default_rng(self.random_state).choice(
                 n_samples, size=max_svm_samples, replace=False
             )
-            svm_subset = X[idx]
+            svm_subset = None
+            if include_svm:
+                base_view = _view(self.projection_model_ is not None)
+                svm_subset = base_view[idx]
         else:
-            svm_subset = X
+            svm_subset = None
+            if include_svm:
+                svm_subset = _view(self.projection_model_ is not None)
 
         for info in estimators:
             estimator = info.estimator
-            if isinstance(estimator, OneClassSVM) and svm_subset is not X:
+            train_view = _view(info.use_projected)
+            if isinstance(estimator, OneClassSVM) and svm_subset is not None:
                 estimator.fit(svm_subset)
             else:
-                estimator.fit(X)
+                estimator.fit(train_view)
 
+            infer_view = train_view
             if hasattr(estimator, "decision_function"):
-                dec = estimator.decision_function(X)
+                dec = estimator.decision_function(infer_view)
             elif hasattr(estimator, "score_samples"):
-                dec = estimator.score_samples(X)
+                dec = estimator.score_samples(infer_view)
             else:
                 # 退化情况：仅返回 predict 结果
-                dec = estimator.predict(X)
+                dec = estimator.predict(infer_view)
 
             normalized = _normalize_scores(dec)
             decision_stack.append(normalized)
@@ -201,7 +231,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
             self.fit_raw_scores_[info.name] = raw_scores
             if hasattr(estimator, "predict"):
                 try:
-                    pred = estimator.predict(X)
+                    pred = estimator.predict(infer_view)
                 except Exception:
                     pred = np.where(raw_scores <= 0, -1, 1)
             else:
@@ -288,21 +318,29 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                     thr_candidates = np.linspace(0.1, 0.9, 41)
                     best_thr = 0.5
                     best_f1 = -1.0
+                    best_f05 = -1.0
                     best_metrics = None
                     for thr in thr_candidates:
                         preds = (proba >= thr).astype(int)
+                        precision = precision_score(
+                            y_binary, preds, zero_division=0
+                        )
+                        recall = recall_score(y_binary, preds, zero_division=0)
                         f1 = f1_score(y_binary, preds, zero_division=0)
-                        if f1 > best_f1:
-                            precision = precision_score(
-                                y_binary, preds, zero_division=0
-                            )
-                            recall = recall_score(y_binary, preds, zero_division=0)
+                        f05 = fbeta_score(
+                            y_binary, preds, beta=0.5, zero_division=0
+                        )
+                        if (f05 > best_f05 + 1e-12) or (
+                            abs(f05 - best_f05) <= 1e-12 and f1 > best_f1
+                        ):
                             best_f1 = f1
+                            best_f05 = f05
                             best_thr = thr
                             best_metrics = {
                                 "precision": float(precision),
                                 "recall": float(recall),
                                 "f1": float(f1),
+                                "f0.5": float(f05),
                             }
                     self.calibration_threshold_ = float(best_thr)
                     self.calibration_report_ = best_metrics
@@ -323,6 +361,13 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         scores, vote_ratio = self._compute_decision_details(X)
         if self.threshold_ is None:
             raise RuntimeError("模型尚未拟合")
+        threshold = float(self.threshold_)
+        vote_threshold = float(
+            self.vote_threshold_ if self.vote_threshold_ is not None else np.clip(np.mean(vote_ratio), 0.1, 1.0)
+        )
+        base_anomalies = (scores <= threshold) & (vote_ratio >= vote_threshold)
+        anomalies = base_anomalies.copy()
+
         if (
             self.supervised_model_ is not None
             and self.last_supervised_scores_ is not None
@@ -332,20 +377,28 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                 if self.supervised_threshold_ is not None
                 else 0.5
             )
-            anomalies = self.last_supervised_scores_ >= cal_threshold
+            sup_scores = self.last_supervised_scores_.astype(float)
+            margin = max(0.05, min(0.2, 0.5 * (1.0 - cal_threshold)))
+            strong_sup = sup_scores >= (cal_threshold + margin)
+            consensus = base_anomalies & (sup_scores >= cal_threshold)
+            anomalies = consensus | strong_sup
+            if not np.any(anomalies):
+                anomalies = base_anomalies
         elif self.calibrator_ is not None and self.last_calibrated_scores_ is not None:
             cal_threshold = (
                 float(self.calibration_threshold_)
                 if self.calibration_threshold_ is not None
                 else 0.5
             )
-            anomalies = self.last_calibrated_scores_ >= cal_threshold
+            cal_scores = self.last_calibrated_scores_.astype(float)
+            margin = max(0.05, min(0.2, 0.5 * (1.0 - cal_threshold)))
+            strong_cal = cal_scores >= (cal_threshold + margin)
+            consensus = base_anomalies & (cal_scores >= cal_threshold)
+            anomalies = consensus | strong_cal
+            if not np.any(anomalies):
+                anomalies = base_anomalies
         else:
-            threshold = float(self.threshold_)
-            vote_threshold = float(
-                self.vote_threshold_ if self.vote_threshold_ is not None else 0.5
-            )
-            anomalies = (scores <= threshold) & (vote_ratio >= vote_threshold)
+            anomalies = base_anomalies
         if not np.any(anomalies) and len(scores):
             top_k = max(1, int(np.ceil(self.contamination * len(scores))))
             idx = np.argsort(scores)[:top_k]
@@ -363,18 +416,20 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
             raise ValueError("X 必须为二维数组")
 
         raw_input = X
+        projected = self._transform_projected(X)
 
         decision_stack = []
         vote_stack = []
         weights = []
         for name, info in self.detectors_.items():
             estimator = info.estimator
+            view = projected if info.use_projected else X
             if hasattr(estimator, "decision_function"):
-                dec = estimator.decision_function(X)
+                dec = estimator.decision_function(view)
             elif hasattr(estimator, "score_samples"):
-                dec = estimator.score_samples(X)
+                dec = estimator.score_samples(view)
             else:
-                dec = estimator.predict(X)
+                dec = estimator.predict(view)
             if name in self.fit_raw_scores_:
                 ref = _normalize_scores(self.fit_raw_scores_[name])
                 ref_mean = float(np.mean(ref))
@@ -388,7 +443,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
             weights.append(float(info.weight))
             if hasattr(estimator, "predict"):
                 try:
-                    pred = estimator.predict(X)
+                    pred = estimator.predict(view)
                 except Exception:
                     pred = np.where(arr <= 0, -1, 1)
             else:
@@ -463,6 +518,18 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                 features = np.hstack([features, arr[:, :use_dim]])
 
         return features
+
+    def _transform_projected(self, X: np.ndarray) -> np.ndarray:
+        if self.projection_model_ is None:
+            return X
+        try:
+            transformed = self.projection_model_.transform(X)
+        except Exception:
+            if self.projected_dim_ is not None and self.projected_dim_ <= X.shape[1]:
+                transformed = X[:, : self.projected_dim_]
+            else:
+                transformed = X
+        return transformed
 
 
 __all__ = ["EnsembleAnomalyDetector"]

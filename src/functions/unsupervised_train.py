@@ -14,7 +14,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.kernel_approximation import RBFSampler
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, f1_score, fbeta_score, precision_score, recall_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import QuantileTransformer, StandardScaler
 from joblib import dump
@@ -135,6 +135,26 @@ ANOMALY_TOKENS = {
 }
 
 
+def _build_token_variants(tokens: set[str]) -> set[str]:
+    variants: set[str] = set()
+    strip_chars = "。.,，!！?？；;:"
+    for token in tokens:
+        if not token:
+            continue
+        base = token.strip().lower()
+        collapsed = base.replace(" ", "")
+        trimmed = base.strip(strip_chars)
+        collapsed_trimmed = collapsed.strip(strip_chars)
+        for item in (base, collapsed, trimmed, collapsed_trimmed):
+            if item:
+                variants.add(item)
+    return variants
+
+
+NORMAL_TOKEN_VARIANTS = _build_token_variants(NORMAL_TOKENS)
+ANOMALY_TOKEN_VARIANTS = _build_token_variants(ANOMALY_TOKENS)
+
+
 def _is_npz(path: str) -> bool:
     return path.lower().endswith(".npz")
 
@@ -190,6 +210,8 @@ def _series_to_binary(series: pd.Series) -> Optional[np.ndarray]:
         .astype(str)
         .str.strip()
         .str.lower()
+        .str.replace(r"[\t\n\r\u3000]+", " ", regex=True)
+        .str.replace(r"\s+", " ", regex=True)
     )
 
     if normalized.eq("unknown").all():
@@ -198,9 +220,15 @@ def _series_to_binary(series: pd.Series) -> Optional[np.ndarray]:
     parsed = np.full(len(normalized), fill_value=-1, dtype=int)
 
     for idx, value in enumerate(normalized):
-        if value in NORMAL_TOKENS:
+        candidates = {
+            value,
+            value.replace(" ", ""),
+            value.strip("。.,，!！?？；;:"),
+            value.replace(" ", "").strip("。.,，!！?？；;:"),
+        }
+        if any(candidate in NORMAL_TOKEN_VARIANTS for candidate in candidates if candidate):
             parsed[idx] = 0
-        elif value in ANOMALY_TOKENS:
+        elif any(candidate in ANOMALY_TOKEN_VARIANTS for candidate in candidates if candidate):
             parsed[idx] = 1
         else:
             try:
@@ -440,9 +468,17 @@ def _train_from_dataframe(
         working_df, feature_columns_hint=feature_columns_hint
     )
 
+    adaptive_contamination = float(contamination)
+    if ground_truth is not None:
+        anomaly_ratio = float(np.mean(ground_truth))
+        if anomaly_ratio > 0.0:
+            adaptive_contamination = float(
+                np.clip(anomaly_ratio * 1.2 + 1e-3, 0.001, 0.4)
+            )
+
     adaptive_neighbors = int(max(15, min(120, np.sqrt(len(working_df)) * 2)))
     detector = EnsembleAnomalyDetector(
-        contamination=contamination,
+        contamination=adaptive_contamination,
         n_estimators=max(256, base_estimators * 4),
         n_neighbors=adaptive_neighbors,
         random_state=42,
@@ -514,16 +550,23 @@ def _train_from_dataframe(
         thr_candidates = np.linspace(0.1, 0.9, 41)
         best_thr = 0.5
         best_f1 = -1.0
+        best_f05 = -1.0
         best_prec = 0.0
         best_rec = 0.0
         for thr in thr_candidates:
             preds = (supervised_proba >= thr).astype(int)
+            precision = precision_score(ground_truth, preds, zero_division=0)
+            recall = recall_score(ground_truth, preds, zero_division=0)
             f1 = f1_score(ground_truth, preds, zero_division=0)
-            if f1 > best_f1:
+            f05 = fbeta_score(ground_truth, preds, beta=0.5, zero_division=0)
+            if (f05 > best_f05 + 1e-12) or (
+                abs(f05 - best_f05) <= 1e-12 and f1 > best_f1
+            ):
                 best_f1 = f1
+                best_f05 = f05
                 best_thr = thr
-                best_prec = precision_score(ground_truth, preds, zero_division=0)
-                best_rec = recall_score(ground_truth, preds, zero_division=0)
+                best_prec = precision
+                best_rec = recall
         detector.supervised_model_ = supervised_model
         detector.supervised_threshold_ = float(best_thr)
         detector.supervised_input_dim_ = reduced.shape[1]
@@ -533,6 +576,7 @@ def _train_from_dataframe(
             "precision": float(best_prec),
             "recall": float(best_rec),
             "f1": float(best_f1),
+            "f0.5": float(best_f05),
             "threshold": float(best_thr),
         }
 
@@ -566,7 +610,8 @@ def _train_from_dataframe(
         vote_ratio = np.ones_like(is_malicious, dtype=float)
     vote_ratio = np.asarray(vote_ratio, dtype=float)
 
-    threshold = detector.threshold_ if detector.threshold_ is not None else float(np.quantile(scores, contamination))
+    effective_contamination = float(detector.contamination)
+    threshold = detector.threshold_ if detector.threshold_ is not None else float(np.quantile(scores, effective_contamination))
     vote_threshold = detector.vote_threshold_ if detector.vote_threshold_ is not None else float(np.mean(vote_ratio))
     vote_threshold = float(np.clip(vote_threshold, 0.0, 1.0))
 
@@ -574,10 +619,21 @@ def _train_from_dataframe(
     conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
     vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
     anomaly_confidence = np.clip((conf_from_score + vote_component) / 2.0, 0.0, 1.0)
+    base_confidence = anomaly_confidence.copy()
     if detector.last_supervised_scores_ is not None:
-        anomaly_confidence = detector.last_supervised_scores_.astype(float)
+        supervised_scores = detector.last_supervised_scores_.astype(float)
+        anomaly_confidence = np.clip(
+            0.5 * base_confidence + 0.5 * supervised_scores,
+            0.0,
+            1.0,
+        )
     elif detector.last_calibrated_scores_ is not None:
-        anomaly_confidence = detector.last_calibrated_scores_.astype(float)
+        calibrated_scores = detector.last_calibrated_scores_.astype(float)
+        anomaly_confidence = np.clip(
+            0.6 * base_confidence + 0.4 * calibrated_scores,
+            0.0,
+            1.0,
+        )
 
     working_df["anomaly_score"] = scores
     working_df["vote_ratio"] = vote_ratio
@@ -637,7 +693,8 @@ def _train_from_dataframe(
 
     metadata = {
         "timestamp": timestamp,
-        "contamination": contamination,
+        "contamination": effective_contamination,
+        "requested_contamination": float(contamination),
         "base_estimators": base_estimators,
         "feature_columns": feature_columns,
         "expanded_dim": int(expanded_dim) if expanded_dim is not None else None,
@@ -654,6 +711,7 @@ def _train_from_dataframe(
         "results_csv": results_csv,
         "summary_csv": summary_csv,
         "gaussianizer_path": gaussianizer_path,
+        "projection_dim": int(detector.projected_dim_) if detector.projected_dim_ is not None else None,
     }
 
     if detector.calibration_report_ is not None:
@@ -702,7 +760,8 @@ def _train_from_dataframe(
         "packets": len(working_df),
         "flows": len(working_df),
         "malicious": int(is_malicious.sum()),
-        "contamination": contamination,
+        "contamination": effective_contamination,
+        "requested_contamination": float(contamination),
         "threshold": float(threshold),
         "vote_threshold": float(vote_threshold),
         "estimated_precision": metadata["estimated_precision"],
@@ -713,6 +772,7 @@ def _train_from_dataframe(
         "ground_truth_column": ground_truth_column,
         "evaluation": metadata.get("evaluation"),
         "supervised": supervised_metrics,
+        "projection_dim": metadata.get("projection_dim"),
     }
 
 
