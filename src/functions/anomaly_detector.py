@@ -11,7 +11,7 @@ import numpy as np
 from sklearn.base import BaseEstimator, OutlierMixin
 from sklearn.ensemble import IsolationForest
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.metrics import f1_score, fbeta_score, precision_score, recall_score
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.svm import OneClassSVM
 from sklearn.decomposition import TruncatedSVD
@@ -318,21 +318,29 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                     thr_candidates = np.linspace(0.1, 0.9, 41)
                     best_thr = 0.5
                     best_f1 = -1.0
+                    best_f05 = -1.0
                     best_metrics = None
                     for thr in thr_candidates:
                         preds = (proba >= thr).astype(int)
+                        precision = precision_score(
+                            y_binary, preds, zero_division=0
+                        )
+                        recall = recall_score(y_binary, preds, zero_division=0)
                         f1 = f1_score(y_binary, preds, zero_division=0)
-                        if f1 > best_f1:
-                            precision = precision_score(
-                                y_binary, preds, zero_division=0
-                            )
-                            recall = recall_score(y_binary, preds, zero_division=0)
+                        f05 = fbeta_score(
+                            y_binary, preds, beta=0.5, zero_division=0
+                        )
+                        if (f05 > best_f05 + 1e-12) or (
+                            abs(f05 - best_f05) <= 1e-12 and f1 > best_f1
+                        ):
                             best_f1 = f1
+                            best_f05 = f05
                             best_thr = thr
                             best_metrics = {
                                 "precision": float(precision),
                                 "recall": float(recall),
                                 "f1": float(f1),
+                                "f0.5": float(f05),
                             }
                     self.calibration_threshold_ = float(best_thr)
                     self.calibration_report_ = best_metrics
@@ -357,6 +365,9 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         vote_threshold = float(
             self.vote_threshold_ if self.vote_threshold_ is not None else np.clip(np.mean(vote_ratio), 0.1, 1.0)
         )
+        base_anomalies = (scores <= threshold) & (vote_ratio >= vote_threshold)
+        anomalies = base_anomalies.copy()
+
         if (
             self.supervised_model_ is not None
             and self.last_supervised_scores_ is not None
@@ -366,16 +377,28 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                 if self.supervised_threshold_ is not None
                 else 0.5
             )
-            anomalies = self.last_supervised_scores_ >= cal_threshold
+            sup_scores = self.last_supervised_scores_.astype(float)
+            margin = max(0.05, min(0.2, 0.5 * (1.0 - cal_threshold)))
+            strong_sup = sup_scores >= (cal_threshold + margin)
+            consensus = base_anomalies & (sup_scores >= cal_threshold)
+            anomalies = consensus | strong_sup
+            if not np.any(anomalies):
+                anomalies = base_anomalies
         elif self.calibrator_ is not None and self.last_calibrated_scores_ is not None:
             cal_threshold = (
                 float(self.calibration_threshold_)
                 if self.calibration_threshold_ is not None
                 else 0.5
             )
-            anomalies = self.last_calibrated_scores_ >= cal_threshold
+            cal_scores = self.last_calibrated_scores_.astype(float)
+            margin = max(0.05, min(0.2, 0.5 * (1.0 - cal_threshold)))
+            strong_cal = cal_scores >= (cal_threshold + margin)
+            consensus = base_anomalies & (cal_scores >= cal_threshold)
+            anomalies = consensus | strong_cal
+            if not np.any(anomalies):
+                anomalies = base_anomalies
         else:
-            anomalies = (scores <= threshold) & (vote_ratio >= vote_threshold)
+            anomalies = base_anomalies
         if not np.any(anomalies) and len(scores):
             top_k = max(1, int(np.ceil(self.contamination * len(scores))))
             idx = np.argsort(scores)[:top_k]

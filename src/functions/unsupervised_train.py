@@ -14,7 +14,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.kernel_approximation import RBFSampler
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import accuracy_score, f1_score, fbeta_score, precision_score, recall_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import QuantileTransformer, StandardScaler
 from joblib import dump
@@ -550,16 +550,23 @@ def _train_from_dataframe(
         thr_candidates = np.linspace(0.1, 0.9, 41)
         best_thr = 0.5
         best_f1 = -1.0
+        best_f05 = -1.0
         best_prec = 0.0
         best_rec = 0.0
         for thr in thr_candidates:
             preds = (supervised_proba >= thr).astype(int)
+            precision = precision_score(ground_truth, preds, zero_division=0)
+            recall = recall_score(ground_truth, preds, zero_division=0)
             f1 = f1_score(ground_truth, preds, zero_division=0)
-            if f1 > best_f1:
+            f05 = fbeta_score(ground_truth, preds, beta=0.5, zero_division=0)
+            if (f05 > best_f05 + 1e-12) or (
+                abs(f05 - best_f05) <= 1e-12 and f1 > best_f1
+            ):
                 best_f1 = f1
+                best_f05 = f05
                 best_thr = thr
-                best_prec = precision_score(ground_truth, preds, zero_division=0)
-                best_rec = recall_score(ground_truth, preds, zero_division=0)
+                best_prec = precision
+                best_rec = recall
         detector.supervised_model_ = supervised_model
         detector.supervised_threshold_ = float(best_thr)
         detector.supervised_input_dim_ = reduced.shape[1]
@@ -569,6 +576,7 @@ def _train_from_dataframe(
             "precision": float(best_prec),
             "recall": float(best_rec),
             "f1": float(best_f1),
+            "f0.5": float(best_f05),
             "threshold": float(best_thr),
         }
 
