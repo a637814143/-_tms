@@ -10,8 +10,11 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.feature_selection import VarianceThreshold
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import QuantileTransformer, StandardScaler
 from joblib import dump
 
 from src.functions.feature_extractor import extract_features, extract_features_dir
@@ -27,6 +30,53 @@ META_COLUMNS = {
     "protocol",
     "__source_file__",
     "__source_path__",
+}
+
+GROUND_TRUTH_COLUMN_CANDIDATES = (
+    "label",
+    "labels",
+    "ground_truth",
+    "attack",
+    "attacks",
+    "is_attack",
+    "is_malicious",
+    "malicious",
+    "malware",
+    "anomaly",
+)
+
+NORMAL_TOKENS = {
+    "normal",
+    "normal.",
+    "benign",
+    "benign.",
+    "good",
+    "legit",
+    "legitimate",
+    "clean",
+    "0",
+    "false",
+    "no",
+}
+
+ANOMALY_TOKENS = {
+    "attack",
+    "attack.",
+    "attacks",
+    "intrusion",
+    "intrusion.",
+    "anomaly",
+    "anomaly.",
+    "malicious",
+    "malicious.",
+    "malware",
+    "botnet",
+    "spam",
+    "ddos",
+    "dos",
+    "1",
+    "true",
+    "yes",
 }
 
 
@@ -54,6 +104,66 @@ def _is_preprocessed_csv(path: str) -> bool:
         return False
     base, _ = os.path.splitext(path)
     return os.path.exists(f"{base}_meta.json")
+
+
+def _series_to_binary(series: pd.Series) -> Optional[np.ndarray]:
+    if series.empty:
+        return None
+
+    if series.dtype == bool:
+        return series.fillna(False).astype(int).to_numpy()
+
+    try:
+        numeric = pd.to_numeric(series, errors="coerce")
+    except Exception:
+        numeric = None
+
+    if numeric is not None and not numeric.isna().all():
+        arr = numeric.fillna(0.0).to_numpy()
+        binary = np.where(arr > 0, 1, 0).astype(int)
+        if np.unique(binary).size >= 2:
+            return binary
+
+    normalized = (
+        series.fillna("unknown")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+    )
+    if normalized.eq("unknown").all():
+        return None
+
+    result = []
+    for value in normalized:
+        if value in NORMAL_TOKENS:
+            result.append(0)
+        elif value in ANOMALY_TOKENS:
+            result.append(1)
+        else:
+            parsed = None
+            try:
+                parsed = float(value)
+            except Exception:
+                parsed = None
+            if parsed is not None:
+                result.append(1 if parsed > 0 else 0)
+            else:
+                result.append(1)
+
+    binary = np.asarray(result, dtype=int)
+    if np.unique(binary).size < 2:
+        return None
+    return binary
+
+
+def _extract_ground_truth(df: pd.DataFrame) -> Tuple[Optional[str], Optional[np.ndarray]]:
+    for column in df.columns:
+        if column.lower() in GROUND_TRUTH_COLUMN_CANDIDATES:
+            series = df[column]
+            binary = _series_to_binary(series)
+            if binary is not None and binary.size == len(df):
+                return column, binary
+    return None, None
 
 
 def _latest_preprocessed_csv(directory: str) -> Optional[str]:
@@ -120,19 +230,42 @@ def _load_feature_frames(paths: List[str], workers: int) -> List[pd.DataFrame]:
     return [df for _, df in frames]
 
 
-def _prepare_feature_matrix(df: pd.DataFrame) -> Tuple[np.ndarray, List[str]]:
-    numeric_cols: List[str] = []
-    for col in df.columns:
-        if col in META_COLUMNS:
-            continue
-        if is_numeric_dtype(df[col]):
-            numeric_cols.append(col)
+def _prepare_feature_matrix(
+    df: pd.DataFrame, feature_columns_hint: Optional[List[str]] = None
+) -> Tuple[np.ndarray, List[str]]:
+    """提取用于训练的特征矩阵。
 
-    if not numeric_cols:
+    如果提供了 ``feature_columns_hint``，则严格按照提示顺序筛选列，
+    这可以确保预处理阶段与训练阶段使用完全一致的特征集合。
+    若部分列缺失，会抛出异常提示用户重新执行预处理流程。
+    """
+
+    candidate_cols: List[str] = []
+    if feature_columns_hint:
+        missing = [col for col in feature_columns_hint if col not in df.columns]
+        if missing:
+            raise RuntimeError(
+                "训练数据缺少以下预期特征列，请重新检查预处理输出: "
+                + ", ".join(missing)
+            )
+        candidate_cols = list(feature_columns_hint)
+    else:
+        for col in df.columns:
+            if col in META_COLUMNS:
+                continue
+            if is_numeric_dtype(df[col]):
+                candidate_cols.append(col)
+
+    if not candidate_cols:
         raise RuntimeError("未发现可用于训练的数值特征。")
 
-    matrix = df[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    return matrix.to_numpy(dtype=float, copy=False), numeric_cols
+    numeric_df = df[candidate_cols].apply(pd.to_numeric, errors="coerce")
+    # 以列中位数进行填充，进一步提升鲁棒性
+    medians = numeric_df.median(axis=0, skipna=True)
+    medians = medians.fillna(0.0)
+    filled = numeric_df.fillna(medians).astype("float32")
+
+    return filled.to_numpy(dtype=float, copy=False), candidate_cols
 
 
 def _train_from_dataframe(
@@ -144,32 +277,92 @@ def _train_from_dataframe(
     base_estimators: int,
     progress_cb=None,
     group_column: Optional[str] = None,
+    feature_columns_hint: Optional[List[str]] = None,
 ) -> dict:
     if df.empty:
         raise RuntimeError("训练数据为空。")
 
     working_df = df.copy()
-    X, feature_columns = _prepare_feature_matrix(working_df)
+    ground_truth_column, ground_truth = _extract_ground_truth(working_df)
+    X, feature_columns = _prepare_feature_matrix(
+        working_df, feature_columns_hint=feature_columns_hint
+    )
+
+    adaptive_neighbors = int(max(15, min(120, np.sqrt(len(working_df)) * 2)))
+    detector = EnsembleAnomalyDetector(
+        contamination=contamination,
+        n_estimators=max(256, base_estimators * 4),
+        n_neighbors=adaptive_neighbors,
+        random_state=42,
+    )
 
     pipeline = Pipeline(
         [
+            ("variance_filter", VarianceThreshold(threshold=1e-6)),
             ("scaler", StandardScaler()),
             (
-                "detector",
-                EnsembleAnomalyDetector(
-                    contamination=contamination,
-                    n_estimators=max(128, base_estimators),
+                "gaussianizer",
+                QuantileTransformer(
+                    output_distribution="normal",
+                    subsample=200000,
                     random_state=42,
                 ),
             ),
+            ("detector", detector),
         ]
     )
 
     if progress_cb:
         progress_cb(70)
 
-    pipeline.fit(X)
-    detector: EnsembleAnomalyDetector = pipeline.named_steps["detector"]
+    if ground_truth is not None:
+        pipeline.fit(X, ground_truth)
+    else:
+        pipeline.fit(X)
+    try:
+        pipeline.feature_names_in_ = np.asarray(feature_columns)
+    except Exception:
+        pass
+    detector = pipeline.named_steps["detector"]
+
+    supervised_metrics = None
+    if ground_truth is not None:
+        transformer = Pipeline(pipeline.steps[:-1])
+        transformed = transformer.transform(X)
+        if transformed.ndim == 1:
+            transformed = transformed.reshape(-1, 1)
+        supervised_model = HistGradientBoostingClassifier(
+            max_depth=7,
+            learning_rate=0.1,
+            max_iter=400,
+            l2_regularization=1.0,
+            random_state=42,
+        )
+        supervised_model.fit(transformed, ground_truth)
+        supervised_proba = supervised_model.predict_proba(transformed)[:, 1]
+        thr_candidates = np.linspace(0.1, 0.9, 41)
+        best_thr = 0.5
+        best_f1 = -1.0
+        best_prec = 0.0
+        best_rec = 0.0
+        for thr in thr_candidates:
+            preds = (supervised_proba >= thr).astype(int)
+            f1 = f1_score(ground_truth, preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thr = thr
+                best_prec = precision_score(ground_truth, preds, zero_division=0)
+                best_rec = recall_score(ground_truth, preds, zero_division=0)
+        detector.supervised_model_ = supervised_model
+        detector.supervised_threshold_ = float(best_thr)
+        detector.supervised_input_dim_ = transformed.shape[1]
+        detector.last_supervised_scores_ = supervised_proba.astype(float)
+        supervised_metrics = {
+            "precision": float(best_prec),
+            "recall": float(best_rec),
+            "f1": float(best_f1),
+            "threshold": float(best_thr),
+        }
 
     scores = None
     if detector.last_combined_scores_ is not None:
@@ -200,6 +393,10 @@ def _train_from_dataframe(
     conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
     vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
     anomaly_confidence = np.clip((conf_from_score + vote_component) / 2.0, 0.0, 1.0)
+    if detector.last_supervised_scores_ is not None:
+        anomaly_confidence = detector.last_supervised_scores_.astype(float)
+    elif detector.last_calibrated_scores_ is not None:
+        anomaly_confidence = detector.last_calibrated_scores_.astype(float)
 
     working_df["anomaly_score"] = scores
     working_df["vote_ratio"] = vote_ratio
@@ -248,6 +445,8 @@ def _train_from_dataframe(
 
     scaler_path = os.path.join(models_dir, "scaler.joblib")
     dump(pipeline.named_steps["scaler"], scaler_path)
+    gaussianizer_path = os.path.join(models_dir, "gaussianizer.joblib")
+    dump(pipeline.named_steps["gaussianizer"], gaussianizer_path)
     model_path = os.path.join(models_dir, "isoforest.joblib")
     base_iforest = detector.detectors_.get("iforest")
     if base_iforest:
@@ -262,6 +461,8 @@ def _train_from_dataframe(
         "feature_columns": feature_columns,
         "threshold": float(threshold),
         "score_std": float(score_std),
+        "score_min": float(np.min(scores)),
+        "score_max": float(np.max(scores)),
         "vote_mean": float(np.mean(vote_ratio)),
         "vote_threshold": float(vote_threshold),
         "threshold_breakdown": detector.threshold_breakdown_,
@@ -270,7 +471,31 @@ def _train_from_dataframe(
         "estimated_anomaly_ratio": float(is_malicious.mean()),
         "results_csv": results_csv,
         "summary_csv": summary_csv,
+        "gaussianizer_path": gaussianizer_path,
     }
+
+    if detector.calibration_report_ is not None:
+        metadata["calibration"] = detector.calibration_report_
+        metadata["calibration_threshold"] = float(
+            detector.calibration_threshold_ if detector.calibration_threshold_ is not None else 0.5
+        )
+
+    if supervised_metrics is not None:
+        metadata["supervised"] = supervised_metrics
+
+    if ground_truth is not None:
+        precision = precision_score(ground_truth, is_malicious, zero_division=0)
+        recall = recall_score(ground_truth, is_malicious, zero_division=0)
+        f1 = f1_score(ground_truth, is_malicious, zero_division=0)
+        acc = accuracy_score(ground_truth, is_malicious)
+        metadata["ground_truth_column"] = ground_truth_column
+        metadata["ground_truth_ratio"] = float(np.mean(ground_truth))
+        metadata["evaluation"] = {
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "accuracy": float(acc),
+        }
 
     metadata_path = os.path.join(models_dir, f"iforest_metadata_{timestamp}.json")
     with open(metadata_path, "w", encoding="utf-8") as fh:
@@ -296,11 +521,15 @@ def _train_from_dataframe(
         "flows": len(working_df),
         "malicious": int(is_malicious.sum()),
         "contamination": contamination,
-        "feature_columns": feature_columns,
         "threshold": float(threshold),
         "vote_threshold": float(vote_threshold),
         "estimated_precision": metadata["estimated_precision"],
         "threshold_breakdown": detector.threshold_breakdown_,
+        "feature_columns": feature_columns,
+        "gaussianizer_path": gaussianizer_path,
+        "ground_truth_column": ground_truth_column,
+        "evaluation": metadata.get("evaluation"),
+        "supervised": supervised_metrics,
     }
 
 
@@ -322,6 +551,20 @@ def _train_from_preprocessed_csv(
 
     manifest_path = _manifest_path_for(dataset_path)
     manifest_col = None
+    feature_columns_hint: Optional[List[str]] = None
+
+    meta_path = dataset_path.replace(".csv", "_meta.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta_payload = json.load(fh)
+            if isinstance(meta_payload, dict):
+                cols = meta_payload.get("feature_columns")
+                if isinstance(cols, list):
+                    feature_columns_hint = [str(col) for col in cols]
+        except Exception as exc:
+            print(f"[WARN] 读取元数据失败 {meta_path}: {exc}")
+
     if os.path.exists(manifest_path):
         try:
             manifest_df = pd.read_csv(manifest_path, encoding="utf-8")
@@ -352,6 +595,7 @@ def _train_from_preprocessed_csv(
         base_estimators=base_estimators,
         progress_cb=progress_cb,
         group_column=manifest_col,
+        feature_columns_hint=feature_columns_hint,
     )
 
 
@@ -394,6 +638,7 @@ def _train_from_npz(
         base_estimators=base_estimators,
         progress_cb=progress_cb,
         group_column=manifest_col,
+        feature_columns_hint=list(columns),
     )
 
 

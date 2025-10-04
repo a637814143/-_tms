@@ -10,6 +10,8 @@ from typing import Dict, Iterable, Optional, Tuple
 import numpy as np
 from sklearn.base import BaseEstimator, OutlierMixin
 from sklearn.ensemble import IsolationForest
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.neighbors import LocalOutlierFactor
 from sklearn.svm import OneClassSVM
 
@@ -80,6 +82,16 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.fit_votes_: Dict[str, np.ndarray] = {}
         self.last_combined_scores_: Optional[np.ndarray] = None
         self.last_vote_ratio_: Optional[np.ndarray] = None
+        self.last_normalized_stack_: Optional[np.ndarray] = None
+        self.last_calibrated_scores_: Optional[np.ndarray] = None
+        self.calibrator_: Optional[LogisticRegression] = None
+        self.calibration_threshold_: Optional[float] = None
+        self.calibration_report_: Optional[Dict[str, float]] = None
+        self.calibration_input_dim_: Optional[int] = None
+        self.supervised_model_: Optional[BaseEstimator] = None
+        self.supervised_threshold_: Optional[float] = None
+        self.supervised_input_dim_: Optional[int] = None
+        self.last_supervised_scores_: Optional[np.ndarray] = None
         self.threshold_breakdown_: Optional[Dict[str, float]] = None
 
     # sklearn API -----------------------------------------------------
@@ -97,6 +109,16 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.fit_votes_.clear()
         self.last_combined_scores_ = None
         self.last_vote_ratio_ = None
+        self.last_normalized_stack_ = None
+        self.last_calibrated_scores_ = None
+        self.calibrator_ = None
+        self.calibration_threshold_ = None
+        self.calibration_report_ = None
+        self.calibration_input_dim_ = None
+        self.supervised_model_ = None
+        self.supervised_threshold_ = None
+        self.supervised_input_dim_ = None
+        self.last_supervised_scores_ = None
 
         estimators: Iterable[DetectorInfo] = [
             DetectorInfo(
@@ -177,7 +199,12 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
             self.fit_votes_[info.name] = np.asarray(pred, dtype=int)
             self.detectors_[info.name] = info
 
+        raw_input = np.asarray(X, dtype=float)
+        if raw_input.ndim == 1:
+            raw_input = raw_input.reshape(-1, 1)
+
         stacked = np.vstack(decision_stack)
+        self.last_normalized_stack_ = stacked.astype(float)
         weights = np.asarray(weight_stack, dtype=float)
         weights = weights / weights.sum()
         combined = np.average(stacked, axis=0, weights=weights)
@@ -225,6 +252,49 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         else:
             self.vote_threshold_ = float(np.clip(np.mean(vote_ratio) if vote_ratio.size else 0.5, 0.1, 1.0))
 
+        if y is not None:
+            y_arr = np.asarray(y).ravel()
+            if y_arr.size == n_samples:
+                try:
+                    y_binary = np.asarray(y_arr, dtype=float)
+                    if not np.all(np.isfinite(y_binary)):
+                        raise ValueError
+                    # 将非零视为异常
+                    y_binary = np.where(y_binary > 0, 1, 0).astype(int)
+                except Exception:
+                    y_binary = np.where(np.asarray(y_arr, dtype=object).astype(str) != "0", 1, 0)
+
+                if np.unique(y_binary).size >= 2:
+                    features = self._build_calibration_features(
+                        combined, vote_ratio, stacked, raw_input
+                    )
+                    self.calibrator_ = LogisticRegression(
+                        max_iter=1000, class_weight="balanced", solver="lbfgs"
+                    )
+                    self.calibrator_.fit(features, y_binary)
+                    proba = self.calibrator_.predict_proba(features)[:, 1]
+                    thr_candidates = np.linspace(0.1, 0.9, 41)
+                    best_thr = 0.5
+                    best_f1 = -1.0
+                    best_metrics = None
+                    for thr in thr_candidates:
+                        preds = (proba >= thr).astype(int)
+                        f1 = f1_score(y_binary, preds, zero_division=0)
+                        if f1 > best_f1:
+                            precision = precision_score(
+                                y_binary, preds, zero_division=0
+                            )
+                            recall = recall_score(y_binary, preds, zero_division=0)
+                            best_f1 = f1
+                            best_thr = thr
+                            best_metrics = {
+                                "precision": float(precision),
+                                "recall": float(recall),
+                                "f1": float(f1),
+                            }
+                    self.calibration_threshold_ = float(best_thr)
+                    self.calibration_report_ = best_metrics
+                    self.last_calibrated_scores_ = proba.astype(float)
         return self
 
     def decision_function(self, X: np.ndarray) -> np.ndarray:
@@ -241,9 +311,29 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         scores, vote_ratio = self._compute_decision_details(X)
         if self.threshold_ is None:
             raise RuntimeError("模型尚未拟合")
-        threshold = float(self.threshold_)
-        vote_threshold = float(self.vote_threshold_ if self.vote_threshold_ is not None else 0.5)
-        anomalies = (scores <= threshold) & (vote_ratio >= vote_threshold)
+        if (
+            self.supervised_model_ is not None
+            and self.last_supervised_scores_ is not None
+        ):
+            cal_threshold = (
+                float(self.supervised_threshold_)
+                if self.supervised_threshold_ is not None
+                else 0.5
+            )
+            anomalies = self.last_supervised_scores_ >= cal_threshold
+        elif self.calibrator_ is not None and self.last_calibrated_scores_ is not None:
+            cal_threshold = (
+                float(self.calibration_threshold_)
+                if self.calibration_threshold_ is not None
+                else 0.5
+            )
+            anomalies = self.last_calibrated_scores_ >= cal_threshold
+        else:
+            threshold = float(self.threshold_)
+            vote_threshold = float(
+                self.vote_threshold_ if self.vote_threshold_ is not None else 0.5
+            )
+            anomalies = (scores <= threshold) & (vote_ratio >= vote_threshold)
         if not np.any(anomalies) and len(scores):
             top_k = max(1, int(np.ceil(self.contamination * len(scores))))
             idx = np.argsort(scores)[:top_k]
@@ -259,6 +349,8 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         X = np.asarray(X, dtype=float)
         if X.ndim != 2:
             raise ValueError("X 必须为二维数组")
+
+        raw_input = X
 
         decision_stack = []
         vote_stack = []
@@ -292,6 +384,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
             vote_stack.append(np.where(np.asarray(pred, dtype=int) == -1, 1.0, 0.0))
 
         stacked = np.vstack(decision_stack)
+        self.last_normalized_stack_ = stacked.astype(float)
         weights_arr = np.asarray(weights, dtype=float)
         weights_arr = weights_arr / weights_arr.sum()
         combined = np.average(stacked, axis=0, weights=weights_arr)
@@ -303,8 +396,58 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
 
         self.last_combined_scores_ = combined.astype(float)
         self.last_vote_ratio_ = vote_ratio.astype(float)
+        if self.calibrator_ is not None:
+            features = self._build_calibration_features(
+                combined, vote_ratio, stacked, raw_input
+            )
+            self.last_calibrated_scores_ = self.calibrator_.predict_proba(features)[:, 1]
+        else:
+            self.last_calibrated_scores_ = None
+
+        if self.supervised_model_ is not None and hasattr(
+            self.supervised_model_, "predict_proba"
+        ):
+            arr = np.asarray(raw_input, dtype=float)
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            use_dim = arr.shape[1]
+            if self.supervised_input_dim_ is not None:
+                use_dim = min(self.supervised_input_dim_, use_dim)
+            self.last_supervised_scores_ = self.supervised_model_.predict_proba(
+                arr[:, :use_dim]
+            )[:, 1]
+        else:
+            self.last_supervised_scores_ = None
 
         return self.last_combined_scores_, self.last_vote_ratio_
+
+    # ------------------------------------------------------------------
+    def _build_calibration_features(
+        self,
+        combined: np.ndarray,
+        vote_ratio: np.ndarray,
+        stacked: np.ndarray,
+        raw_input: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        combined = np.asarray(combined, dtype=float).reshape(-1, 1)
+        vote_ratio = np.asarray(vote_ratio, dtype=float).reshape(-1, 1)
+        stacked = np.asarray(stacked, dtype=float)
+        if stacked.ndim == 1:
+            stacked = stacked.reshape(1, -1)
+        stacked = stacked.T
+        features = np.hstack([combined, vote_ratio, stacked])
+
+        if raw_input is not None:
+            arr = np.asarray(raw_input, dtype=float)
+            if arr.ndim == 1:
+                arr = arr.reshape(-1, 1)
+            if self.calibration_input_dim_ is None:
+                self.calibration_input_dim_ = min(32, arr.shape[1])
+            use_dim = min(self.calibration_input_dim_, arr.shape[1])
+            if use_dim > 0:
+                features = np.hstack([features, arr[:, :use_dim]])
+
+        return features
 
 
 __all__ = ["EnsembleAnomalyDetector"]
