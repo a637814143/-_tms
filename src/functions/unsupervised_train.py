@@ -21,6 +21,10 @@ from joblib import dump
 
 from src.functions.feature_extractor import extract_features, extract_features_dir
 from src.functions.anomaly_detector import EnsembleAnomalyDetector
+from src.functions.logging_utils import get_logger
+from src.functions.transformers import FlowFeaturePreprocessor
+
+logger = get_logger(__name__)
 
 META_COLUMNS = {
     "pcap_file",
@@ -440,15 +444,10 @@ def _load_feature_frames(paths: List[str], workers: int) -> List[pd.DataFrame]:
     return [df for _, df in frames]
 
 
-def _prepare_feature_matrix(
+def _prepare_feature_frame(
     df: pd.DataFrame, feature_columns_hint: Optional[List[str]] = None
-) -> Tuple[np.ndarray, List[str]]:
-    """提取用于训练的特征矩阵。
-
-    如果提供了 ``feature_columns_hint``，则严格按照提示顺序筛选列，
-    这可以确保预处理阶段与训练阶段使用完全一致的特征集合。
-    若部分列缺失，会抛出异常提示用户重新执行预处理流程。
-    """
+) -> Tuple[pd.DataFrame, List[str]]:
+    """提取用于训练的特征列，并保持原始顺序。"""
 
     candidate_cols: List[str] = []
     if feature_columns_hint:
@@ -463,19 +462,13 @@ def _prepare_feature_matrix(
         for col in df.columns:
             if col in META_COLUMNS:
                 continue
-            if is_numeric_dtype(df[col]):
-                candidate_cols.append(col)
+            candidate_cols.append(col)
 
     if not candidate_cols:
-        raise RuntimeError("未发现可用于训练的数值特征。")
+        raise RuntimeError("未发现可用于训练的特征列。")
 
-    numeric_df = df[candidate_cols].apply(pd.to_numeric, errors="coerce")
-    # 以列中位数进行填充，进一步提升鲁棒性
-    medians = numeric_df.median(axis=0, skipna=True)
-    medians = medians.fillna(0.0)
-    filled = numeric_df.fillna(medians).astype("float32")
-
-    return filled.to_numpy(dtype=float, copy=False), candidate_cols
+    feature_df = df.loc[:, candidate_cols].copy()
+    return feature_df, candidate_cols
 
 
 def _train_from_dataframe(
@@ -488,13 +481,15 @@ def _train_from_dataframe(
     progress_cb=None,
     group_column: Optional[str] = None,
     feature_columns_hint: Optional[List[str]] = None,
+    rbf_components: Optional[int] = None,
+    rbf_gamma: Optional[float] = None,
 ) -> dict:
     if df.empty:
         raise RuntimeError("训练数据为空。")
 
     working_df = df.copy()
     ground_truth_column, ground_truth = _extract_ground_truth(working_df)
-    X, feature_columns = _prepare_feature_matrix(
+    feature_df, feature_columns = _prepare_feature_frame(
         working_df, feature_columns_hint=feature_columns_hint
     )
 
@@ -514,7 +509,22 @@ def _train_from_dataframe(
         random_state=42,
     )
 
+    preprocessor = FlowFeaturePreprocessor(feature_columns=feature_columns)
+    feature_df_numeric = feature_df
+
+    sample_count = len(feature_df_numeric)
+    base_dim = max(len(feature_columns), 1)
+    auto_components = int(
+        np.clip(np.sqrt(max(1, min(sample_count, base_dim))) * 40, 600, 2000)
+    )
+    if rbf_components is not None and rbf_components > 0:
+        used_components = int(rbf_components)
+    else:
+        used_components = auto_components
+    used_gamma = float(rbf_gamma) if rbf_gamma and rbf_gamma > 0 else 0.2
+
     pipeline_steps = [
+        ("preprocessor", preprocessor),
         ("variance_filter", VarianceThreshold(threshold=1e-6)),
         ("scaler", StandardScaler()),
         (
@@ -528,8 +538,8 @@ def _train_from_dataframe(
         (
             "feature_expander",
             RBFSampler(
-                n_components=2500,
-                gamma=0.2,
+                n_components=used_components,
+                gamma=used_gamma,
                 random_state=42,
             ),
         ),
@@ -538,13 +548,23 @@ def _train_from_dataframe(
 
     pipeline = Pipeline(pipeline_steps)
 
+    logger.info(
+        "Starting unsupervised training: rows=%d features=%d contamination=%.4f (adaptive=%.4f) rbf_components=%d rbf_gamma=%.3f",
+        len(feature_df_numeric),
+        len(feature_columns),
+        contamination,
+        adaptive_contamination,
+        used_components,
+        used_gamma,
+    )
+
     if progress_cb:
         progress_cb(70)
 
     if ground_truth is not None:
-        pipeline.fit(X, ground_truth)
+        pipeline.fit(feature_df_numeric, ground_truth)
     else:
-        pipeline.fit(X)
+        pipeline.fit(feature_df_numeric)
     try:
         pipeline.feature_names_in_ = np.asarray(feature_columns)
     except Exception:
@@ -555,7 +575,7 @@ def _train_from_dataframe(
 
     supervised_metrics = None
     if ground_truth is not None:
-        transformed = pre_detector.transform(X)
+        transformed = pre_detector.transform(feature_df_numeric)
         transformed_features = transformed
         if transformed.ndim == 1:
             transformed = transformed.reshape(-1, 1)
@@ -617,7 +637,7 @@ def _train_from_dataframe(
         scores = detector.fit_decision_scores_
     else:
         if transformed_features is None:
-            transformed_features = pre_detector.transform(X)
+            transformed_features = pre_detector.transform(feature_df_numeric)
         scores = detector.score_samples(transformed_features)
     scores = np.asarray(scores, dtype=float)
 
@@ -628,7 +648,7 @@ def _train_from_dataframe(
     elif transformed_features is not None:
         expanded_dim = int(transformed_features.shape[1])
 
-    preds = pipeline.predict(X)
+    preds = pipeline.predict(feature_df_numeric)
     is_malicious = (preds == -1).astype(int)
 
     vote_ratio = None
@@ -726,6 +746,12 @@ def _train_from_dataframe(
     else:
         dump(detector, model_path)
 
+    preprocessor_metadata = {}
+    try:
+        preprocessor_metadata = preprocessor.to_metadata()
+    except Exception:
+        preprocessor_metadata = {}
+
     metadata = {
         "timestamp": timestamp,
         "contamination": effective_contamination,
@@ -748,6 +774,10 @@ def _train_from_dataframe(
         "summary_csv": summary_csv,
         "gaussianizer_path": gaussianizer_path,
         "projection_dim": int(detector.projected_dim_) if detector.projected_dim_ is not None else None,
+        "preprocessor": preprocessor_metadata,
+        "feature_names_in": feature_columns,
+        "rbf_components": used_components,
+        "rbf_gamma": used_gamma,
     }
 
     if detector.calibration_report_ is not None:
@@ -781,6 +811,14 @@ def _train_from_dataframe(
     with open(latest_meta_path, "w", encoding="utf-8") as fh:
         json.dump(metadata, fh, ensure_ascii=False, indent=2)
 
+    logger.info(
+        "Training finished: threshold=%.6f vote_threshold=%.3f anomalies=%d/%d",
+        float(threshold),
+        float(vote_threshold),
+        int(is_malicious.sum()),
+        len(is_malicious),
+    )
+
     if progress_cb:
         progress_cb(100)
 
@@ -810,6 +848,9 @@ def _train_from_dataframe(
         "evaluation": metadata.get("evaluation"),
         "supervised": supervised_metrics,
         "projection_dim": metadata.get("projection_dim"),
+        "preprocessor": preprocessor_metadata,
+        "rbf_components": used_components,
+        "rbf_gamma": used_gamma,
     }
 
 
@@ -821,6 +862,8 @@ def _train_from_preprocessed_csv(
     contamination: float,
     base_estimators: int,
     progress_cb=None,
+    rbf_components: Optional[int] = None,
+    rbf_gamma: Optional[float] = None,
 ) -> dict:
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"预处理数据集不存在: {dataset_path}")
@@ -876,6 +919,8 @@ def _train_from_preprocessed_csv(
         progress_cb=progress_cb,
         group_column=manifest_col,
         feature_columns_hint=feature_columns_hint,
+        rbf_components=rbf_components,
+        rbf_gamma=rbf_gamma,
     )
 
 
@@ -887,6 +932,8 @@ def _train_from_npz(
     contamination: float,
     base_estimators: int,
     progress_cb=None,
+    rbf_components: Optional[int] = None,
+    rbf_gamma: Optional[float] = None,
 ) -> dict:
     X, columns = _load_npz_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -919,6 +966,8 @@ def _train_from_npz(
         progress_cb=progress_cb,
         group_column=manifest_col,
         feature_columns_hint=list(columns),
+        rbf_components=rbf_components,
+        rbf_gamma=rbf_gamma,
     )
 
 
@@ -930,6 +979,8 @@ def _train_from_npy(
     contamination: float,
     base_estimators: int,
     progress_cb=None,
+    rbf_components: Optional[int] = None,
+    rbf_gamma: Optional[float] = None,
 ) -> dict:
     X, columns, meta_data = _load_npy_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -987,6 +1038,8 @@ def _train_from_npy(
         progress_cb=progress_cb,
         group_column=manifest_col,
         feature_columns_hint=feature_columns_hint,
+        rbf_components=rbf_components,
+        rbf_gamma=rbf_gamma,
     )
 
 
@@ -998,6 +1051,8 @@ def train_unsupervised_on_split(
     base_estimators: int = 50,
     progress_cb=None,
     workers: int = 4,
+    rbf_components: Optional[int] = None,
+    rbf_gamma: Optional[float] = None,
 ):
     """
     无监督训练：
@@ -1056,6 +1111,8 @@ def train_unsupervised_on_split(
                 contamination=contamination,
                 base_estimators=base_estimators,
                 progress_cb=progress_cb,
+                rbf_components=rbf_components,
+                rbf_gamma=rbf_gamma,
             )
         if ext == ".npy":
             return _train_from_npy(
@@ -1065,6 +1122,8 @@ def train_unsupervised_on_split(
                 contamination=contamination,
                 base_estimators=base_estimators,
                 progress_cb=progress_cb,
+                rbf_components=rbf_components,
+                rbf_gamma=rbf_gamma,
             )
         if ext == ".npz":
             return _train_from_npz(
@@ -1074,6 +1133,8 @@ def train_unsupervised_on_split(
                 contamination=contamination,
                 base_estimators=base_estimators,
                 progress_cb=progress_cb,
+                rbf_components=rbf_components,
+                rbf_gamma=rbf_gamma,
             )
         raise FileNotFoundError(f"不支持的数据集格式: {dataset_path}")
 
@@ -1125,4 +1186,7 @@ def train_unsupervised_on_split(
         base_estimators=base_estimators,
         progress_cb=progress_cb,
         group_column="pcap_file" if "pcap_file" in full_df.columns else None,
+        feature_columns_hint=None,
+        rbf_components=rbf_components,
+        rbf_gamma=rbf_gamma,
     )
