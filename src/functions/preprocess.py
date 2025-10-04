@@ -29,6 +29,7 @@ RESERVED_META_COLUMNS = [
     "src_port",
     "dst_port",
     "protocol",
+    "label",
 ]
 
 MISSING_TOKEN = "<MISSING>"
