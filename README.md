@@ -5,9 +5,10 @@
 ## 快速开始
 
 1. 安装依赖：`pip install -r requirements.txt`
-2. 提取特征：`python -m src.functions.feature_extractor <pcap路径> <输出csv>`
-3. 预处理并训练：`python -m src.functions.unsupervised_train ...`（参考脚本目录中的示例）。
-4. 使用 `scripts/` 下的脚本批量处理或集成 GUI。
+2. （可选）通过环境变量 `MALDET_DATA_DIR`/`MALDET_LOG_DIR` 指定 GUI 默认的数据与日志根目录（默认位于 `~/<maldet_data>`）。
+3. 提取特征：`python -m src.functions.feature_extractor <pcap路径> <输出csv>`
+4. 预处理并训练：`python -m src.functions.unsupervised_train ...`（参考脚本目录中的示例）。
+5. 使用 `scripts/` 下的脚本批量处理或集成 GUI。
 
 ## 新增能力速览
 

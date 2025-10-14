@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil, json
+from pathlib import Path
 import numpy as np
 from typing import List, Optional, Set
 from datetime import datetime
@@ -34,20 +35,59 @@ QGroupBox::title { subcontrol-origin: margin; left:12px; padding:0 6px; backgrou
 # 仅表格预览上限（全部数据都会落盘）
 PREVIEW_LIMIT_FOR_TABLE = 50
 
-# ======= 固定输出路径（与你之前一致）=======
-_DATA_BASE = r"D:\pythonProject8\data"
+DATA_BASE = Path(os.getenv("MALDET_DATA_DIR", Path.home() / "maldet_data")).expanduser().resolve()
 PATHS = {
-    "split": os.path.join(_DATA_BASE, "split"),
-    "csv_info": os.path.join(_DATA_BASE, "CSV", "info"),
-    "csv_feature": os.path.join(_DATA_BASE, "CSV", "feature"),
-    "csv_preprocess": os.path.join(_DATA_BASE, "CSV", "DP"),
-    "models": os.path.join(_DATA_BASE, "models"),
-    "results_analysis": os.path.join(_DATA_BASE, "results", "analysis"),
-    "results_pred": os.path.join(_DATA_BASE, "results", "modelprediction"),
-    "results_abnormal": os.path.join(_DATA_BASE, "results", "abnormal"),
+    "split": DATA_BASE / "split",
+    "csv_info": DATA_BASE / "CSV" / "info",
+    "csv_feature": DATA_BASE / "CSV" / "feature",
+    "csv_preprocess": DATA_BASE / "CSV" / "DP",
+    "models": DATA_BASE / "models",
+    "results_analysis": DATA_BASE / "results" / "analysis",
+    "results_pred": DATA_BASE / "results" / "modelprediction",
+    "results_abnormal": DATA_BASE / "results" / "abnormal",
 }
-for _p in PATHS.values():
-    os.makedirs(_p, exist_ok=True)
+for _path in PATHS.values():
+    _path.mkdir(parents=True, exist_ok=True)
+
+LOGS_DIR = Path(os.getenv("MALDET_LOG_DIR", DATA_BASE / "logs")).expanduser().resolve()
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+SETTINGS_PATH = DATA_BASE / "settings.json"
+
+
+class AppSettings:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.data: dict[str, object] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            self.data = {}
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if isinstance(payload, dict):
+                self.data = payload
+            else:
+                self.data = {}
+        except Exception:
+            self.data = {}
+
+    def get(self, key: str, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key: str, value) -> None:
+        self.data[key] = value
+        self._save()
+
+    def _save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, "w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
 # =============== 表格模型与行高亮 ===============
 class PandasFrameModel(QtCore.QAbstractTableModel):
@@ -200,15 +240,24 @@ class TrainWorker(QtCore.QThread):
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
-    def __init__(self, input_path, results_dir, models_dir):
+    def __init__(self, input_path, results_dir, models_dir, rbf_components=None, rbf_gamma=None):
         super().__init__()
         self.input_path = input_path
         self.results_dir = results_dir
         self.models_dir = models_dir
+        self.rbf_components = rbf_components
+        self.rbf_gamma = rbf_gamma
 
     def run(self):
         try:
-            res = run_train(self.input_path, self.results_dir, self.models_dir, progress_cb=self.progress.emit)
+            res = run_train(
+                self.input_path,
+                self.results_dir,
+                self.models_dir,
+                progress_cb=self.progress.emit,
+                rbf_components=self.rbf_components,
+                rbf_gamma=self.rbf_gamma,
+            )
             self.finished.emit(res)
         except Exception as e:
             self.error.emit(str(e))
@@ -219,14 +268,20 @@ class AnalysisWorker(QtCore.QThread):
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
-    def __init__(self, results_csv, out_dir):
+    def __init__(self, results_csv, out_dir, metadata_path=None):
         super().__init__()
         self.results_csv = results_csv
         self.out_dir = out_dir
+        self.metadata_path = metadata_path
 
     def run(self):
         try:
-            result = run_analysis(self.results_csv, self.out_dir, progress_cb=self.progress.emit)
+            result = run_analysis(
+                self.results_csv,
+                self.out_dir,
+                metadata_path=self.metadata_path,
+                progress_cb=self.progress.emit,
+            )
             if not isinstance(result, dict):
                 result = {"out_dir": self.out_dir}
             elif "out_dir" not in result:
@@ -363,6 +418,11 @@ class Ui_MainWindow(object):
         # worker
         self.worker: Optional[InfoWorker] = None
         self.preprocess_worker: Optional[PreprocessWorker] = None
+
+        # 用户偏好
+        self._settings = AppSettings(SETTINGS_PATH)
+        self._loading_settings = False
+        self._apply_saved_preferences()
 
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
@@ -523,6 +583,24 @@ class Ui_MainWindow(object):
         self.right_layout.setContentsMargins(6, 6, 6, 6)
         self.right_layout.setSpacing(10)
 
+        self.advanced_group = QtWidgets.QGroupBox("高级设置")
+        ag_layout = QtWidgets.QFormLayout(self.advanced_group)
+        ag_layout.setContentsMargins(10, 8, 10, 8)
+        self.rbf_components_spin = QtWidgets.QSpinBox()
+        self.rbf_components_spin.setRange(0, 5000)
+        self.rbf_components_spin.setSingleStep(50)
+        self.rbf_components_spin.setSpecialValueText("自动")
+        self.rbf_components_spin.setValue(0)
+        self.rbf_gamma_spin = QtWidgets.QDoubleSpinBox()
+        self.rbf_gamma_spin.setRange(0.0, 5.0)
+        self.rbf_gamma_spin.setDecimals(4)
+        self.rbf_gamma_spin.setSingleStep(0.05)
+        self.rbf_gamma_spin.setSpecialValueText("自动 (0.2)")
+        self.rbf_gamma_spin.setValue(0.0)
+        ag_layout.addRow("RBF 维度：", self.rbf_components_spin)
+        ag_layout.addRow("RBF γ：", self.rbf_gamma_spin)
+        self.right_layout.addWidget(self.advanced_group)
+
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
         self.btn_fe = QtWidgets.QPushButton("提取特征")
         self.btn_vector = QtWidgets.QPushButton("数据预处理")
@@ -531,6 +609,8 @@ class Ui_MainWindow(object):
         self.btn_predict = QtWidgets.QPushButton("加载模型预测")
         self.btn_export = QtWidgets.QPushButton("导出结果（异常）")
         self.btn_clear = QtWidgets.QPushButton("清空显示")
+        self.btn_open_results = QtWidgets.QPushButton("打开结果目录")
+        self.btn_view_logs = QtWidgets.QPushButton("查看日志")
 
         for b in [
             self.btn_view,
@@ -540,6 +620,8 @@ class Ui_MainWindow(object):
             self.btn_analysis,
             self.btn_predict,
             self.btn_export,
+            self.btn_open_results,
+            self.btn_view_logs,
             self.btn_clear,
         ]:
             self.right_layout.addWidget(b); self.right_layout.addSpacing(2)
@@ -564,11 +646,15 @@ class Ui_MainWindow(object):
         self.btn_train.clicked.connect(self._on_train_model)
         self.btn_analysis.clicked.connect(self._on_run_analysis)
         self.btn_predict.clicked.connect(self._on_predict)
+        self.btn_open_results.clicked.connect(self._open_results_dir)
+        self.btn_view_logs.clicked.connect(self._open_logs_dir)
 
         self.btn_page_prev.clicked.connect(self._on_page_prev)
         self.btn_page_next.clicked.connect(self._on_page_next)
         self.page_size_spin.valueChanged.connect(self._on_page_size_changed)
         self.btn_show_all.clicked.connect(self._show_full_preview)
+        self.rbf_components_spin.valueChanged.connect(self._on_rbf_settings_changed)
+        self.rbf_gamma_spin.valueChanged.connect(self._on_rbf_settings_changed)
 
         self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
         self.output_list.itemDoubleClicked.connect(self._on_output_double_click)
@@ -577,23 +663,31 @@ class Ui_MainWindow(object):
     def _project_root(self):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     def _default_split_dir(self):
-        return PATHS["split"]
+        return str(PATHS["split"])
+
     def _default_results_dir(self):
-        return PATHS["results_analysis"]
+        return str(PATHS["results_analysis"])
+
     def _default_models_dir(self):
-        return PATHS["models"]
+        return str(PATHS["models"])
+
     def _default_csv_info_dir(self):
-        return PATHS["csv_info"]
+        return str(PATHS["csv_info"])
+
     def _default_csv_feature_dir(self):
-        return PATHS["csv_feature"]
+        return str(PATHS["csv_feature"])
+
     def _analysis_out_dir(self):
-        return PATHS["results_analysis"]
+        return str(PATHS["results_analysis"])
+
     def _prediction_out_dir(self):
-        return PATHS["results_pred"]
+        return str(PATHS["results_pred"])
+
     def _abnormal_out_dir(self):
-        return PATHS["results_abnormal"]
+        return str(PATHS["results_abnormal"])
+
     def _preprocess_out_dir(self):
-        return PATHS["csv_preprocess"]
+        return str(PATHS["csv_preprocess"])
 
     def _latest_pipeline_bundle(self):
         models_dir = self._default_models_dir()
@@ -624,18 +718,22 @@ class Ui_MainWindow(object):
             d = QtWidgets.QFileDialog.getExistingDirectory(None, "选择包含多个小包的目录（如 data/split）", self._default_split_dir())
             if d:
                 self.file_edit.setText(d); self.display_result(f"已选择目录: {d}", True)
+                self._remember_path(d)
             return
         self.file_edit.setText(p); self.display_result(f"已选择文件: {p}", True)
+        self._remember_path(p)
 
     def _choose_file(self):
         p, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择 pcap 文件", "", "pcap (*.pcap *.pcapng);;所有文件 (*)")
         if p:
             self.file_edit.setText(p); self.display_result(f"已选择文件: {p}", True)
+            self._remember_path(p)
 
     def _choose_dir(self):
         d = QtWidgets.QFileDialog.getExistingDirectory(None, "选择包含多个小包的目录（如 data/split）", self._default_split_dir())
         if d:
             self.file_edit.setText(d); self.display_result(f"已选择目录: {d}", True)
+            self._remember_path(d)
 
     def _ask_pcap_input(self):
         current = self.file_edit.text().strip()
@@ -1209,11 +1307,14 @@ class Ui_MainWindow(object):
             files_list = list(feature_source)
             preview = f"{len(files_list)} 个CSV文件"
             if files_list:
-                self.file_edit.setText(str(files_list[0]))
+                first_path = str(files_list[0])
+                self.file_edit.setText(first_path)
+                self._remember_path(first_path)
         else:
             preview = str(feature_source)
             if os.path.exists(preview):
                 self.file_edit.setText(preview)
+                self._remember_path(preview)
 
         self.display_result(f"[INFO] 数据预处理：{preview} -> {out_dir}")
         self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
@@ -1272,6 +1373,7 @@ class Ui_MainWindow(object):
         path = selection
         if os.path.exists(path):
             self.file_edit.setText(path)
+            self._remember_path(path)
 
         res_dir = self._default_results_dir()
         mdl_dir = self._default_models_dir()
@@ -1279,7 +1381,15 @@ class Ui_MainWindow(object):
 
         self.display_result(f"[INFO] 开始训练，输入: {path}")
         self.btn_train.setEnabled(False); self.set_button_progress(self.btn_train, 1)
-        self.train_worker = TrainWorker(path, res_dir, mdl_dir)
+        comp = self.rbf_components_spin.value()
+        gamma = self.rbf_gamma_spin.value()
+        self.train_worker = TrainWorker(
+            path,
+            res_dir,
+            mdl_dir,
+            rbf_components=int(comp) if comp > 0 else None,
+            rbf_gamma=float(gamma) if gamma > 0 else None,
+        )
         self.train_worker.progress.connect(lambda p: self.set_button_progress(self.btn_train, p))
         self.train_worker.finished.connect(self._on_train_finished)
         self.train_worker.error.connect(self._on_train_error)
@@ -1313,6 +1423,10 @@ class Ui_MainWindow(object):
                     float(adaptive), float(quant if quant is not None else adaptive), float(robust if robust is not None else adaptive)
                 )
             )
+        if res.get("rbf_components"):
+            msg_lines.append(f"RBF 维度={int(res['rbf_components'])}")
+        if res.get("rbf_gamma") is not None:
+            msg_lines.append(f"RBF γ={float(res['rbf_gamma']):.3f}")
         if res.get("estimated_precision") is not None:
             msg_lines.append(f"异常置信度均值≈{res.get('estimated_precision'):.2%}")
         msg = "\n".join(msg_lines)
@@ -1345,7 +1459,8 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 正在分析结果 -> {out_dir}")
         self._analysis_summary = None
         self.btn_analysis.setEnabled(False); self.set_button_progress(self.btn_analysis, 1)
-        self.analysis_worker = AnalysisWorker(csv, out_dir)
+        _, meta_path = self._latest_pipeline_bundle()
+        self.analysis_worker = AnalysisWorker(csv, out_dir, metadata_path=meta_path)
         self.analysis_worker.progress.connect(lambda p: self.set_button_progress(self.btn_analysis, p))
         self.analysis_worker.finished.connect(self._on_analysis_finished)
         self.analysis_worker.error.connect(self._on_analysis_error)
@@ -1374,6 +1489,7 @@ class Ui_MainWindow(object):
             summary_csv = result.get("summary_csv") if isinstance(result.get("summary_csv"), str) else None
             summary_text = result.get("summary_text") if isinstance(result.get("summary_text"), str) else None
             summary_json = result.get("summary_json") if isinstance(result.get("summary_json"), str) else None
+            metrics_csv = result.get("metrics_csv") if isinstance(result.get("metrics_csv"), str) else None
         else:
             out_dir = str(result) if result is not None else None
 
@@ -1407,6 +1523,9 @@ class Ui_MainWindow(object):
                         self._open_csv_paged(top20_csv)
                 except Exception:
                     pass
+
+        if locals().get("metrics_csv"):
+            _mark(metrics_csv)
 
         fallback_names = [
             "top10_malicious_ratio.png",
@@ -1451,6 +1570,8 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
             return
 
+        self._remember_path(csv_path)
+
         from joblib import load as joblib_load
 
         pipeline_path, meta_path = self._latest_pipeline_bundle()
@@ -1483,77 +1604,80 @@ class Ui_MainWindow(object):
         vote_mean_meta = metadata.get("vote_mean") if isinstance(metadata, dict) else None
         vote_threshold_meta = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
 
-        use_df = df.copy()
-        if feature_columns:
-            missing_cols = [c for c in feature_columns if c not in use_df.columns]
-            for col in missing_cols:
-                use_df[col] = 0
-            X_df = use_df[feature_columns]
+        preprocessor_meta = metadata.get("preprocessor") if isinstance(metadata, dict) else None
+        if isinstance(preprocessor_meta, dict):
+            required_columns = preprocessor_meta.get("input_columns") or feature_columns
         else:
-            X_df = use_df.select_dtypes(include=[np.number])
-            if X_df.empty:
-                X_df = use_df.apply(pd.to_numeric, errors="coerce")
+            required_columns = feature_columns
 
-        X_df = X_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
-        X = X_df.to_numpy(dtype=float, copy=False)
+        if not required_columns:
+            QtWidgets.QMessageBox.critical(None, "缺少特征列", "模型元数据缺乏特征列描述，无法执行预测。")
+            return
+
+        missing_cols = [c for c in required_columns if c not in df.columns]
+        if missing_cols:
+            QtWidgets.QMessageBox.critical(
+                None,
+                "列不匹配",
+                "当前 CSV 缺少以下训练期特征列：\n" + "\n".join(missing_cols),
+            )
+            return
+
+        feature_df = df.loc[:, required_columns].copy()
 
         named_steps = getattr(pipeline, "named_steps", {}) if hasattr(pipeline, "named_steps") else {}
         detector = named_steps.get("detector") if isinstance(named_steps, dict) else None
-        scaler = named_steps.get("scaler") if isinstance(named_steps, dict) else None
-
-        X_scaled = None
 
         if detector is None:
             QtWidgets.QMessageBox.critical(None, "模型不完整", "当前模型缺少集成检测器，请重新训练。")
             return
 
         try:
-            preds = pipeline.predict(X)
+            preds = pipeline.predict(feature_df)
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}")
             return
 
+        pre_detector = Pipeline(pipeline.steps[:-1])
+        transformed = None
+
         scores = getattr(detector, "last_combined_scores_", None)
         if scores is None:
             try:
-                if scaler is not None:
-                    X_scaled = scaler.transform(X)
-                else:
-                    X_scaled = X
+                transformed = pre_detector.transform(feature_df)
             except Exception as e:
-                QtWidgets.QMessageBox.warning(None, "缩放失败", f"标准化失败：{e}")
-                try:
-                    X_scaled = X if scaler is None else scaler.fit_transform(X)
-                except Exception:
-                    X_scaled = X
+                QtWidgets.QMessageBox.critical(None, "转换失败", f"特征预处理失败：{e}")
+                return
             try:
-                scores = detector.score_samples(X_scaled)
+                scores = detector.score_samples(transformed)
             except Exception:
-                scores = np.zeros(len(X), dtype=float)
+                scores = np.zeros(len(feature_df), dtype=float)
         scores = np.asarray(scores, dtype=float)
 
         vote_ratio = getattr(detector, "last_vote_ratio_", None)
         if vote_ratio is None:
+            if transformed is None:
+                try:
+                    transformed = pre_detector.transform(feature_df)
+                except Exception as e:
+                    QtWidgets.QMessageBox.warning(None, "转换失败", f"特征转换失败：{e}")
+                    transformed = None
             vote_blocks = []
-            if X_scaled is None:
-                try:
-                    X_scaled = scaler.transform(X) if scaler is not None else X
-                except Exception:
-                    X_scaled = X
-            for info in getattr(detector, "detectors_", {}).values():
-                est = getattr(info, "estimator", None)
-                if est is None or not hasattr(est, "predict"):
-                    continue
-                try:
-                    sub_pred = est.predict(X_scaled)
-                    vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
-                except Exception:
-                    continue
+            if transformed is not None:
+                for info in getattr(detector, "detectors_", {}).values():
+                    est = getattr(info, "estimator", None)
+                    if est is None or not hasattr(est, "predict"):
+                        continue
+                    try:
+                        sub_pred = est.predict(transformed)
+                        vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
+                    except Exception:
+                        continue
             if vote_blocks:
                 vote_ratio = np.vstack(vote_blocks).mean(axis=0)
         if vote_ratio is None:
             fallback_vote = 0.5 if vote_mean_meta is None else float(vote_mean_meta)
-            vote_ratio = np.full(len(X), fallback_vote, dtype=float)
+            vote_ratio = np.full(len(feature_df), fallback_vote, dtype=float)
         vote_ratio = np.asarray(vote_ratio, dtype=float)
 
         if threshold is None:
@@ -1631,6 +1755,12 @@ class Ui_MainWindow(object):
         it.setToolTip(path); it.setData(QtCore.Qt.UserRole, path)
         self.output_list.addItem(it); self.output_list.scrollToBottom()
 
+    def _open_results_dir(self):
+        self._reveal_in_folder(self._default_results_dir())
+
+    def _open_logs_dir(self):
+        self._reveal_in_folder(str(LOGS_DIR))
+
     def _on_output_double_click(self, it):
         self._reveal_in_folder(it.data(QtCore.Qt.UserRole))
 
@@ -1659,6 +1789,46 @@ class Ui_MainWindow(object):
                 subprocess.run(["xdg-open", path if os.path.isdir(path) else os.path.dirname(path)])
         except Exception as e:
             QtWidgets.QMessageBox.warning(None, "打开失败", f"无法打开资源管理器：{e}")
+
+    def _remember_path(self, path: str) -> None:
+        if not path or not hasattr(self, "_settings"):
+            return
+        try:
+            self._settings.set("last_input_path", path)
+        except Exception:
+            pass
+
+    def _on_rbf_settings_changed(self):
+        if getattr(self, "_loading_settings", False):
+            return
+        if not hasattr(self, "_settings"):
+            return
+        try:
+            self._settings.set("rbf_components", int(self.rbf_components_spin.value()))
+            self._settings.set("rbf_gamma", float(self.rbf_gamma_spin.value()))
+        except Exception:
+            pass
+
+    def _apply_saved_preferences(self):
+        if not hasattr(self, "_settings"):
+            return
+        self._loading_settings = True
+        try:
+            last_path = self._settings.get("last_input_path")
+            if isinstance(last_path, str) and last_path:
+                self.file_edit.setText(last_path)
+            saved_components = self._settings.get("rbf_components", 0) or 0
+            saved_gamma = self._settings.get("rbf_gamma", 0.0) or 0.0
+            try:
+                self.rbf_components_spin.setValue(int(saved_components))
+            except Exception:
+                self.rbf_components_spin.setValue(0)
+            try:
+                self.rbf_gamma_spin.setValue(float(saved_gamma))
+            except Exception:
+                self.rbf_gamma_spin.setValue(0.0)
+        finally:
+            self._loading_settings = False
 
     # --------- 清空 ----------
     def _on_clear(self):
