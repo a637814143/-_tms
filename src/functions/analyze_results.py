@@ -3,6 +3,7 @@
 import json
 import math
 import os
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import matplotlib
@@ -17,6 +18,25 @@ import numpy as np
 from src.functions.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _resolve_data_base() -> str:
+    env = os.getenv("MALDET_DATA_DIR")
+    if env and env.strip():
+        try:
+            Path(env).expanduser().resolve().mkdir(parents=True, exist_ok=True)
+            return str(Path(env).expanduser().resolve())
+        except Exception:
+            pass
+    try:
+        proj_root = Path(__file__).resolve().parents[2]
+        local_data = proj_root / "data"
+        local_data.mkdir(parents=True, exist_ok=True)
+        return str(local_data)
+    except Exception:
+        fallback = Path.home() / "maldet_data"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return str(fallback)
 
 GROUND_TRUTH_COLUMN_CANDIDATES = (
     "label",
@@ -205,6 +225,13 @@ def analyze_results(
     os.makedirs(out_dir, exist_ok=True)
     df = pd.read_csv(results_csv)
 
+    if metadata is None:
+        if not metadata_path or not os.path.exists(metadata_path):
+            base_dir = _resolve_data_base()
+            candidate = os.path.join(base_dir, "models", "latest_iforest_metadata.json")
+            if os.path.exists(candidate):
+                metadata_path = candidate
+
     loaded_metadata: Dict[str, object] = {}
     if isinstance(metadata, dict):
         loaded_metadata = metadata
@@ -262,6 +289,7 @@ def analyze_results(
     malicious_ratio_global = float(malicious_total / total_rows) if total_rows else 0.0
 
     avg_confidence = None
+    avg_risk = None
     vote_ratio_quantiles = None
     vote_threshold_hint = None
     if "anomaly_confidence" in df.columns:
@@ -273,6 +301,15 @@ def analyze_results(
                 avg_confidence = float(conf_series.mean())
         except Exception:
             avg_confidence = None
+    if "risk_score" in df.columns:
+        try:
+            risk_series = df["risk_score"].astype("float32", copy=False)
+            if malicious_mask.any():
+                avg_risk = float(risk_series[malicious_mask].mean())
+            else:
+                avg_risk = float(risk_series.mean())
+        except Exception:
+            avg_risk = None
     if "vote_ratio" in df.columns:
         try:
             vote_series = df["vote_ratio"].astype("float32", copy=False)
@@ -447,7 +484,9 @@ def analyze_results(
         f"建议异常得分阈值（越小越异常）：≤ {score_threshold:.6f}",
         f"文件级判定阈值：恶意占比 ≥ {ratio_threshold:.2%}",
     ]
-    if avg_confidence is not None:
+    if avg_risk is not None:
+        summary_lines.append(f"风险分均值：{avg_risk:.2%}")
+    elif avg_confidence is not None:
         summary_lines.append(f"异常置信度均值：{avg_confidence:.2%}")
     if vote_threshold_hint is not None:
         summary_lines.append(f"投票占比建议阈值：≥ {vote_threshold_hint:.2f}")
@@ -488,6 +527,7 @@ def analyze_results(
         "score_threshold": score_threshold,
         "ratio_threshold": ratio_threshold,
         "avg_confidence": avg_confidence,
+        "avg_risk": avg_risk,
         "vote_ratio_quantiles": vote_ratio_quantiles,
         "vote_threshold_hint": vote_threshold_hint,
         "anomalous_files": anomalous_files,

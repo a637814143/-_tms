@@ -21,6 +21,23 @@ try:
 except Exception:
     pd = None
 
+def _resolve_data_base() -> Path:
+    env = os.getenv("MALDET_DATA_DIR")
+    if env and env.strip():
+        base = Path(env).expanduser()
+        base.mkdir(parents=True, exist_ok=True)
+        return base.resolve()
+    try:
+        proj_root = Path(__file__).resolve().parents[2]
+        data_dir = proj_root / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir.resolve()
+    except Exception:
+        fallback = Path.home() / "maldet_data"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback.resolve()
+
+
 APP_STYLE = """
 QWidget { background-color: #F7F8FA; font-family: "Microsoft YaHei", "PingFang SC","SF Pro Text"; color:#1d1d1f; font-size:13px; }
 QTextEdit, QTableView { background-color: #FFFFFF; border:1px solid #E3E6EB; border-radius:8px; }
@@ -35,7 +52,7 @@ QGroupBox::title { subcontrol-origin: margin; left:12px; padding:0 6px; backgrou
 # 仅表格预览上限（全部数据都会落盘）
 PREVIEW_LIMIT_FOR_TABLE = 50
 
-DATA_BASE = Path(os.getenv("MALDET_DATA_DIR", Path.home() / "maldet_data")).expanduser().resolve()
+DATA_BASE = _resolve_data_base()
 PATHS = {
     "split": DATA_BASE / "split",
     "csv_info": DATA_BASE / "CSV" / "info",
@@ -1623,7 +1640,44 @@ class Ui_MainWindow(object):
             )
             return
 
-        feature_df = df.loc[:, required_columns].copy()
+        feature_df_raw = df.loc[:, required_columns].copy()
+
+        models_dir = self._default_models_dir()
+        preproc_candidates = []
+        if isinstance(metadata, dict):
+            if metadata.get("preprocessor_latest"):
+                preproc_candidates.append(metadata.get("preprocessor_latest"))
+            if metadata.get("preprocessor_path"):
+                preproc_candidates.append(metadata.get("preprocessor_path"))
+        preproc_candidates.append(os.path.join(models_dir, "latest_preprocessor.joblib"))
+
+        loaded_preprocessor = None
+        last_preproc_error = None
+        for path in preproc_candidates:
+            if not path:
+                continue
+            if not os.path.exists(path):
+                continue
+            try:
+                loaded_preprocessor = joblib_load(path)
+                break
+            except Exception as exc:
+                last_preproc_error = exc
+                continue
+
+        if loaded_preprocessor is None:
+            loaded_preprocessor = pipeline.named_steps.get("preprocessor") if hasattr(pipeline, "named_steps") else None
+
+        if loaded_preprocessor is None:
+            detail = f"（最近一次错误：{last_preproc_error}）" if last_preproc_error else ""
+            QtWidgets.QMessageBox.critical(None, "模型不完整", f"缺少可用的特征预处理器，请重新训练。{detail}")
+            return
+
+        try:
+            feature_df_aligned = loaded_preprocessor.transform(feature_df_raw)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, "转换失败", f"特征预处理失败：{e}")
+            return
 
         named_steps = getattr(pipeline, "named_steps", {}) if hasattr(pipeline, "named_steps") else {}
         detector = named_steps.get("detector") if isinstance(named_steps, dict) else None
@@ -1632,52 +1686,45 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.critical(None, "模型不完整", "当前模型缺少集成检测器，请重新训练。")
             return
 
+        transformed = feature_df_aligned
+        for name, step in pipeline.steps[1:-1]:
+            try:
+                transformed = step.transform(transformed)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(None, "转换失败", f"特征变换失败（{name}）：{e}")
+                return
+
         try:
-            preds = pipeline.predict(feature_df)
+            preds = detector.predict(transformed)
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}")
             return
 
-        pre_detector = Pipeline(pipeline.steps[:-1])
-        transformed = None
-
         scores = getattr(detector, "last_combined_scores_", None)
         if scores is None:
             try:
-                transformed = pre_detector.transform(feature_df)
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(None, "转换失败", f"特征预处理失败：{e}")
-                return
-            try:
                 scores = detector.score_samples(transformed)
             except Exception:
-                scores = np.zeros(len(feature_df), dtype=float)
+                scores = np.zeros(len(feature_df_aligned), dtype=float)
         scores = np.asarray(scores, dtype=float)
 
         vote_ratio = getattr(detector, "last_vote_ratio_", None)
         if vote_ratio is None:
-            if transformed is None:
-                try:
-                    transformed = pre_detector.transform(feature_df)
-                except Exception as e:
-                    QtWidgets.QMessageBox.warning(None, "转换失败", f"特征转换失败：{e}")
-                    transformed = None
             vote_blocks = []
-            if transformed is not None:
-                for info in getattr(detector, "detectors_", {}).values():
-                    est = getattr(info, "estimator", None)
-                    if est is None or not hasattr(est, "predict"):
-                        continue
-                    try:
-                        sub_pred = est.predict(transformed)
-                        vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
-                    except Exception:
-                        continue
+            for info in getattr(detector, "detectors_", {}).values():
+                est = getattr(info, "estimator", None)
+                if est is None or not hasattr(est, "predict"):
+                    continue
+                try:
+                    sub_pred = est.predict(transformed)
+                    vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
+                except Exception:
+                    continue
             if vote_blocks:
                 vote_ratio = np.vstack(vote_blocks).mean(axis=0)
         if vote_ratio is None:
             fallback_vote = 0.5 if vote_mean_meta is None else float(vote_mean_meta)
-            vote_ratio = np.full(len(feature_df), fallback_vote, dtype=float)
+            vote_ratio = np.full(len(feature_df_aligned), fallback_vote, dtype=float)
         vote_ratio = np.asarray(vote_ratio, dtype=float)
 
         if threshold is None:
@@ -1697,7 +1744,19 @@ class Ui_MainWindow(object):
 
         conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
         vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
-        anomaly_confidence = np.clip((conf_from_score + vote_component) / 2.0, 0.0, 1.0)
+        risk_score = np.clip(0.6 * conf_from_score + 0.4 * vote_component, 0.0, 1.0)
+
+        supervised_scores = getattr(detector, "last_supervised_scores_", None)
+        if supervised_scores is not None:
+            risk_score = np.clip(0.5 * risk_score + 0.5 * supervised_scores.astype(float), 0.0, 1.0)
+        elif getattr(detector, "last_calibrated_scores_", None) is not None:
+            risk_score = np.clip(
+                0.6 * risk_score + 0.4 * detector.last_calibrated_scores_.astype(float),
+                0.0,
+                1.0,
+            )
+
+        anomaly_confidence = risk_score.copy()
 
         out_df = df.copy()
         out_df["prediction"] = preds
@@ -1705,6 +1764,7 @@ class Ui_MainWindow(object):
         out_df["anomaly_score"] = scores
         out_df["anomaly_confidence"] = anomaly_confidence
         out_df["vote_ratio"] = vote_ratio
+        out_df["risk_score"] = risk_score
 
         malicious = int(out_df["is_malicious"].sum())
         total = int(len(out_df))
@@ -1732,7 +1792,7 @@ class Ui_MainWindow(object):
             f"自动阈值：{threshold:.6f}",
             f"投票阈值：{vote_threshold:.2f}",
             f"分数范围：{score_min:.4f} ~ {score_max:.4f}",
-            f"平均异常置信度：{float(anomaly_confidence.mean()):.2%}",
+            f"平均风险分：{float(risk_score.mean()):.2%}",
         ]
         if isinstance(threshold_breakdown_meta, dict) and threshold_breakdown_meta.get("adaptive") is not None:
             msg.append(

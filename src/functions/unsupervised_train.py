@@ -22,7 +22,7 @@ from joblib import dump
 from src.functions.feature_extractor import extract_features, extract_features_dir
 from src.functions.anomaly_detector import EnsembleAnomalyDetector
 from src.functions.logging_utils import get_logger
-from src.functions.transformers import FlowFeaturePreprocessor
+from src.functions.transformers import PreprocessPipeline
 
 logger = get_logger(__name__)
 
@@ -509,8 +509,8 @@ def _train_from_dataframe(
         random_state=42,
     )
 
-    preprocessor = FlowFeaturePreprocessor(feature_columns=feature_columns)
-    feature_df_numeric = feature_df
+    preprocessor = PreprocessPipeline(feature_order=feature_columns, fill_value=0.0)
+    feature_df_numeric = feature_df.loc[:, feature_columns].copy()
 
     sample_count = len(feature_df_numeric)
     base_dim = max(len(feature_columns), 1)
@@ -561,6 +561,7 @@ def _train_from_dataframe(
     if progress_cb:
         progress_cb(70)
 
+    supervised_proba = None
     if ground_truth is not None:
         pipeline.fit(feature_df_numeric, ground_truth)
     else:
@@ -570,6 +571,7 @@ def _train_from_dataframe(
     except Exception:
         pass
     detector = pipeline.named_steps["detector"]
+    preprocessor = pipeline.named_steps.get("preprocessor", preprocessor)
     pre_detector = Pipeline(pipeline.steps[:-1])
     transformed_features: Optional[np.ndarray] = None
 
@@ -673,26 +675,24 @@ def _train_from_dataframe(
     score_std = float(np.std(scores) or 1.0)
     conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
     vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
-    anomaly_confidence = np.clip((conf_from_score + vote_component) / 2.0, 0.0, 1.0)
-    base_confidence = anomaly_confidence.copy()
+    risk_score = np.clip(0.6 * conf_from_score + 0.4 * vote_component, 0.0, 1.0)
+
     if detector.last_supervised_scores_ is not None:
         supervised_scores = detector.last_supervised_scores_.astype(float)
-        anomaly_confidence = np.clip(
-            0.5 * base_confidence + 0.5 * supervised_scores,
-            0.0,
-            1.0,
-        )
+        risk_score = np.clip(0.5 * risk_score + 0.5 * supervised_scores, 0.0, 1.0)
     elif detector.last_calibrated_scores_ is not None:
         calibrated_scores = detector.last_calibrated_scores_.astype(float)
-        anomaly_confidence = np.clip(
-            0.6 * base_confidence + 0.4 * calibrated_scores,
-            0.0,
-            1.0,
-        )
+        risk_score = np.clip(0.6 * risk_score + 0.4 * calibrated_scores, 0.0, 1.0)
+    elif supervised_proba is not None:
+        sup_scores = np.clip(supervised_proba.astype(float), 0.0, 1.0)
+        risk_score = np.clip(0.5 * risk_score + 0.5 * sup_scores, 0.0, 1.0)
+
+    anomaly_confidence = risk_score.copy()
 
     working_df["anomaly_score"] = scores
     working_df["vote_ratio"] = vote_ratio
     working_df["anomaly_confidence"] = anomaly_confidence
+    working_df["risk_score"] = risk_score
     working_df["is_malicious"] = is_malicious
 
     results_csv = os.path.join(results_dir, "iforest_results.csv")
@@ -729,11 +729,20 @@ def _train_from_dataframe(
     pipeline_path = os.path.join(models_dir, pipeline_name)
     dump(pipeline, pipeline_path)
 
+    preprocessor_path = os.path.join(models_dir, f"preprocessor_{timestamp}.joblib")
+    dump(preprocessor, preprocessor_path)
+
     latest_pipeline_path = os.path.join(models_dir, "latest_iforest_pipeline.joblib")
     try:
         shutil.copy2(pipeline_path, latest_pipeline_path)
     except Exception:
         dump(pipeline, latest_pipeline_path)
+
+    latest_preprocessor_path = os.path.join(models_dir, "latest_preprocessor.joblib")
+    try:
+        shutil.copy2(preprocessor_path, latest_preprocessor_path)
+    except Exception:
+        dump(preprocessor, latest_preprocessor_path)
 
     scaler_path = os.path.join(models_dir, "scaler.joblib")
     dump(pipeline.named_steps["scaler"], scaler_path)
@@ -777,7 +786,10 @@ def _train_from_dataframe(
         "preprocessor": preprocessor_metadata,
         "feature_names_in": feature_columns,
         "rbf_components": used_components,
+        "rbf_n_components": used_components,
         "rbf_gamma": used_gamma,
+        "preprocessor_path": preprocessor_path,
+        "preprocessor_latest": latest_preprocessor_path,
     }
 
     if detector.calibration_report_ is not None:
@@ -831,6 +843,8 @@ def _train_from_dataframe(
         "pipeline_latest": latest_pipeline_path,
         "metadata_path": metadata_path,
         "metadata_latest": latest_meta_path,
+        "preprocessor_path": preprocessor_path,
+        "preprocessor_latest": latest_preprocessor_path,
         "packets": len(working_df),
         "flows": len(working_df),
         "malicious": int(is_malicious.sum()),
@@ -850,6 +864,7 @@ def _train_from_dataframe(
         "projection_dim": metadata.get("projection_dim"),
         "preprocessor": preprocessor_metadata,
         "rbf_components": used_components,
+        "rbf_n_components": used_components,
         "rbf_gamma": used_gamma,
     }
 
