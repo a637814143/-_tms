@@ -14,10 +14,30 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
+from pandas.api.types import is_numeric_dtype
+from sklearn.metrics import (
+    auc,
+    average_precision_score,
+    precision_recall_curve,
+    roc_curve,
+)
 
 from src.functions.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+EXPLANATION_EXCLUDE_COLUMNS = {
+    "anomaly_score",
+    "anomaly_confidence",
+    "vote_ratio",
+    "risk_score",
+    "is_malicious",
+    "__TAG__",
+    "pcap_file",
+    "__source_file__",
+    "__source_path__",
+    "flow_id",
+}
 
 
 def _resolve_data_base() -> str:
@@ -371,7 +391,26 @@ def analyze_results(
     plt.close()
 
     # 3) Top20 异常包（分数越小越异常）
-    top20 = df.sort_values("anomaly_score").head(20)
+    explanation_numeric_cols = [
+        col
+        for col in df.columns
+        if col not in EXPLANATION_EXCLUDE_COLUMNS and is_numeric_dtype(df[col])
+    ]
+    top20 = df.sort_values("anomaly_score").head(20).copy()
+    if explanation_numeric_cols:
+        mu = df[explanation_numeric_cols].mean()
+        sigma = df[explanation_numeric_cols].std(ddof=0).replace(0, 1e-6)
+
+        def _top_reasons(row: pd.Series, k: int = 3) -> str:
+            try:
+                z_scores = ((row[explanation_numeric_cols] - mu) / sigma).abs()
+            except Exception:
+                return ""
+            z_scores = z_scores.sort_values(ascending=False)
+            pairs = [f"{col}:{z_scores[col]:.2f}" for col in z_scores.head(k).index]
+            return ";".join(pairs)
+
+        top20["top_reasons"] = top20.apply(_top_reasons, axis=1)
     out3 = os.path.join(out_dir, "top20_packets.csv")
     top20.to_csv(out3, index=False, encoding="utf-8")
 
@@ -440,6 +479,11 @@ def analyze_results(
     metrics_rows: List[Dict[str, object]] = []
     base_metrics: Optional[Dict[str, float]] = None
     train_metrics: Optional[Dict[str, float]] = None
+    roc_plot_path: Optional[str] = None
+    pr_plot_path: Optional[str] = None
+    roc_auc_val: Optional[float] = None
+    pr_auc_val: Optional[float] = None
+    avg_precision_val: Optional[float] = None
 
     if ground_truth is not None:
         preds_actual = df["is_malicious"].astype(int, copy=False).to_numpy()
@@ -467,11 +511,76 @@ def analyze_results(
                 }
             )
 
+        unique_truth = np.unique(ground_truth)
+        if unique_truth.size > 1:
+            if "risk_score" in df.columns:
+                score_like = df["risk_score"].astype("float64", copy=False)
+            elif "anomaly_confidence" in df.columns:
+                score_like = df["anomaly_confidence"].astype("float64", copy=False)
+            else:
+                score_like = -df["anomaly_score"].astype("float64", copy=False)
+
+            score_array = np.asarray(score_like, dtype=float)
+            try:
+                fpr, tpr, _ = roc_curve(ground_truth, score_array)
+                roc_auc_val = float(auc(fpr, tpr)) if fpr.size and tpr.size else None
+                if roc_auc_val is not None:
+                    plt.figure(figsize=(6, 5))
+                    plt.plot(fpr, tpr, label=f"AUC={roc_auc_val:.3f}")
+                    plt.plot([0, 1], [0, 1], linestyle="--", color="#999999")
+                    plt.xlabel("False Positive Rate")
+                    plt.ylabel("True Positive Rate")
+                    plt.title("ROC Curve")
+                    plt.legend(loc="lower right")
+                    plt.tight_layout()
+                    roc_plot_path = os.path.join(out_dir, "roc_curve.png")
+                    plt.savefig(roc_plot_path)
+                    plt.close()
+
+                precision_curve, recall_curve, _ = precision_recall_curve(
+                    ground_truth, score_array
+                )
+                if recall_curve.size and precision_curve.size:
+                    pr_auc_val = float(auc(recall_curve, precision_curve))
+                    avg_precision_val = float(
+                        average_precision_score(ground_truth, score_array)
+                    )
+                    plt.figure(figsize=(6, 5))
+                    plt.plot(
+                        recall_curve,
+                        precision_curve,
+                        label=f"PR AUC={pr_auc_val:.3f}",
+                    )
+                    plt.xlabel("Recall")
+                    plt.ylabel("Precision")
+                    plt.title("Precision-Recall Curve")
+                    plt.legend(loc="upper right")
+                    plt.tight_layout()
+                    pr_plot_path = os.path.join(out_dir, "precision_recall_curve.png")
+                    plt.savefig(pr_plot_path)
+                    plt.close()
+            except Exception as exc:
+                logger.warning("Failed to compute ROC/PR curves: %s", exc)
+
     metrics_csv_path = None
+    metrics_json_path = None
     if metrics_rows:
         metrics_df = pd.DataFrame(metrics_rows)
         metrics_csv_path = os.path.join(out_dir, "threshold_evaluation.csv")
         metrics_df.to_csv(metrics_csv_path, index=False, encoding="utf-8")
+
+    if ground_truth is not None:
+        metrics_summary_payload = {
+            "ground_truth_column": ground_truth_column,
+            "model_metrics": base_metrics,
+            "train_threshold_metrics": train_metrics,
+            "roc_auc": roc_auc_val,
+            "pr_auc": pr_auc_val,
+            "average_precision": avg_precision_val,
+        }
+        metrics_json_path = os.path.join(out_dir, "metrics.json")
+        with open(metrics_json_path, "w", encoding="utf-8") as fh:
+            json.dump(metrics_summary_payload, fh, ensure_ascii=False, indent=2)
 
     single_file_status = None
     if unique_files == 1:
@@ -498,6 +607,12 @@ def analyze_results(
                 train_metrics["f1"],
             )
         )
+    if roc_auc_val is not None and pr_auc_val is not None:
+        summary_lines.append(
+            f"ROC AUC：{roc_auc_val:.3f}；PR AUC：{pr_auc_val:.3f}"
+        )
+    if avg_precision_val is not None:
+        summary_lines.append(f"平均精度 (AP)：{avg_precision_val:.3f}")
     if single_file_status:
         summary_lines.append(f"单文件判定：{single_file_status}")
     if anomalous_files:
@@ -541,6 +656,12 @@ def analyze_results(
         "ground_truth_column": ground_truth_column,
         "metadata_path": metadata_path,
         "score_std_train": score_std_train,
+        "roc_auc": roc_auc_val,
+        "pr_auc": pr_auc_val,
+        "average_precision": avg_precision_val,
+        "metrics_json": metrics_json_path,
+        "roc_plot": roc_plot_path,
+        "pr_plot": pr_plot_path,
     }
 
     export_payload = {
@@ -574,7 +695,7 @@ def analyze_results(
         )
 
     payload = {
-        "plots": [p for p in (out1, out2) if p],
+        "plots": [p for p in (out1, out2, roc_plot_path, pr_plot_path) if p],
         "top20_csv": out3,
         "out_dir": out_dir,
         "summary_csv": summary_path,
@@ -583,6 +704,7 @@ def analyze_results(
         "metrics": details_payload,
         "export_payload": export_payload,
         "metrics_csv": metrics_csv_path,
+        "metrics_json": metrics_json_path,
     }
 
     return payload

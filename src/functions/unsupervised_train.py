@@ -483,6 +483,8 @@ def _train_from_dataframe(
     feature_columns_hint: Optional[List[str]] = None,
     rbf_components: Optional[int] = None,
     rbf_gamma: Optional[float] = None,
+    fill_values: Optional[Dict[str, object]] = None,
+    categorical_maps: Optional[Dict[str, Dict[str, object]]] = None,
 ) -> dict:
     if df.empty:
         raise RuntimeError("训练数据为空。")
@@ -509,7 +511,12 @@ def _train_from_dataframe(
         random_state=42,
     )
 
-    preprocessor = PreprocessPipeline(feature_order=feature_columns, fill_value=0.0)
+    preprocessor = PreprocessPipeline(
+        feature_order=feature_columns,
+        fill_value=0.0,
+        fill_values=fill_values,
+        categorical_maps=categorical_maps,
+    )
     feature_df_numeric = feature_df.loc[:, feature_columns].copy()
 
     sample_count = len(feature_df_numeric)
@@ -521,7 +528,8 @@ def _train_from_dataframe(
         used_components = int(rbf_components)
     else:
         used_components = auto_components
-    used_gamma = float(rbf_gamma) if rbf_gamma and rbf_gamma > 0 else 0.2
+    auto_gamma = float(np.clip(1.0 / np.sqrt(float(base_dim)), 0.05, 0.5))
+    used_gamma = float(rbf_gamma) if rbf_gamma and rbf_gamma > 0 else auto_gamma
 
     pipeline_steps = [
         ("preprocessor", preprocessor),
@@ -890,6 +898,8 @@ def _train_from_preprocessed_csv(
     manifest_path = _manifest_path_for(dataset_path)
     manifest_col = None
     feature_columns_hint: Optional[List[str]] = None
+    fill_values_hint: Optional[Dict[str, object]] = None
+    categorical_maps_hint: Optional[Dict[str, Dict[str, object]]] = None
 
     meta_path = _meta_path_for(dataset_path)
     if os.path.exists(meta_path):
@@ -900,6 +910,17 @@ def _train_from_preprocessed_csv(
                 cols = meta_payload.get("feature_columns")
                 if isinstance(cols, list):
                     feature_columns_hint = [str(col) for col in cols]
+                fill_values_hint = meta_payload.get("fill_values") or meta_payload.get("fill_strategies")
+                if fill_values_hint is not None:
+                    fill_values_hint = {
+                        str(k): v for k, v in dict(fill_values_hint).items()
+                    }
+                categorical_maps_raw = meta_payload.get("categorical_maps")
+                if isinstance(categorical_maps_raw, dict):
+                    categorical_maps_hint = {
+                        str(k): dict(v) if isinstance(v, dict) else {}
+                        for k, v in categorical_maps_raw.items()
+                    }
         except Exception as exc:
             print(f"[WARN] 读取元数据失败 {meta_path}: {exc}")
 
@@ -936,6 +957,8 @@ def _train_from_preprocessed_csv(
         feature_columns_hint=feature_columns_hint,
         rbf_components=rbf_components,
         rbf_gamma=rbf_gamma,
+        fill_values=fill_values_hint,
+        categorical_maps=categorical_maps_hint,
     )
 
 
@@ -972,6 +995,28 @@ def _train_from_npz(
     if progress_cb:
         progress_cb(40)
 
+    fill_values_hint: Optional[Dict[str, object]] = None
+    categorical_maps_hint: Optional[Dict[str, Dict[str, object]]] = None
+    meta_path = _meta_path_for(dataset_path)
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta_payload = json.load(fh)
+            if isinstance(meta_payload, dict):
+                fill_values_hint = meta_payload.get("fill_values") or meta_payload.get("fill_strategies")
+                if fill_values_hint is not None:
+                    fill_values_hint = {
+                        str(k): v for k, v in dict(fill_values_hint).items()
+                    }
+                categorical_maps_raw = meta_payload.get("categorical_maps")
+                if isinstance(categorical_maps_raw, dict):
+                    categorical_maps_hint = {
+                        str(k): dict(v) if isinstance(v, dict) else {}
+                        for k, v in categorical_maps_raw.items()
+                    }
+        except Exception as exc:
+            print(f"[WARN] 读取元数据失败 {meta_path}: {exc}")
+
     return _train_from_dataframe(
         df,
         results_dir=results_dir,
@@ -983,6 +1028,8 @@ def _train_from_npz(
         feature_columns_hint=list(columns),
         rbf_components=rbf_components,
         rbf_gamma=rbf_gamma,
+        fill_values=fill_values_hint,
+        categorical_maps=categorical_maps_hint,
     )
 
 
@@ -1030,6 +1077,8 @@ def _train_from_npy(
         manifest_col = "pcap_file"
 
     feature_columns_hint: Optional[List[str]] = list(columns)
+    fill_values_hint: Optional[Dict[str, object]] = None
+    categorical_maps_hint: Optional[Dict[str, Dict[str, object]]] = None
     meta_path = _meta_path_for(dataset_path)
     if os.path.exists(meta_path):
         try:
@@ -1038,6 +1087,17 @@ def _train_from_npy(
             cols = meta_payload.get("feature_columns")
             if isinstance(cols, list) and cols:
                 feature_columns_hint = [str(col) for col in cols]
+            fill_values_hint = meta_payload.get("fill_values") or meta_payload.get("fill_strategies")
+            if fill_values_hint is not None:
+                fill_values_hint = {
+                    str(k): v for k, v in dict(fill_values_hint).items()
+                }
+            categorical_maps_raw = meta_payload.get("categorical_maps")
+            if isinstance(categorical_maps_raw, dict):
+                categorical_maps_hint = {
+                    str(k): dict(v) if isinstance(v, dict) else {}
+                    for k, v in categorical_maps_raw.items()
+                }
         except Exception as exc:
             print(f"[WARN] 读取元数据失败 {meta_path}: {exc}")
 
@@ -1055,6 +1115,8 @@ def _train_from_npy(
         feature_columns_hint=feature_columns_hint,
         rbf_components=rbf_components,
         rbf_gamma=rbf_gamma,
+        fill_values=fill_values_hint,
+        categorical_maps=categorical_maps_hint,
     )
 
 

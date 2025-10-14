@@ -410,6 +410,7 @@ class Ui_MainWindow(object):
         self._build_paging_toolbar()
         self._build_output_list()
         self._build_footer()
+        self._update_status_message("@2025 恶意流量检测系统")
 
         self.splitter.addWidget(self.left_scroll)
 
@@ -589,10 +590,36 @@ class Ui_MainWindow(object):
         self.bottom_bar.setFixedHeight(22)
         bb = QtWidgets.QHBoxLayout(self.bottom_bar)
         bb.setContentsMargins(6, 0, 6, 0); bb.addStretch()
-        self.bottom_label = QtWidgets.QLabel("@2025  恶意流量检测系统")
+        self.bottom_label = QtWidgets.QLabel()
         self.bottom_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         bb.addWidget(self.bottom_label)
         self.left_layout.addWidget(self.bottom_bar)
+
+    def _action_buttons(self) -> List[QtWidgets.QPushButton]:
+        return [
+            btn
+            for btn in (
+                getattr(self, "btn_view", None),
+                getattr(self, "btn_fe", None),
+                getattr(self, "btn_vector", None),
+                getattr(self, "btn_train", None),
+                getattr(self, "btn_analysis", None),
+                getattr(self, "btn_predict", None),
+                getattr(self, "btn_export", None),
+            )
+            if btn is not None
+        ]
+
+    def _set_action_buttons_enabled(self, enabled: bool) -> None:
+        for btn in self._action_buttons():
+            btn.setEnabled(enabled)
+
+    def _update_status_message(self, message: Optional[str] = None) -> None:
+        base = f"数据目录: {DATA_BASE}"
+        if message:
+            self.bottom_label.setText(f"{message} | {base}")
+        else:
+            self.bottom_label.setText(base)
 
     def _build_right_panel(self):
         self.right_frame = QtWidgets.QFrame(self.centralwidget)
@@ -612,7 +639,7 @@ class Ui_MainWindow(object):
         self.rbf_gamma_spin.setRange(0.0, 5.0)
         self.rbf_gamma_spin.setDecimals(4)
         self.rbf_gamma_spin.setSingleStep(0.05)
-        self.rbf_gamma_spin.setSpecialValueText("自动 (0.2)")
+        self.rbf_gamma_spin.setSpecialValueText("自动 (≈1/√d)")
         self.rbf_gamma_spin.setValue(0.0)
         ag_layout.addRow("RBF 维度：", self.rbf_components_spin)
         ag_layout.addRow("RBF γ：", self.rbf_gamma_spin)
@@ -1098,6 +1125,7 @@ class Ui_MainWindow(object):
         if len(file_list) > 100: self.display_result(f" ...（其余 {len(file_list) - 100} 个省略显示）")
         self.display_result(f"[INFO] 正在解析 {path} ...", True)
 
+        self._set_action_buttons_enabled(False)
         self.btn_view.setEnabled(False); self.set_button_progress(self.btn_view, 0)
 
         self.worker = InfoWorker(
@@ -1118,6 +1146,7 @@ class Ui_MainWindow(object):
         self.set_button_progress(self.btn_view, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_view))
         self.worker = None
+        self._set_action_buttons_enabled(True)
 
         if pd is not None and isinstance(df, pd.DataFrame):
             df = self._auto_tag_dataframe(df)
@@ -1153,13 +1182,15 @@ class Ui_MainWindow(object):
                 head_txt = "(预览生成失败)"
             self.display_result(f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}", append=False)
             rows = len(df) if hasattr(df, "__len__") else 0
-            self.bottom_label.setText(f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个  @2025")
+            status = f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个"
+            self._update_status_message(status)
         if errs:
             for e in errs.split("\n"):
                 if e.strip(): self.display_result(e)
 
     def _on_worker_error(self, msg):
         self.btn_view.setEnabled(True); self.reset_button_progress(self.btn_view)
+        self._set_action_buttons_enabled(True)
         self.worker = None
         QtWidgets.QMessageBox.critical(None, "解析失败", msg)
         self.display_result(f"[错误] 解析失败: {msg}")
@@ -1255,6 +1286,7 @@ class Ui_MainWindow(object):
         out_dir = self._default_csv_feature_dir()
         os.makedirs(out_dir, exist_ok=True)
 
+        self._set_action_buttons_enabled(False)
         if os.path.isdir(path):
             self.display_result(f"[INFO] 目录特征提取：{path} -> {out_dir}")
             self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
@@ -1278,6 +1310,7 @@ class Ui_MainWindow(object):
         self.btn_fe.setEnabled(True)
         self.set_button_progress(self.btn_fe, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
+        self._set_action_buttons_enabled(True)
         self.display_result(f"[INFO] 特征提取完成，CSV已保存: {csv}")
         self._add_output(csv)
         try:
@@ -1292,6 +1325,7 @@ class Ui_MainWindow(object):
         self.btn_fe.setEnabled(True)
         self.set_button_progress(self.btn_fe, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
+        self._set_action_buttons_enabled(True)
         self.display_result(f"[INFO] 目录特征提取完成：共 {len(csv_list)} 个 CSV")
         for p in csv_list:
             if os.path.exists(p): self._add_output(p)
@@ -1307,6 +1341,7 @@ class Ui_MainWindow(object):
 
     def _on_fe_error(self, msg):
         self.btn_fe.setEnabled(True); self.reset_button_progress(self.btn_fe)
+        self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "特征提取失败", msg)
         self.display_result(f"[错误] 特征提取失败: {msg}")
 
@@ -1334,6 +1369,7 @@ class Ui_MainWindow(object):
                 self._remember_path(preview)
 
         self.display_result(f"[INFO] 数据预处理：{preview} -> {out_dir}")
+        self._set_action_buttons_enabled(False)
         self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
         self.preprocess_worker = PreprocessWorker(feature_source, out_dir)
         self.preprocess_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
@@ -1346,6 +1382,7 @@ class Ui_MainWindow(object):
         self.set_button_progress(self.btn_vector, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_vector))
         self.preprocess_worker = None
+        self._set_action_buttons_enabled(True)
 
         data = result if isinstance(result, dict) else {}
         dataset = data.get("dataset_path")
@@ -1376,6 +1413,7 @@ class Ui_MainWindow(object):
     def _on_preprocess_error(self, msg):
         self.btn_vector.setEnabled(True)
         self.reset_button_progress(self.btn_vector)
+        self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "数据预处理失败", msg)
         self.display_result(f"[错误] 数据预处理失败: {msg}")
         self.preprocess_worker = None
@@ -1397,6 +1435,7 @@ class Ui_MainWindow(object):
         os.makedirs(res_dir, exist_ok=True); os.makedirs(mdl_dir, exist_ok=True)
 
         self.display_result(f"[INFO] 开始训练，输入: {path}")
+        self._set_action_buttons_enabled(False)
         self.btn_train.setEnabled(False); self.set_button_progress(self.btn_train, 1)
         comp = self.rbf_components_spin.value()
         gamma = self.rbf_gamma_spin.value()
@@ -1416,6 +1455,7 @@ class Ui_MainWindow(object):
         self.btn_train.setEnabled(True)
         self.set_button_progress(self.btn_train, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_train))
+        self._set_action_buttons_enabled(True)
         msg_lines = [
             "results:",
             f"- {res.get('results_csv')}",
@@ -1456,6 +1496,7 @@ class Ui_MainWindow(object):
 
     def _on_train_error(self, msg):
         self.btn_train.setEnabled(True); self.reset_button_progress(self.btn_train)
+        self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "训练失败", msg)
         self.display_result(f"[错误] 训练失败: {msg}")
 
@@ -1475,6 +1516,7 @@ class Ui_MainWindow(object):
 
         self.display_result(f"[INFO] 正在分析结果 -> {out_dir}")
         self._analysis_summary = None
+        self._set_action_buttons_enabled(False)
         self.btn_analysis.setEnabled(False); self.set_button_progress(self.btn_analysis, 1)
         _, meta_path = self._latest_pipeline_bundle()
         self.analysis_worker = AnalysisWorker(csv, out_dir, metadata_path=meta_path)
@@ -1487,6 +1529,7 @@ class Ui_MainWindow(object):
         self.btn_analysis.setEnabled(True)
         self.set_button_progress(self.btn_analysis, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_analysis))
+        self._set_action_buttons_enabled(True)
         out_dir = None
         plot_paths: List[str] = []
         top20_csv: Optional[str] = None
@@ -1567,6 +1610,7 @@ class Ui_MainWindow(object):
 
     def _on_analysis_error(self, msg):
         self.btn_analysis.setEnabled(True); self.reset_button_progress(self.btn_analysis)
+        self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "分析失败", msg)
         self.display_result(f"[错误] 分析失败: {msg}")
         self._analysis_summary = None
@@ -1906,7 +1950,7 @@ class Ui_MainWindow(object):
             self.table_view.setModel(None)
             self.display_tabs.setCurrentWidget(self.results_widget)
             self.output_list.clear()
-            self.bottom_label.setText("@2025  恶意流量检测系统")
+            self._update_status_message("@2025 恶意流量检测系统")
             self._csv_paged_path = None
             self._csv_total_rows = None
             self._csv_current_page = 1
