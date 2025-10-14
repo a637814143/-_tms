@@ -91,6 +91,18 @@ def _inter_arrivals(times: List[float]) -> np.ndarray:
     return arr[arr >= 0]
 
 
+def _burstiness(arr: np.ndarray) -> float:
+    if arr.size < 2:
+        return 0.0
+    mean = float(arr.mean())
+    if mean <= 1e-9:
+        return 0.0
+    std = float(arr.std(ddof=0))
+    if std <= 1e-9:
+        return 0.0
+    return float(np.clip(std / mean, 0.0, 1e3))
+
+
 @dataclass
 class FlowAccumulator:
     src_ip: str
@@ -139,6 +151,8 @@ class FlowAccumulator:
                     "std": 0.0,
                     "max": 0,
                     "min": 0,
+                    "median": 0.0,
+                    "iqr": 0.0,
                 }
             arr = np.array(values, dtype=float)
             return {
@@ -148,6 +162,8 @@ class FlowAccumulator:
                 "std": float(arr.std(ddof=0)) if arr.size > 1 else 0.0,
                 "max": float(arr.max()),
                 "min": float(arr.min()),
+                "median": float(np.median(arr)),
+                "iqr": float(max(0.0, np.quantile(arr, 0.75) - np.quantile(arr, 0.25))),
             }
 
         fwd_stats = _stats(self.forward_lengths)
@@ -163,6 +179,47 @@ class FlowAccumulator:
 
         fwd_intervals = _inter_arrivals(self.forward_times)
         bwd_intervals = _inter_arrivals(self.backward_times)
+
+        def _interval_metrics(arr: np.ndarray) -> Dict[str, float]:
+            if arr.size == 0:
+                return {
+                    "mean": 0.0,
+                    "std": 0.0,
+                    "median": 0.0,
+                    "p90": 0.0,
+                    "p95": 0.0,
+                    "max": 0.0,
+                    "burstiness": 0.0,
+                }
+            return {
+                "mean": float(arr.mean()),
+                "std": float(arr.std(ddof=0)) if arr.size > 1 else 0.0,
+                "median": float(np.quantile(arr, 0.5)),
+                "p90": float(np.quantile(arr, 0.9)),
+                "p95": float(np.quantile(arr, 0.95)),
+                "max": float(arr.max()),
+                "burstiness": _burstiness(arr),
+            }
+
+        fwd_interval_stats = _interval_metrics(fwd_intervals)
+        bwd_interval_stats = _interval_metrics(bwd_intervals)
+
+        def _flag_rate(counter: Counter, name: str, total: int) -> float:
+            if total <= 0:
+                return 0.0
+            return float(counter.get(name, 0)) / float(total)
+
+        def _flag_imbalance(flag: str) -> float:
+            numerator = abs(
+                float(self.forward_flags.get(flag, 0))
+                - float(self.backward_flags.get(flag, 0))
+            )
+            denominator = float(
+                self.forward_flags.get(flag, 0) + self.backward_flags.get(flag, 0)
+            )
+            if denominator <= 0:
+                return 0.0
+            return numerator / denominator
 
         features: Dict[str, float] = {
             "pcap_file": self.pcap_file,
@@ -187,15 +244,44 @@ class FlowAccumulator:
             "bwd_pkt_len_max": bwd_stats["max"],
             "fwd_pkt_len_min": fwd_stats["min"],
             "bwd_pkt_len_min": bwd_stats["min"],
+            "fwd_pkt_len_median": fwd_stats["median"],
+            "bwd_pkt_len_median": bwd_stats["median"],
+            "fwd_pkt_len_iqr": fwd_stats["iqr"],
+            "bwd_pkt_len_iqr": bwd_stats["iqr"],
             "throughput_bytes_s": total_bytes / duration if duration > 0 else 0.0,
             "packets_per_s": total_packets / duration if duration > 0 else 0.0,
             "fwd_bwd_pkt_ratio": (fwd_stats["count"] / bwd_stats["count"]) if bwd_stats["count"] else float(fwd_stats["count"]),
             "fwd_bwd_byte_ratio": (fwd_stats["total"] / bwd_stats["total"]) if bwd_stats["total"] else float(fwd_stats["total"]),
-            "mean_fwd_inter": float(fwd_intervals.mean()) if fwd_intervals.size else 0.0,
-            "mean_bwd_inter": float(bwd_intervals.mean()) if bwd_intervals.size else 0.0,
-            "std_fwd_inter": float(fwd_intervals.std(ddof=0)) if fwd_intervals.size > 1 else 0.0,
-            "std_bwd_inter": float(bwd_intervals.std(ddof=0)) if bwd_intervals.size > 1 else 0.0,
+            "flow_duration_log": float(np.log1p(duration)),
+            "avg_pkt_size": (total_bytes / total_packets) if total_packets else 0.0,
+            "byte_symmetry": float(
+                abs(fwd_stats["total"] - bwd_stats["total"])
+                / max(total_bytes, 1.0)
+            ),
+            "packet_symmetry": float(
+                abs(fwd_stats["count"] - bwd_stats["count"])
+                / max(total_packets, 1)
+            ),
+            "mean_fwd_inter": fwd_interval_stats["mean"],
+            "mean_bwd_inter": bwd_interval_stats["mean"],
+            "std_fwd_inter": fwd_interval_stats["std"],
+            "std_bwd_inter": bwd_interval_stats["std"],
+            "median_fwd_inter": fwd_interval_stats["median"],
+            "median_bwd_inter": bwd_interval_stats["median"],
+            "p90_fwd_inter": fwd_interval_stats["p90"],
+            "p90_bwd_inter": bwd_interval_stats["p90"],
+            "p95_fwd_inter": fwd_interval_stats["p95"],
+            "p95_bwd_inter": bwd_interval_stats["p95"],
+            "max_fwd_inter": fwd_interval_stats["max"],
+            "max_bwd_inter": bwd_interval_stats["max"],
+            "burstiness_fwd": fwd_interval_stats["burstiness"],
+            "burstiness_bwd": bwd_interval_stats["burstiness"],
         }
+
+        max_idle = max(fwd_interval_stats["max"], bwd_interval_stats["max"])
+        features["idle_time_fraction"] = (
+            float(np.clip(max_idle / duration, 0.0, 1.0)) if duration > 0 else 0.0
+        )
 
         features.update(_hist_features(self.forward_lengths, LENGTH_BINS, "fwd_len_bin"))
         features.update(_hist_features(self.backward_lengths, LENGTH_BINS, "bwd_len_bin"))
@@ -211,6 +297,18 @@ class FlowAccumulator:
         for flag in TCP_FLAG_MAP:
             features.setdefault(f"fwd_flag_{flag}", 0)
             features.setdefault(f"bwd_flag_{flag}", 0)
+            features[f"fwd_flag_{flag}_rate"] = _flag_rate(
+                self.forward_flags, flag, fwd_stats["count"]
+            )
+            features[f"bwd_flag_{flag}_rate"] = _flag_rate(
+                self.backward_flags, flag, bwd_stats["count"]
+            )
+            features[f"flag_{flag}_imbalance"] = _flag_imbalance(flag)
+
+        rst_total = self.forward_flags.get("rst", 0) + self.backward_flags.get("rst", 0)
+        features["rst_to_packet_ratio"] = (
+            float(rst_total) / float(total_packets) if total_packets else 0.0
+        )
 
         return features
 
