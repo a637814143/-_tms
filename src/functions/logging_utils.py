@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Dict
 
@@ -24,17 +25,32 @@ def get_logger(name: str) -> logging.Logger:
         return _LOGGERS[name]
 
     logger = logging.getLogger(name)
-    if not logger.handlers:
-        logger.setLevel(logging.INFO)
-        log_dir = _resolve_log_dir()
-        safe_name = name.replace("/", "_").replace(".", "_")
-        handler = logging.FileHandler(log_dir / f"{safe_name}.log", encoding="utf-8")
-        formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        # 控制台打印保持默认级别，由外部控制
+    if logger.handlers:
+        _LOGGERS[name] = logger
+        return logger
+
+    logger.setLevel(logging.INFO)
+    log_dir = _resolve_log_dir()
+    safe_name = name.replace("/", "_").replace(".", "_")
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    file_handler = TimedRotatingFileHandler(
+        log_dir / f"{safe_name}.log",
+        when="D",
+        interval=1,
+        backupCount=7,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.propagate = False
+
     _LOGGERS[name] = logger
     return logger

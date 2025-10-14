@@ -1,191 +1,217 @@
-"""Reusable feature preprocessing transformers for flow anomaly detection."""
+"""Simple preprocessing utilities to align flow features across train/infer stages."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
-import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 from sklearn.base import BaseEstimator, TransformerMixin
 
-MISSING_TOKEN = "<MISSING>"
+
+def _maybe_float(value: object) -> object:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return value
 
 
-def _ensure_dataframe(X: object, columns: Optional[Iterable[str]] = None) -> pd.DataFrame:
-    if isinstance(X, pd.DataFrame):
-        return X.copy()
-    if isinstance(X, pd.Series):
-        return X.to_frame().T.copy()
-    if isinstance(X, np.ndarray):
-        if columns is None:
-            raise ValueError("NumPy 数组缺少列名，无法恢复原始特征顺序。")
-        if X.ndim != 2:
-            raise ValueError("输入数组必须是二维的")
-        return pd.DataFrame(X, columns=list(columns))
-    raise TypeError(f"不支持的输入类型: {type(X)!r}")
-
-
-@dataclass
-class _CategoricalSchema:
-    source: str
-    labels: List[str]
-    missing_token: str = MISSING_TOKEN
-
-    def to_dict(self) -> Dict[str, object]:
-        return {
-            "source": self.source,
-            "labels": list(self.labels),
-            "missing_token": self.missing_token,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: Dict[str, object]) -> "_CategoricalSchema":
-        source = str(payload.get("source", ""))
-        labels_raw = payload.get("labels") or []
-        labels = [str(item) for item in labels_raw]
-        missing = str(payload.get("missing_token", MISSING_TOKEN))
-        return cls(source=source, labels=labels, missing_token=missing)
-
-
-class FlowFeaturePreprocessor(BaseEstimator, TransformerMixin):
-    """统一的特征对齐与编码器，用于训练与推理阶段保持一致。"""
+class FeatureAligner(BaseEstimator, TransformerMixin):
+    """Ensure a deterministic column order and fill missing columns."""
 
     def __init__(
         self,
-        *,
-        feature_columns: Optional[List[str]] = None,
-        fill_values: Optional[Dict[str, float]] = None,
-        categorical_maps: Optional[Dict[str, Dict[str, object]]] = None,
+        feature_order: Iterable[str],
+        fill_value: float = 0.0,
+        column_fill_values: Optional[Dict[str, object]] = None,
     ) -> None:
-        self.feature_columns = list(feature_columns) if feature_columns else None
-        self.initial_fill_values = dict(fill_values) if fill_values else None
-        self.initial_categorical_maps = (
-            {key: dict(value) for key, value in categorical_maps.items()}
-            if categorical_maps
-            else None
-        )
+        self.feature_order = list(feature_order)
+        self.fill_value = float(fill_value)
+        self.column_fill_values: Dict[str, object] = {
+            str(k): v for k, v in (column_fill_values or {}).items()
+        }
 
-    def fit(self, X: object, y: Optional[object] = None):  # noqa: D401 - scikit-learn API
-        df = _ensure_dataframe(X, self.feature_columns)
-        if self.feature_columns is None:
-            self.feature_columns_ = [str(col) for col in df.columns]
-        else:
-            self.feature_columns_ = [str(col) for col in self.feature_columns]
-        missing = [col for col in self.feature_columns_ if col not in df.columns]
-        if missing:
-            raise ValueError(f"训练数据缺少特征列: {', '.join(missing)}")
-
-        self.fill_values_: Dict[str, float] = {}
-        if self.initial_fill_values:
-            self.fill_values_.update({str(k): float(v) for k, v in self.initial_fill_values.items()})
-
-        self.categorical_maps_: Dict[str, _CategoricalSchema] = {}
-        if self.initial_categorical_maps:
-            for key, payload in self.initial_categorical_maps.items():
-                self.categorical_maps_[str(key)] = _CategoricalSchema.from_dict(payload)
-
-        transformed_blocks: List[pd.Series] = []
-        for column in self.feature_columns_:
-            series = df[column]
-            if pd.api.types.is_bool_dtype(series):
-                numeric = series.fillna(False).astype(bool).astype("int8")
-                self.fill_values_.setdefault(column, 0.0)
-                transformed_blocks.append(numeric.astype("float32"))
-            elif pd.api.types.is_numeric_dtype(series):
-                numeric = pd.to_numeric(series, errors="coerce")
-                if column not in self.fill_values_:
-                    non_na = numeric.dropna()
-                    median = float(non_na.median()) if not non_na.empty else 0.0
-                    if np.isnan(median) or np.isinf(median):
-                        median = float(non_na.iloc[0]) if not non_na.empty else 0.0
-                    self.fill_values_[column] = median
-                transformed_blocks.append(numeric.astype("float32"))
-            else:
-                normalized = series.fillna(MISSING_TOKEN).astype(str).str.strip()
-                normalized = normalized.replace("", MISSING_TOKEN)
-                schema = self.categorical_maps_.get(column)
-                if schema is None:
-                    labels: List[str] = []
-                    mapping: Dict[str, int] = {}
-                    for value in normalized.drop_duplicates():
-                        value_str = str(value)
-                        if value_str not in mapping:
-                            mapping[value_str] = len(labels)
-                            labels.append(value_str)
-                    schema = _CategoricalSchema(source=column, labels=labels)
-                    self.categorical_maps_[column] = schema
-                transformed_blocks.append(normalized.astype("string"))
-                self.fill_values_.setdefault(column, -1.0)
-
-        self.feature_names_in_ = np.asarray(self.feature_columns_, dtype=object)
-        self.output_feature_names_ = list(self.feature_columns_)
-        self._fitted = True
+    def fit(self, X, y: Optional[object] = None):  # noqa: D401 - sklearn signature
         return self
 
-    def transform(self, X: object) -> np.ndarray:  # noqa: D401 - scikit-learn API
-        if not getattr(self, "_fitted", False):
-            raise RuntimeError("FlowFeaturePreprocessor 尚未 fit，无法 transform。")
-        df = _ensure_dataframe(X, self.feature_columns_)
-        row_count = len(df)
-        transformed_cols: List[np.ndarray] = []
+    def transform(self, X) -> pd.DataFrame:  # noqa: D401 - sklearn signature
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("FeatureAligner 仅支持 pandas DataFrame 输入。")
+        Xc = X.copy()
+        for col in self.feature_order:
+            if col not in Xc.columns:
+                fill = self.column_fill_values.get(col, self.fill_value)
+                Xc[col] = fill
+        return Xc[self.feature_order].copy()
 
-        for column in self.feature_columns_:
-            if column not in df.columns:
-                raise ValueError(f"输入数据缺少特征列: {column}")
-            series = df[column]
-            if pd.api.types.is_bool_dtype(series):
-                numeric = series.fillna(False).astype(bool).astype("int8")
-                transformed_cols.append(numeric.to_numpy(dtype="float32", copy=False))
-            elif pd.api.types.is_numeric_dtype(series):
-                numeric = pd.to_numeric(series, errors="coerce")
-                fill_value = self.fill_values_.get(column, 0.0)
-                filled = numeric.fillna(fill_value).astype("float32")
-                transformed_cols.append(filled.to_numpy(dtype="float32", copy=False))
-            else:
-                normalized = series.fillna(MISSING_TOKEN).astype(str).str.strip()
-                normalized = normalized.replace("", MISSING_TOKEN)
-                schema = self.categorical_maps_.get(column)
-                if schema is None:
-                    fill_value = int(self.fill_values_.get(column, -1.0))
-                    transformed_cols.append(np.full(row_count, fill_value, dtype="float32"))
-                    continue
-                mapping = {label: idx for idx, label in enumerate(schema.labels)}
-                codes = normalized.map(mapping).fillna(-1).astype("int32")
-                transformed_cols.append(codes.to_numpy(dtype="float32", copy=False))
-        if not transformed_cols:
-            return np.empty((row_count, 0), dtype="float32")
-        return np.column_stack(transformed_cols).astype("float32", copy=False)
-
-    def get_feature_names_out(self, input_features: Optional[List[str]] = None) -> np.ndarray:
-        if not getattr(self, "_fitted", False):
-            raise RuntimeError("FlowFeaturePreprocessor 尚未 fit，无法获取列名。")
-        return np.asarray(self.output_feature_names_, dtype=object)
-
-    # 序列化辅助
+    # metadata helpers -------------------------------------------------
     def to_metadata(self) -> Dict[str, object]:
-        if not getattr(self, "_fitted", False):
-            raise RuntimeError("FlowFeaturePreprocessor 尚未 fit，无法导出 schema。")
-        categorical = {
-            col: schema.to_dict() for col, schema in self.categorical_maps_.items()
-        }
         return {
-            "input_columns": list(self.feature_columns_),
-            "feature_columns": list(self.output_feature_names_),
-            "fill_values": {k: float(v) for k, v in self.fill_values_.items()},
-            "categorical_maps": categorical,
+            "feature_order": list(self.feature_order),
+            "fill_value": float(self.fill_value),
+            "column_fill_values": self.column_fill_values,
         }
 
     @classmethod
-    def from_metadata(cls, payload: Dict[str, object]) -> "FlowFeaturePreprocessor":
-        feature_columns = payload.get("input_columns") or payload.get("feature_columns")
-        fill_values = payload.get("fill_values") or {}
-        categorical_raw = payload.get("categorical_maps") or {}
-        categorical_maps = {
-            key: value for key, value in categorical_raw.items() if isinstance(value, dict)
-        }
+    def from_metadata(cls, payload: Dict[str, object]) -> "FeatureAligner":
+        feature_order = payload.get("feature_order") or []
+        fill_value = payload.get("fill_value", 0.0)
+        column_fill_values = payload.get("column_fill_values") or {}
         return cls(
-            feature_columns=list(feature_columns) if feature_columns else None,
+            feature_order=feature_order,
+            fill_value=float(fill_value),
+            column_fill_values=dict(column_fill_values),
+        )
+
+
+class SimpleImputerByDtype(BaseEstimator, TransformerMixin):
+    """Fill numeric columns with median and categorical with mode/empty string."""
+
+    def __init__(
+        self,
+        preset_numeric: Optional[Dict[str, object]] = None,
+        preset_categorical: Optional[Dict[str, object]] = None,
+    ) -> None:
+        self._preset_numeric = {
+            str(k): _maybe_float(v) for k, v in (preset_numeric or {}).items()
+        }
+        self._preset_categorical = {
+            str(k): v for k, v in (preset_categorical or {}).items()
+        }
+        self.num_median_: Dict[str, float] = {
+            k: float(v)
+            for k, v in self._preset_numeric.items()
+            if isinstance(v, (int, float))
+        }
+        self.cat_mode_: Dict[str, Any] = dict(self._preset_categorical)
+
+    def fit(self, X: pd.DataFrame, y: Optional[object] = None):  # noqa: D401
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("SimpleImputerByDtype 仅支持 pandas DataFrame 输入。")
+        for col in X.columns:
+            series = X[col]
+            if is_numeric_dtype(series):
+                if col in self._preset_numeric:
+                    value = self._preset_numeric[col]
+                    try:
+                        self.num_median_[col] = float(value)
+                        continue
+                    except (TypeError, ValueError):
+                        pass
+                numeric = pd.to_numeric(series, errors="coerce")
+                self.num_median_[col] = float(numeric.median()) if not numeric.dropna().empty else 0.0
+            else:
+                if col in self._preset_categorical:
+                    self.cat_mode_[col] = self._preset_categorical[col]
+                    continue
+                mode_series = series.mode(dropna=True)
+                if not mode_series.empty:
+                    self.cat_mode_[col] = mode_series.iloc[0]
+                else:
+                    self.cat_mode_[col] = ""
+        return self
+
+    def transform(self, X: pd.DataFrame) -> pd.DataFrame:  # noqa: D401
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("SimpleImputerByDtype 仅支持 pandas DataFrame 输入。")
+        Xc = X.copy()
+        for col in Xc.columns:
+            if col in self.num_median_:
+                numeric = pd.to_numeric(Xc[col], errors="coerce")
+                Xc[col] = numeric.fillna(self.num_median_[col])
+            elif col in self.cat_mode_:
+                Xc[col] = Xc[col].fillna(self.cat_mode_[col])
+        return Xc
+
+    def to_metadata(self) -> Dict[str, object]:
+        return {
+            "num_median": {k: float(v) for k, v in self.num_median_.items()},
+            "cat_mode": {k: ("" if v is None else v) for k, v in self.cat_mode_.items()},
+        }
+
+    @classmethod
+    def from_metadata(cls, payload: Dict[str, object]) -> "SimpleImputerByDtype":
+        num_meta = {k: _maybe_float(v) for k, v in (payload.get("num_median") or {}).items()}
+        cat_meta = dict(payload.get("cat_mode") or {})
+        inst = cls(preset_numeric=num_meta, preset_categorical=cat_meta)
+        inst.num_median_ = {k: float(v) for k, v in num_meta.items() if isinstance(v, (int, float))}
+        inst.cat_mode_ = dict(cat_meta)
+        return inst
+
+
+class PreprocessPipeline(BaseEstimator, TransformerMixin):
+    """Compose FeatureAligner and SimpleImputer for reuse between train/infer."""
+
+    def __init__(
+        self,
+        feature_order: Iterable[str],
+        fill_value: float = 0.0,
+        *,
+        fill_values: Optional[Dict[str, object]] = None,
+        categorical_maps: Optional[Dict[str, Dict[str, object]]] = None,
+    ) -> None:
+        self.feature_order = list(feature_order)
+        self.fill_value = float(fill_value)
+        self.fill_values = {
+            str(k): _maybe_float(v) for k, v in (fill_values or {}).items()
+        }
+        self.categorical_maps = {
+            str(k): dict(v) for k, v in (categorical_maps or {}).items()
+        }
+        categorical_fill = {
+            key: -1 for key in self.categorical_maps.keys()
+        }
+        column_fill_values = dict(categorical_fill)
+        column_fill_values.update(self.fill_values)
+
+        self.aligner = FeatureAligner(
+            self.feature_order,
+            self.fill_value,
+            column_fill_values=column_fill_values,
+        )
+        self.imputer = SimpleImputerByDtype(preset_numeric=self.fill_values)
+
+    def fit(self, X, y: Optional[object] = None):  # noqa: D401
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("PreprocessPipeline 仅支持 pandas DataFrame 输入。")
+        aligned = self.aligner.transform(X)
+        self.imputer.fit(aligned)
+        return self
+
+    def transform(self, X):  # noqa: D401
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("PreprocessPipeline 仅支持 pandas DataFrame 输入。")
+        aligned = self.aligner.transform(X)
+        return self.imputer.transform(aligned)
+
+    # metadata helpers -------------------------------------------------
+    def to_metadata(self) -> Dict[str, object]:
+        return {
+            "feature_order": list(self.feature_order),
+            "fill_value": float(self.fill_value),
+            "fill_values": self.fill_values,
+            "categorical_maps": self.categorical_maps,
+            "column_fill_values": self.aligner.column_fill_values,
+            "input_columns": list(self.feature_order),
+            "imputer": self.imputer.to_metadata(),
+        }
+
+    @classmethod
+    def from_metadata(cls, payload: Dict[str, object]) -> "PreprocessPipeline":
+        feature_order = payload.get("feature_order") or payload.get("input_columns") or []
+        fill_value = payload.get("fill_value", 0.0)
+        fill_values = payload.get("fill_values") or {}
+        categorical_maps = payload.get("categorical_maps") or {}
+        inst = cls(
+            feature_order=feature_order,
+            fill_value=float(fill_value),
             fill_values=fill_values,
             categorical_maps=categorical_maps,
         )
+        imputer_meta = payload.get("imputer") or {}
+        inst.imputer = SimpleImputerByDtype.from_metadata(imputer_meta)
+        # 覆盖 aligner 的列填充值，确保与训练阶段保持一致
+        column_fill_values = payload.get("column_fill_values") or {}
+        if column_fill_values:
+            inst.aligner.column_fill_values = dict(column_fill_values)
+        return inst

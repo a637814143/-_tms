@@ -21,6 +21,23 @@ try:
 except Exception:
     pd = None
 
+def _resolve_data_base() -> Path:
+    env = os.getenv("MALDET_DATA_DIR")
+    if env and env.strip():
+        base = Path(env).expanduser()
+        base.mkdir(parents=True, exist_ok=True)
+        return base.resolve()
+    try:
+        proj_root = Path(__file__).resolve().parents[2]
+        data_dir = proj_root / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir.resolve()
+    except Exception:
+        fallback = Path.home() / "maldet_data"
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback.resolve()
+
+
 APP_STYLE = """
 QWidget { background-color: #F7F8FA; font-family: "Microsoft YaHei", "PingFang SC","SF Pro Text"; color:#1d1d1f; font-size:13px; }
 QTextEdit, QTableView { background-color: #FFFFFF; border:1px solid #E3E6EB; border-radius:8px; }
@@ -35,7 +52,7 @@ QGroupBox::title { subcontrol-origin: margin; left:12px; padding:0 6px; backgrou
 # 仅表格预览上限（全部数据都会落盘）
 PREVIEW_LIMIT_FOR_TABLE = 50
 
-DATA_BASE = Path(os.getenv("MALDET_DATA_DIR", Path.home() / "maldet_data")).expanduser().resolve()
+DATA_BASE = _resolve_data_base()
 PATHS = {
     "split": DATA_BASE / "split",
     "csv_info": DATA_BASE / "CSV" / "info",
@@ -393,6 +410,7 @@ class Ui_MainWindow(object):
         self._build_paging_toolbar()
         self._build_output_list()
         self._build_footer()
+        self._update_status_message("@2025 恶意流量检测系统")
 
         self.splitter.addWidget(self.left_scroll)
 
@@ -572,10 +590,36 @@ class Ui_MainWindow(object):
         self.bottom_bar.setFixedHeight(22)
         bb = QtWidgets.QHBoxLayout(self.bottom_bar)
         bb.setContentsMargins(6, 0, 6, 0); bb.addStretch()
-        self.bottom_label = QtWidgets.QLabel("@2025  恶意流量检测系统")
+        self.bottom_label = QtWidgets.QLabel()
         self.bottom_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         bb.addWidget(self.bottom_label)
         self.left_layout.addWidget(self.bottom_bar)
+
+    def _action_buttons(self) -> List[QtWidgets.QPushButton]:
+        return [
+            btn
+            for btn in (
+                getattr(self, "btn_view", None),
+                getattr(self, "btn_fe", None),
+                getattr(self, "btn_vector", None),
+                getattr(self, "btn_train", None),
+                getattr(self, "btn_analysis", None),
+                getattr(self, "btn_predict", None),
+                getattr(self, "btn_export", None),
+            )
+            if btn is not None
+        ]
+
+    def _set_action_buttons_enabled(self, enabled: bool) -> None:
+        for btn in self._action_buttons():
+            btn.setEnabled(enabled)
+
+    def _update_status_message(self, message: Optional[str] = None) -> None:
+        base = f"数据目录: {DATA_BASE}"
+        if message:
+            self.bottom_label.setText(f"{message} | {base}")
+        else:
+            self.bottom_label.setText(base)
 
     def _build_right_panel(self):
         self.right_frame = QtWidgets.QFrame(self.centralwidget)
@@ -595,7 +639,7 @@ class Ui_MainWindow(object):
         self.rbf_gamma_spin.setRange(0.0, 5.0)
         self.rbf_gamma_spin.setDecimals(4)
         self.rbf_gamma_spin.setSingleStep(0.05)
-        self.rbf_gamma_spin.setSpecialValueText("自动 (0.2)")
+        self.rbf_gamma_spin.setSpecialValueText("自动 (≈1/√d)")
         self.rbf_gamma_spin.setValue(0.0)
         ag_layout.addRow("RBF 维度：", self.rbf_components_spin)
         ag_layout.addRow("RBF γ：", self.rbf_gamma_spin)
@@ -1081,6 +1125,7 @@ class Ui_MainWindow(object):
         if len(file_list) > 100: self.display_result(f" ...（其余 {len(file_list) - 100} 个省略显示）")
         self.display_result(f"[INFO] 正在解析 {path} ...", True)
 
+        self._set_action_buttons_enabled(False)
         self.btn_view.setEnabled(False); self.set_button_progress(self.btn_view, 0)
 
         self.worker = InfoWorker(
@@ -1101,6 +1146,7 @@ class Ui_MainWindow(object):
         self.set_button_progress(self.btn_view, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_view))
         self.worker = None
+        self._set_action_buttons_enabled(True)
 
         if pd is not None and isinstance(df, pd.DataFrame):
             df = self._auto_tag_dataframe(df)
@@ -1136,13 +1182,15 @@ class Ui_MainWindow(object):
                 head_txt = "(预览生成失败)"
             self.display_result(f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}", append=False)
             rows = len(df) if hasattr(df, "__len__") else 0
-            self.bottom_label.setText(f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个  @2025")
+            status = f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个"
+            self._update_status_message(status)
         if errs:
             for e in errs.split("\n"):
                 if e.strip(): self.display_result(e)
 
     def _on_worker_error(self, msg):
         self.btn_view.setEnabled(True); self.reset_button_progress(self.btn_view)
+        self._set_action_buttons_enabled(True)
         self.worker = None
         QtWidgets.QMessageBox.critical(None, "解析失败", msg)
         self.display_result(f"[错误] 解析失败: {msg}")
@@ -1238,6 +1286,7 @@ class Ui_MainWindow(object):
         out_dir = self._default_csv_feature_dir()
         os.makedirs(out_dir, exist_ok=True)
 
+        self._set_action_buttons_enabled(False)
         if os.path.isdir(path):
             self.display_result(f"[INFO] 目录特征提取：{path} -> {out_dir}")
             self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
@@ -1261,6 +1310,7 @@ class Ui_MainWindow(object):
         self.btn_fe.setEnabled(True)
         self.set_button_progress(self.btn_fe, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
+        self._set_action_buttons_enabled(True)
         self.display_result(f"[INFO] 特征提取完成，CSV已保存: {csv}")
         self._add_output(csv)
         try:
@@ -1275,6 +1325,7 @@ class Ui_MainWindow(object):
         self.btn_fe.setEnabled(True)
         self.set_button_progress(self.btn_fe, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
+        self._set_action_buttons_enabled(True)
         self.display_result(f"[INFO] 目录特征提取完成：共 {len(csv_list)} 个 CSV")
         for p in csv_list:
             if os.path.exists(p): self._add_output(p)
@@ -1290,6 +1341,7 @@ class Ui_MainWindow(object):
 
     def _on_fe_error(self, msg):
         self.btn_fe.setEnabled(True); self.reset_button_progress(self.btn_fe)
+        self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "特征提取失败", msg)
         self.display_result(f"[错误] 特征提取失败: {msg}")
 
@@ -1317,6 +1369,7 @@ class Ui_MainWindow(object):
                 self._remember_path(preview)
 
         self.display_result(f"[INFO] 数据预处理：{preview} -> {out_dir}")
+        self._set_action_buttons_enabled(False)
         self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
         self.preprocess_worker = PreprocessWorker(feature_source, out_dir)
         self.preprocess_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
@@ -1329,6 +1382,7 @@ class Ui_MainWindow(object):
         self.set_button_progress(self.btn_vector, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_vector))
         self.preprocess_worker = None
+        self._set_action_buttons_enabled(True)
 
         data = result if isinstance(result, dict) else {}
         dataset = data.get("dataset_path")
@@ -1359,6 +1413,7 @@ class Ui_MainWindow(object):
     def _on_preprocess_error(self, msg):
         self.btn_vector.setEnabled(True)
         self.reset_button_progress(self.btn_vector)
+        self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "数据预处理失败", msg)
         self.display_result(f"[错误] 数据预处理失败: {msg}")
         self.preprocess_worker = None
@@ -1380,6 +1435,7 @@ class Ui_MainWindow(object):
         os.makedirs(res_dir, exist_ok=True); os.makedirs(mdl_dir, exist_ok=True)
 
         self.display_result(f"[INFO] 开始训练，输入: {path}")
+        self._set_action_buttons_enabled(False)
         self.btn_train.setEnabled(False); self.set_button_progress(self.btn_train, 1)
         comp = self.rbf_components_spin.value()
         gamma = self.rbf_gamma_spin.value()
@@ -1399,6 +1455,7 @@ class Ui_MainWindow(object):
         self.btn_train.setEnabled(True)
         self.set_button_progress(self.btn_train, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_train))
+        self._set_action_buttons_enabled(True)
         msg_lines = [
             "results:",
             f"- {res.get('results_csv')}",
@@ -1439,6 +1496,7 @@ class Ui_MainWindow(object):
 
     def _on_train_error(self, msg):
         self.btn_train.setEnabled(True); self.reset_button_progress(self.btn_train)
+        self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "训练失败", msg)
         self.display_result(f"[错误] 训练失败: {msg}")
 
@@ -1458,6 +1516,7 @@ class Ui_MainWindow(object):
 
         self.display_result(f"[INFO] 正在分析结果 -> {out_dir}")
         self._analysis_summary = None
+        self._set_action_buttons_enabled(False)
         self.btn_analysis.setEnabled(False); self.set_button_progress(self.btn_analysis, 1)
         _, meta_path = self._latest_pipeline_bundle()
         self.analysis_worker = AnalysisWorker(csv, out_dir, metadata_path=meta_path)
@@ -1470,6 +1529,7 @@ class Ui_MainWindow(object):
         self.btn_analysis.setEnabled(True)
         self.set_button_progress(self.btn_analysis, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_analysis))
+        self._set_action_buttons_enabled(True)
         out_dir = None
         plot_paths: List[str] = []
         top20_csv: Optional[str] = None
@@ -1550,6 +1610,7 @@ class Ui_MainWindow(object):
 
     def _on_analysis_error(self, msg):
         self.btn_analysis.setEnabled(True); self.reset_button_progress(self.btn_analysis)
+        self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "分析失败", msg)
         self.display_result(f"[错误] 分析失败: {msg}")
         self._analysis_summary = None
@@ -1623,7 +1684,44 @@ class Ui_MainWindow(object):
             )
             return
 
-        feature_df = df.loc[:, required_columns].copy()
+        feature_df_raw = df.loc[:, required_columns].copy()
+
+        models_dir = self._default_models_dir()
+        preproc_candidates = []
+        if isinstance(metadata, dict):
+            if metadata.get("preprocessor_latest"):
+                preproc_candidates.append(metadata.get("preprocessor_latest"))
+            if metadata.get("preprocessor_path"):
+                preproc_candidates.append(metadata.get("preprocessor_path"))
+        preproc_candidates.append(os.path.join(models_dir, "latest_preprocessor.joblib"))
+
+        loaded_preprocessor = None
+        last_preproc_error = None
+        for path in preproc_candidates:
+            if not path:
+                continue
+            if not os.path.exists(path):
+                continue
+            try:
+                loaded_preprocessor = joblib_load(path)
+                break
+            except Exception as exc:
+                last_preproc_error = exc
+                continue
+
+        if loaded_preprocessor is None:
+            loaded_preprocessor = pipeline.named_steps.get("preprocessor") if hasattr(pipeline, "named_steps") else None
+
+        if loaded_preprocessor is None:
+            detail = f"（最近一次错误：{last_preproc_error}）" if last_preproc_error else ""
+            QtWidgets.QMessageBox.critical(None, "模型不完整", f"缺少可用的特征预处理器，请重新训练。{detail}")
+            return
+
+        try:
+            feature_df_aligned = loaded_preprocessor.transform(feature_df_raw)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(None, "转换失败", f"特征预处理失败：{e}")
+            return
 
         named_steps = getattr(pipeline, "named_steps", {}) if hasattr(pipeline, "named_steps") else {}
         detector = named_steps.get("detector") if isinstance(named_steps, dict) else None
@@ -1632,52 +1730,45 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.critical(None, "模型不完整", "当前模型缺少集成检测器，请重新训练。")
             return
 
+        transformed = feature_df_aligned
+        for name, step in pipeline.steps[1:-1]:
+            try:
+                transformed = step.transform(transformed)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(None, "转换失败", f"特征变换失败（{name}）：{e}")
+                return
+
         try:
-            preds = pipeline.predict(feature_df)
+            preds = detector.predict(transformed)
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}")
             return
 
-        pre_detector = Pipeline(pipeline.steps[:-1])
-        transformed = None
-
         scores = getattr(detector, "last_combined_scores_", None)
         if scores is None:
             try:
-                transformed = pre_detector.transform(feature_df)
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(None, "转换失败", f"特征预处理失败：{e}")
-                return
-            try:
                 scores = detector.score_samples(transformed)
             except Exception:
-                scores = np.zeros(len(feature_df), dtype=float)
+                scores = np.zeros(len(feature_df_aligned), dtype=float)
         scores = np.asarray(scores, dtype=float)
 
         vote_ratio = getattr(detector, "last_vote_ratio_", None)
         if vote_ratio is None:
-            if transformed is None:
-                try:
-                    transformed = pre_detector.transform(feature_df)
-                except Exception as e:
-                    QtWidgets.QMessageBox.warning(None, "转换失败", f"特征转换失败：{e}")
-                    transformed = None
             vote_blocks = []
-            if transformed is not None:
-                for info in getattr(detector, "detectors_", {}).values():
-                    est = getattr(info, "estimator", None)
-                    if est is None or not hasattr(est, "predict"):
-                        continue
-                    try:
-                        sub_pred = est.predict(transformed)
-                        vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
-                    except Exception:
-                        continue
+            for info in getattr(detector, "detectors_", {}).values():
+                est = getattr(info, "estimator", None)
+                if est is None or not hasattr(est, "predict"):
+                    continue
+                try:
+                    sub_pred = est.predict(transformed)
+                    vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
+                except Exception:
+                    continue
             if vote_blocks:
                 vote_ratio = np.vstack(vote_blocks).mean(axis=0)
         if vote_ratio is None:
             fallback_vote = 0.5 if vote_mean_meta is None else float(vote_mean_meta)
-            vote_ratio = np.full(len(feature_df), fallback_vote, dtype=float)
+            vote_ratio = np.full(len(feature_df_aligned), fallback_vote, dtype=float)
         vote_ratio = np.asarray(vote_ratio, dtype=float)
 
         if threshold is None:
@@ -1697,7 +1788,19 @@ class Ui_MainWindow(object):
 
         conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
         vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
-        anomaly_confidence = np.clip((conf_from_score + vote_component) / 2.0, 0.0, 1.0)
+        risk_score = np.clip(0.6 * conf_from_score + 0.4 * vote_component, 0.0, 1.0)
+
+        supervised_scores = getattr(detector, "last_supervised_scores_", None)
+        if supervised_scores is not None:
+            risk_score = np.clip(0.5 * risk_score + 0.5 * supervised_scores.astype(float), 0.0, 1.0)
+        elif getattr(detector, "last_calibrated_scores_", None) is not None:
+            risk_score = np.clip(
+                0.6 * risk_score + 0.4 * detector.last_calibrated_scores_.astype(float),
+                0.0,
+                1.0,
+            )
+
+        anomaly_confidence = risk_score.copy()
 
         out_df = df.copy()
         out_df["prediction"] = preds
@@ -1705,6 +1808,7 @@ class Ui_MainWindow(object):
         out_df["anomaly_score"] = scores
         out_df["anomaly_confidence"] = anomaly_confidence
         out_df["vote_ratio"] = vote_ratio
+        out_df["risk_score"] = risk_score
 
         malicious = int(out_df["is_malicious"].sum())
         total = int(len(out_df))
@@ -1732,7 +1836,7 @@ class Ui_MainWindow(object):
             f"自动阈值：{threshold:.6f}",
             f"投票阈值：{vote_threshold:.2f}",
             f"分数范围：{score_min:.4f} ~ {score_max:.4f}",
-            f"平均异常置信度：{float(anomaly_confidence.mean()):.2%}",
+            f"平均风险分：{float(risk_score.mean()):.2%}",
         ]
         if isinstance(threshold_breakdown_meta, dict) and threshold_breakdown_meta.get("adaptive") is not None:
             msg.append(
@@ -1846,7 +1950,7 @@ class Ui_MainWindow(object):
             self.table_view.setModel(None)
             self.display_tabs.setCurrentWidget(self.results_widget)
             self.output_list.clear()
-            self.bottom_label.setText("@2025  恶意流量检测系统")
+            self._update_status_message("@2025 恶意流量检测系统")
             self._csv_paged_path = None
             self._csv_total_rows = None
             self._csv_current_page = 1

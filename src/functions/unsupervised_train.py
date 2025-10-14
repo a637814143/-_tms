@@ -22,7 +22,7 @@ from joblib import dump
 from src.functions.feature_extractor import extract_features, extract_features_dir
 from src.functions.anomaly_detector import EnsembleAnomalyDetector
 from src.functions.logging_utils import get_logger
-from src.functions.transformers import FlowFeaturePreprocessor
+from src.functions.transformers import PreprocessPipeline
 
 logger = get_logger(__name__)
 
@@ -483,6 +483,8 @@ def _train_from_dataframe(
     feature_columns_hint: Optional[List[str]] = None,
     rbf_components: Optional[int] = None,
     rbf_gamma: Optional[float] = None,
+    fill_values: Optional[Dict[str, object]] = None,
+    categorical_maps: Optional[Dict[str, Dict[str, object]]] = None,
 ) -> dict:
     if df.empty:
         raise RuntimeError("训练数据为空。")
@@ -509,8 +511,13 @@ def _train_from_dataframe(
         random_state=42,
     )
 
-    preprocessor = FlowFeaturePreprocessor(feature_columns=feature_columns)
-    feature_df_numeric = feature_df
+    preprocessor = PreprocessPipeline(
+        feature_order=feature_columns,
+        fill_value=0.0,
+        fill_values=fill_values,
+        categorical_maps=categorical_maps,
+    )
+    feature_df_numeric = feature_df.loc[:, feature_columns].copy()
 
     sample_count = len(feature_df_numeric)
     base_dim = max(len(feature_columns), 1)
@@ -521,7 +528,8 @@ def _train_from_dataframe(
         used_components = int(rbf_components)
     else:
         used_components = auto_components
-    used_gamma = float(rbf_gamma) if rbf_gamma and rbf_gamma > 0 else 0.2
+    auto_gamma = float(np.clip(1.0 / np.sqrt(float(base_dim)), 0.05, 0.5))
+    used_gamma = float(rbf_gamma) if rbf_gamma and rbf_gamma > 0 else auto_gamma
 
     pipeline_steps = [
         ("preprocessor", preprocessor),
@@ -561,6 +569,7 @@ def _train_from_dataframe(
     if progress_cb:
         progress_cb(70)
 
+    supervised_proba = None
     if ground_truth is not None:
         pipeline.fit(feature_df_numeric, ground_truth)
     else:
@@ -570,6 +579,7 @@ def _train_from_dataframe(
     except Exception:
         pass
     detector = pipeline.named_steps["detector"]
+    preprocessor = pipeline.named_steps.get("preprocessor", preprocessor)
     pre_detector = Pipeline(pipeline.steps[:-1])
     transformed_features: Optional[np.ndarray] = None
 
@@ -673,26 +683,24 @@ def _train_from_dataframe(
     score_std = float(np.std(scores) or 1.0)
     conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
     vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
-    anomaly_confidence = np.clip((conf_from_score + vote_component) / 2.0, 0.0, 1.0)
-    base_confidence = anomaly_confidence.copy()
+    risk_score = np.clip(0.6 * conf_from_score + 0.4 * vote_component, 0.0, 1.0)
+
     if detector.last_supervised_scores_ is not None:
         supervised_scores = detector.last_supervised_scores_.astype(float)
-        anomaly_confidence = np.clip(
-            0.5 * base_confidence + 0.5 * supervised_scores,
-            0.0,
-            1.0,
-        )
+        risk_score = np.clip(0.5 * risk_score + 0.5 * supervised_scores, 0.0, 1.0)
     elif detector.last_calibrated_scores_ is not None:
         calibrated_scores = detector.last_calibrated_scores_.astype(float)
-        anomaly_confidence = np.clip(
-            0.6 * base_confidence + 0.4 * calibrated_scores,
-            0.0,
-            1.0,
-        )
+        risk_score = np.clip(0.6 * risk_score + 0.4 * calibrated_scores, 0.0, 1.0)
+    elif supervised_proba is not None:
+        sup_scores = np.clip(supervised_proba.astype(float), 0.0, 1.0)
+        risk_score = np.clip(0.5 * risk_score + 0.5 * sup_scores, 0.0, 1.0)
+
+    anomaly_confidence = risk_score.copy()
 
     working_df["anomaly_score"] = scores
     working_df["vote_ratio"] = vote_ratio
     working_df["anomaly_confidence"] = anomaly_confidence
+    working_df["risk_score"] = risk_score
     working_df["is_malicious"] = is_malicious
 
     results_csv = os.path.join(results_dir, "iforest_results.csv")
@@ -729,11 +737,20 @@ def _train_from_dataframe(
     pipeline_path = os.path.join(models_dir, pipeline_name)
     dump(pipeline, pipeline_path)
 
+    preprocessor_path = os.path.join(models_dir, f"preprocessor_{timestamp}.joblib")
+    dump(preprocessor, preprocessor_path)
+
     latest_pipeline_path = os.path.join(models_dir, "latest_iforest_pipeline.joblib")
     try:
         shutil.copy2(pipeline_path, latest_pipeline_path)
     except Exception:
         dump(pipeline, latest_pipeline_path)
+
+    latest_preprocessor_path = os.path.join(models_dir, "latest_preprocessor.joblib")
+    try:
+        shutil.copy2(preprocessor_path, latest_preprocessor_path)
+    except Exception:
+        dump(preprocessor, latest_preprocessor_path)
 
     scaler_path = os.path.join(models_dir, "scaler.joblib")
     dump(pipeline.named_steps["scaler"], scaler_path)
@@ -777,7 +794,10 @@ def _train_from_dataframe(
         "preprocessor": preprocessor_metadata,
         "feature_names_in": feature_columns,
         "rbf_components": used_components,
+        "rbf_n_components": used_components,
         "rbf_gamma": used_gamma,
+        "preprocessor_path": preprocessor_path,
+        "preprocessor_latest": latest_preprocessor_path,
     }
 
     if detector.calibration_report_ is not None:
@@ -831,6 +851,8 @@ def _train_from_dataframe(
         "pipeline_latest": latest_pipeline_path,
         "metadata_path": metadata_path,
         "metadata_latest": latest_meta_path,
+        "preprocessor_path": preprocessor_path,
+        "preprocessor_latest": latest_preprocessor_path,
         "packets": len(working_df),
         "flows": len(working_df),
         "malicious": int(is_malicious.sum()),
@@ -850,6 +872,7 @@ def _train_from_dataframe(
         "projection_dim": metadata.get("projection_dim"),
         "preprocessor": preprocessor_metadata,
         "rbf_components": used_components,
+        "rbf_n_components": used_components,
         "rbf_gamma": used_gamma,
     }
 
@@ -875,6 +898,8 @@ def _train_from_preprocessed_csv(
     manifest_path = _manifest_path_for(dataset_path)
     manifest_col = None
     feature_columns_hint: Optional[List[str]] = None
+    fill_values_hint: Optional[Dict[str, object]] = None
+    categorical_maps_hint: Optional[Dict[str, Dict[str, object]]] = None
 
     meta_path = _meta_path_for(dataset_path)
     if os.path.exists(meta_path):
@@ -885,6 +910,17 @@ def _train_from_preprocessed_csv(
                 cols = meta_payload.get("feature_columns")
                 if isinstance(cols, list):
                     feature_columns_hint = [str(col) for col in cols]
+                fill_values_hint = meta_payload.get("fill_values") or meta_payload.get("fill_strategies")
+                if fill_values_hint is not None:
+                    fill_values_hint = {
+                        str(k): v for k, v in dict(fill_values_hint).items()
+                    }
+                categorical_maps_raw = meta_payload.get("categorical_maps")
+                if isinstance(categorical_maps_raw, dict):
+                    categorical_maps_hint = {
+                        str(k): dict(v) if isinstance(v, dict) else {}
+                        for k, v in categorical_maps_raw.items()
+                    }
         except Exception as exc:
             print(f"[WARN] 读取元数据失败 {meta_path}: {exc}")
 
@@ -921,6 +957,8 @@ def _train_from_preprocessed_csv(
         feature_columns_hint=feature_columns_hint,
         rbf_components=rbf_components,
         rbf_gamma=rbf_gamma,
+        fill_values=fill_values_hint,
+        categorical_maps=categorical_maps_hint,
     )
 
 
@@ -957,6 +995,28 @@ def _train_from_npz(
     if progress_cb:
         progress_cb(40)
 
+    fill_values_hint: Optional[Dict[str, object]] = None
+    categorical_maps_hint: Optional[Dict[str, Dict[str, object]]] = None
+    meta_path = _meta_path_for(dataset_path)
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as fh:
+                meta_payload = json.load(fh)
+            if isinstance(meta_payload, dict):
+                fill_values_hint = meta_payload.get("fill_values") or meta_payload.get("fill_strategies")
+                if fill_values_hint is not None:
+                    fill_values_hint = {
+                        str(k): v for k, v in dict(fill_values_hint).items()
+                    }
+                categorical_maps_raw = meta_payload.get("categorical_maps")
+                if isinstance(categorical_maps_raw, dict):
+                    categorical_maps_hint = {
+                        str(k): dict(v) if isinstance(v, dict) else {}
+                        for k, v in categorical_maps_raw.items()
+                    }
+        except Exception as exc:
+            print(f"[WARN] 读取元数据失败 {meta_path}: {exc}")
+
     return _train_from_dataframe(
         df,
         results_dir=results_dir,
@@ -968,6 +1028,8 @@ def _train_from_npz(
         feature_columns_hint=list(columns),
         rbf_components=rbf_components,
         rbf_gamma=rbf_gamma,
+        fill_values=fill_values_hint,
+        categorical_maps=categorical_maps_hint,
     )
 
 
@@ -1015,6 +1077,8 @@ def _train_from_npy(
         manifest_col = "pcap_file"
 
     feature_columns_hint: Optional[List[str]] = list(columns)
+    fill_values_hint: Optional[Dict[str, object]] = None
+    categorical_maps_hint: Optional[Dict[str, Dict[str, object]]] = None
     meta_path = _meta_path_for(dataset_path)
     if os.path.exists(meta_path):
         try:
@@ -1023,6 +1087,17 @@ def _train_from_npy(
             cols = meta_payload.get("feature_columns")
             if isinstance(cols, list) and cols:
                 feature_columns_hint = [str(col) for col in cols]
+            fill_values_hint = meta_payload.get("fill_values") or meta_payload.get("fill_strategies")
+            if fill_values_hint is not None:
+                fill_values_hint = {
+                    str(k): v for k, v in dict(fill_values_hint).items()
+                }
+            categorical_maps_raw = meta_payload.get("categorical_maps")
+            if isinstance(categorical_maps_raw, dict):
+                categorical_maps_hint = {
+                    str(k): dict(v) if isinstance(v, dict) else {}
+                    for k, v in categorical_maps_raw.items()
+                }
         except Exception as exc:
             print(f"[WARN] 读取元数据失败 {meta_path}: {exc}")
 
@@ -1040,6 +1115,8 @@ def _train_from_npy(
         feature_columns_hint=feature_columns_hint,
         rbf_components=rbf_components,
         rbf_gamma=rbf_gamma,
+        fill_values=fill_values_hint,
+        categorical_maps=categorical_maps_hint,
     )
 
 
