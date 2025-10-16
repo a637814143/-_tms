@@ -12,6 +12,8 @@ import dpkt
 import numpy as np
 import pandas as pd
 
+from src.functions.logging_utils import get_logger
+
 Packet = Tuple[float, bytes]
 ProgressCallback = Optional[Callable[[int], None]]
 
@@ -24,8 +26,13 @@ TCP_FLAG_MAP = {
     "urg": dpkt.tcp.TH_URG,
 }
 
+logger = get_logger(__name__)
+
 LENGTH_BINS = np.linspace(0, 8192, 257)
 INTERVAL_BINS = np.linspace(0.0, 5.0, 257)
+MAX_PKTS_PER_FLOW = 10_000
+FAST_PACKET_THRESHOLD = 1_000_000
+FAST_SAMPLE_RATE = 10
 
 
 def _ip_to_str(raw: bytes) -> str:
@@ -117,6 +124,7 @@ class FlowAccumulator:
     backward_times: List[float] = field(default_factory=list)
     forward_flags: Counter = field(default_factory=Counter)
     backward_flags: Counter = field(default_factory=Counter)
+    truncated: int = 0
 
     def add_packet(
         self,
@@ -126,6 +134,14 @@ class FlowAccumulator:
         direction: str,
         flags: Optional[int] = None,
     ) -> None:
+        if self.truncated:
+            return
+
+        total_packets = len(self.forward_lengths) + len(self.backward_lengths)
+        if total_packets >= MAX_PKTS_PER_FLOW:
+            self.truncated = 1
+            return
+
         if direction == "fwd":
             self.forward_lengths.append(length)
             self.forward_times.append(timestamp)
@@ -309,6 +325,7 @@ class FlowAccumulator:
         features["rst_to_packet_ratio"] = (
             float(rst_total) / float(total_packets) if total_packets else 0.0
         )
+        features["flow_truncated"] = int(self.truncated)
 
         return features
 
@@ -317,6 +334,8 @@ def extract_features(
     pcap_path: str,
     output_csv: str,
     progress_cb: ProgressCallback = None,
+    *,
+    fast: bool = False,
 ) -> str:
     """从单个 PCAP 文件提取高维流量特征并保存为 CSV。"""
 
@@ -325,61 +344,68 @@ def extract_features(
 
     total_packets = _count_packets(pcap_path)
     flows: Dict[Tuple[str, str, int, int, str], FlowAccumulator] = {}
-    processed = 0
     pcap_name = os.path.basename(pcap_path)
+    fast_mode = bool(fast) or total_packets > FAST_PACKET_THRESHOLD
 
-    with open(pcap_path, "rb") as handle:
-        reader = _open_reader(handle)
-        for ts, buf in _iterate_packets(reader):
-            try:
-                eth = dpkt.ethernet.Ethernet(buf)
-                ip_layer = eth.data
-                if not isinstance(ip_layer, (dpkt.ip.IP, dpkt.ip6.IP6)):
+    try:
+        with open(pcap_path, "rb") as handle:
+            reader = _open_reader(handle)
+            for idx, (ts, buf) in enumerate(_iterate_packets(reader), start=1):
+                if fast_mode and total_packets > FAST_PACKET_THRESHOLD and idx % FAST_SAMPLE_RATE != 0:
+                    if progress_cb and total_packets and (idx % 200 == 0 or idx == total_packets):
+                        progress_cb(min(95, int(idx * 100 / max(total_packets, 1))))
                     continue
 
-                proto_num = ip_layer.p if isinstance(ip_layer, dpkt.ip.IP) else ip_layer.nxt
-                proto_name = _protocol_name(int(proto_num))
+                try:
+                    eth = dpkt.ethernet.Ethernet(buf)
+                    ip_layer = eth.data
+                    if not isinstance(ip_layer, (dpkt.ip.IP, dpkt.ip6.IP6)):
+                        continue
 
-                src_ip = _ip_to_str(ip_layer.src)
-                dst_ip = _ip_to_str(ip_layer.dst)
+                    proto_num = ip_layer.p if isinstance(ip_layer, dpkt.ip.IP) else ip_layer.nxt
+                    proto_name = _protocol_name(int(proto_num))
 
-                transport = ip_layer.data
-                src_port = int(getattr(transport, "sport", 0))
-                dst_port = int(getattr(transport, "dport", 0))
+                    src_ip = _ip_to_str(ip_layer.src)
+                    dst_ip = _ip_to_str(ip_layer.dst)
 
-                key_fwd = (src_ip, dst_ip, src_port, dst_port, proto_name)
-                key_bwd = (dst_ip, src_ip, dst_port, src_port, proto_name)
+                    transport = ip_layer.data
+                    src_port = int(getattr(transport, "sport", 0))
+                    dst_port = int(getattr(transport, "dport", 0))
 
-                if key_fwd in flows:
-                    acc = flows[key_fwd]
-                    direction = "fwd"
-                elif key_bwd in flows:
-                    acc = flows[key_bwd]
-                    direction = "bwd"
-                else:
-                    acc = FlowAccumulator(
-                        src_ip=src_ip,
-                        dst_ip=dst_ip,
-                        src_port=src_port,
-                        dst_port=dst_port,
-                        protocol=proto_name,
-                        pcap_file=pcap_name,
-                    )
-                    flows[key_fwd] = acc
-                    direction = "fwd"
+                    key_fwd = (src_ip, dst_ip, src_port, dst_port, proto_name)
+                    key_bwd = (dst_ip, src_ip, dst_port, src_port, proto_name)
 
-                flags = None
-                if proto_name == "TCP" and hasattr(transport, "flags"):
-                    flags = int(transport.flags)
+                    if key_fwd in flows:
+                        acc = flows[key_fwd]
+                        direction = "fwd"
+                    elif key_bwd in flows:
+                        acc = flows[key_bwd]
+                        direction = "bwd"
+                    else:
+                        acc = FlowAccumulator(
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            src_port=src_port,
+                            dst_port=dst_port,
+                            protocol=proto_name,
+                            pcap_file=pcap_name,
+                        )
+                        flows[key_fwd] = acc
+                        direction = "fwd"
 
-                acc.add_packet(length=len(buf), timestamp=float(ts), direction=direction, flags=flags)
-            except Exception:
-                continue
+                    flags = None
+                    if proto_name == "TCP" and hasattr(transport, "flags"):
+                        flags = int(transport.flags)
 
-            processed += 1
-            if progress_cb and total_packets:
-                if processed % 200 == 0 or processed == total_packets:
-                    progress_cb(min(99, int(processed * 100 / total_packets)))
+                    acc.add_packet(length=len(buf), timestamp=float(ts), direction=direction, flags=flags)
+                except Exception:
+                    continue
+
+                if progress_cb and total_packets and (idx % 200 == 0 or idx == total_packets):
+                    progress_cb(min(99, int(idx * 100 / max(total_packets, 1))))
+    except Exception as exc:
+        logger.error("读取失败 %s: %s", pcap_path, exc)
+        raise RuntimeError(f"解析失败 {pcap_path}: {exc}") from exc
 
     if not flows:
         raise ValueError(f"{pcap_path} 未提取到任何有效数据")
@@ -406,6 +432,7 @@ def extract_features_dir(
     *,
     workers: int = 4,
     progress_cb: ProgressCallback = None,
+    fast: bool = False,
 ) -> List[str]:
     """批量提取目录下 PCAP/PCAPNG 文件的高维特征（多线程）。"""
 
@@ -423,22 +450,56 @@ def extract_features_dir(
     total = len(pcap_files)
     _notify(progress_cb, 0)
 
-    def _task(pcap_path: str) -> Tuple[str, str]:
+    def _task(pcap_path: str) -> Tuple[str, Optional[str], Optional[Exception]]:
         base = os.path.splitext(os.path.basename(pcap_path))[0]
         csv_path = os.path.join(output_dir, f"{base}_features.csv")
-        extract_features(pcap_path, csv_path, progress_cb=None)
-        return pcap_path, csv_path
+        last_error: Optional[Exception] = None
+        attempt_sequence = [fast, False, True]
+        for attempt_fast in dict.fromkeys(attempt_sequence):
+            try:
+                extract_features(
+                    pcap_path,
+                    csv_path,
+                    progress_cb=None,
+                    fast=bool(attempt_fast),
+                )
+                return pcap_path, csv_path, None
+            except Exception as exc:  # noqa: PERF203
+                last_error = exc
+                if os.path.exists(csv_path):
+                    try:
+                        os.remove(csv_path)
+                    except Exception:
+                        pass
+        return pcap_path, None, last_error
 
     results: List[Tuple[str, str]] = []
+    failures: List[Tuple[str, Exception]] = []
     max_workers = max(1, workers)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {executor.submit(_task, path): path for path in pcap_files}
         completed = 0
         for future in as_completed(future_map):
-            pcap_path, csv_path = future.result()
-            results.append((pcap_path, csv_path))
+            pcap_path = future_map[future]
+            try:
+                original, csv_path, error = future.result()
+            except Exception as exc:  # unexpected errors
+                failures.append((pcap_path, exc))
+                completed += 1
+                _notify(progress_cb, int(completed * 100 / total))
+                continue
+
+            if error is not None:
+                failures.append((original or pcap_path, error))
+            elif csv_path:
+                results.append((original, csv_path))
             completed += 1
             _notify(progress_cb, int(completed * 100 / total))
 
     results.sort(key=lambda item: item[0])
+    if failures:
+        failed_list = ", ".join(f"{path}: {err}" for path, err in failures)
+        logger.error("部分 PCAP 解析失败：%s", failed_list)
+        if len(results) == 0:
+            raise RuntimeError("所有 PCAP 文件解析失败，请检查日志。")
     return [csv_path for _, csv_path in results]

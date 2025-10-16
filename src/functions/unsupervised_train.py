@@ -26,6 +26,8 @@ from src.functions.transformers import PreprocessPipeline
 
 logger = get_logger(__name__)
 
+MODEL_SCHEMA_VERSION = "2025.10"
+
 META_COLUMNS = {
     "pcap_file",
     "flow_id",
@@ -769,17 +771,32 @@ def _train_from_dataframe(
     except Exception:
         preprocessor_metadata = {}
 
+    feature_order = list(getattr(preprocessor, "feature_order", feature_columns))
+    fill_values = dict(getattr(preprocessor, "fill_values", {}) or {})
+    categorical_maps = dict(getattr(preprocessor, "categorical_maps", {}) or {})
+    quantile_points = (0.01, 0.05, 0.5, 0.9)
+    score_quantiles: Dict[str, float] = {}
+    if scores.size:
+        for q in quantile_points:
+            try:
+                score_quantiles[str(q)] = float(np.quantile(scores, q))
+            except Exception:
+                continue
+
     metadata = {
+        "schema_version": MODEL_SCHEMA_VERSION,
         "timestamp": timestamp,
         "contamination": effective_contamination,
         "requested_contamination": float(contamination),
         "base_estimators": base_estimators,
         "feature_columns": feature_columns,
+        "feature_order": feature_order,
         "expanded_dim": int(expanded_dim) if expanded_dim is not None else None,
         "threshold": float(threshold),
         "score_std": float(score_std),
         "score_min": float(np.min(scores)),
         "score_max": float(np.max(scores)),
+        "score_quantiles": score_quantiles,
         "vote_mean": float(np.mean(vote_ratio)),
         "vote_threshold": float(vote_threshold),
         "threshold_breakdown": detector.threshold_breakdown_,
@@ -791,7 +808,11 @@ def _train_from_dataframe(
         "summary_csv": summary_csv,
         "gaussianizer_path": gaussianizer_path,
         "projection_dim": int(detector.projected_dim_) if detector.projected_dim_ is not None else None,
+        "projected_dim": int(detector.projected_dim_) if detector.projected_dim_ is not None else None,
         "preprocessor": preprocessor_metadata,
+        "fill_value": float(getattr(preprocessor, "fill_value", 0.0)),
+        "fill_values": fill_values,
+        "categorical_maps": categorical_maps,
         "feature_names_in": feature_columns,
         "rbf_components": used_components,
         "rbf_n_components": used_components,
