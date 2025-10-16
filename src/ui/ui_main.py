@@ -70,6 +70,61 @@ LOGS_DIR = Path(os.getenv("MALDET_LOG_DIR", DATA_BASE / "logs")).expanduser().re
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_PATH = DATA_BASE / "settings.json"
 
+MODEL_SCHEMA_VERSION = "2025.10"
+
+
+def _align_input_features(df: "pd.DataFrame", metadata: dict) -> tuple["pd.DataFrame", dict]:
+    info: dict[str, object] = {}
+    if not isinstance(metadata, dict):
+        raise ValueError("模型缺少有效的元数据。")
+
+    schema_version = metadata.get("schema_version")
+    if schema_version is None:
+        raise ValueError("模型元数据缺少 schema_version 字段，请重新训练模型。")
+    info["schema_version"] = schema_version
+
+    feature_order = metadata.get("feature_order")
+    preprocessor_meta = metadata.get("preprocessor") if isinstance(metadata.get("preprocessor"), dict) else None
+    if not feature_order and preprocessor_meta:
+        feature_order = preprocessor_meta.get("feature_order") or preprocessor_meta.get("input_columns")
+    if not feature_order:
+        feature_order = metadata.get("feature_columns")
+    if not feature_order:
+        raise ValueError("模型元数据缺少 feature_order 描述，无法校验列。")
+
+    feature_order = list(feature_order)
+    if not feature_order:
+        raise ValueError("模型元数据的特征列为空。")
+
+    default_fill = 0.0
+    fill_values = {}
+    if isinstance(metadata.get("fill_values"), dict):
+        fill_values.update(metadata["fill_values"])
+    if isinstance(preprocessor_meta, dict):
+        default_fill = float(preprocessor_meta.get("fill_value", default_fill))
+        fill_values.update(preprocessor_meta.get("fill_values") or {})
+    if "fill_value" in metadata:
+        try:
+            default_fill = float(metadata.get("fill_value", default_fill))
+        except (TypeError, ValueError):
+            default_fill = float(default_fill)
+
+    working = df.copy()
+    missing_columns: List[str] = []
+    for column in feature_order:
+        if column in working.columns:
+            continue
+        fill_value = fill_values.get(column, default_fill)
+        working[column] = fill_value
+        missing_columns.append(column)
+
+    extra_columns = [col for col in working.columns if col not in feature_order]
+    info["missing_filled"] = missing_columns
+    info["extra_columns"] = extra_columns
+
+    aligned = working.loc[:, feature_order].copy()
+    return aligned, info
+
 
 class AppSettings:
     def __init__(self, path: Path) -> None:
@@ -1654,7 +1709,6 @@ class Ui_MainWindow(object):
             except Exception:
                 metadata = {}
 
-        feature_columns = metadata.get("feature_columns") if isinstance(metadata, dict) else None
         threshold_breakdown_meta = metadata.get("threshold_breakdown") if isinstance(metadata, dict) else None
         threshold = None
         if isinstance(threshold_breakdown_meta, dict) and threshold_breakdown_meta.get("adaptive") is not None:
@@ -1666,25 +1720,26 @@ class Ui_MainWindow(object):
         vote_threshold_meta = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
 
         preprocessor_meta = metadata.get("preprocessor") if isinstance(metadata, dict) else None
-        if isinstance(preprocessor_meta, dict):
-            required_columns = preprocessor_meta.get("input_columns") or feature_columns
-        else:
-            required_columns = feature_columns
 
-        if not required_columns:
-            QtWidgets.QMessageBox.critical(None, "缺少特征列", "模型元数据缺乏特征列描述，无法执行预测。")
+        try:
+            feature_df_raw, align_info = _align_input_features(df, metadata)
+        except ValueError as exc:
+            QtWidgets.QMessageBox.critical(None, "特征校验失败", str(exc))
             return
 
-        missing_cols = [c for c in required_columns if c not in df.columns]
+        missing_cols = align_info.get("missing_filled") or []
+        extra_cols = align_info.get("extra_columns") or []
+        schema_version = align_info.get("schema_version")
         if missing_cols:
-            QtWidgets.QMessageBox.critical(
-                None,
-                "列不匹配",
-                "当前 CSV 缺少以下训练期特征列：\n" + "\n".join(missing_cols),
+            msg = "以下列在输入数据中缺失，已按训练时填充值自动补齐：\n" + ", ".join(missing_cols)
+            QtWidgets.QMessageBox.information(None, "已自动补齐特征列", msg)
+            self.display_result(f"[WARN] 自动补齐缺失列: {', '.join(missing_cols)}")
+        if extra_cols:
+            self.display_result(f"[INFO] 预测时忽略未使用列: {', '.join(extra_cols[:10])}{' ...' if len(extra_cols) > 10 else ''}")
+        if schema_version and schema_version != MODEL_SCHEMA_VERSION:
+            self.display_result(
+                f"[WARN] 模型 schema_version={schema_version} 与当前期望 {MODEL_SCHEMA_VERSION} 不一致，请确认兼容性。"
             )
-            return
-
-        feature_df_raw = df.loc[:, required_columns].copy()
 
         models_dir = self._default_models_dir()
         preproc_candidates = []
@@ -1838,6 +1893,22 @@ class Ui_MainWindow(object):
             f"分数范围：{score_min:.4f} ~ {score_max:.4f}",
             f"平均风险分：{float(risk_score.mean()):.2%}",
         ]
+        if missing_cols:
+            msg.append(
+                "已自动补齐缺失列: "
+                + ", ".join(missing_cols[:10])
+                + (" ..." if len(missing_cols) > 10 else "")
+            )
+        if extra_cols:
+            msg.append(
+                "已忽略未在训练中使用的列: "
+                + ", ".join(extra_cols[:10])
+                + (" ..." if len(extra_cols) > 10 else "")
+            )
+        if schema_version and schema_version != MODEL_SCHEMA_VERSION:
+            msg.append(
+                f"⚠ 模型 schema_version={schema_version} 与期望 {MODEL_SCHEMA_VERSION} 不一致"
+            )
         if isinstance(threshold_breakdown_meta, dict) and threshold_breakdown_meta.get("adaptive") is not None:
             msg.append(
                 "阈值拆解: 自适应 {:.6f} | 分位 {:.6f} | 鲁棒 {:.6f}".format(

@@ -176,6 +176,39 @@ NORMAL_TOKEN_VARIANTS = _build_token_variants(NORMAL_TOKENS)
 ANOMALY_TOKEN_VARIANTS = _build_token_variants(ANOMALY_TOKENS)
 
 
+def _drift_alert(
+    train_quantiles: Optional[Dict[str, object]],
+    current_scores: pd.Series,
+    *,
+    tolerance: float = 0.15,
+) -> Optional[Dict[str, float]]:
+    """Compare quantiles between train metadata and current scores."""
+
+    if not isinstance(train_quantiles, dict) or current_scores.empty:
+        return None
+
+    try:
+        curr_q_raw = current_scores.quantile([0.01, 0.05, 0.5, 0.9]).to_dict()
+    except Exception:
+        return None
+
+    curr_q = {str(k): float(v) for k, v in curr_q_raw.items() if np.isfinite(v)}
+    alerts: Dict[str, float] = {}
+    for key in ("0.01", "0.05", "0.5", "0.9"):
+        if key not in train_quantiles or key not in curr_q:
+            continue
+        try:
+            base = float(train_quantiles[key])
+            current = float(curr_q[key])
+        except (TypeError, ValueError):
+            continue
+        denom = max(abs(base), 1e-9)
+        drift = abs(current - base) / denom
+        if drift > tolerance:
+            alerts[key] = float(drift)
+    return alerts or None
+
+
 def _series_to_binary(series: pd.Series) -> Optional[np.ndarray]:
     if series.empty:
         return None
@@ -282,6 +315,12 @@ def analyze_results(
     score_std_train = (
         float(loaded_metadata.get("score_std"))
         if isinstance(loaded_metadata, dict) and loaded_metadata.get("score_std") is not None
+        else None
+    )
+
+    train_score_quantiles = (
+        loaded_metadata.get("score_quantiles")
+        if isinstance(loaded_metadata, dict)
         else None
     )
 
@@ -414,9 +453,50 @@ def analyze_results(
     out3 = os.path.join(out_dir, "top20_packets.csv")
     top20.to_csv(out3, index=False, encoding="utf-8")
 
+    top_dst_path = None
+    dst_group_cols = [col for col in ("dst_ip", "dst_port") if col in df.columns]
+    if dst_group_cols:
+        try:
+            by_dst = (
+                df.groupby(dst_group_cols, dropna=False)["is_malicious"].mean().reset_index()
+            )
+            by_dst = by_dst.sort_values("is_malicious", ascending=False).head(50)
+            top_dst_path = os.path.join(out_dir, "top50_dst_pairs.csv")
+            by_dst.to_csv(top_dst_path, index=False, encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to export top dst pairs: %s", exc)
+
+    risk_results_path = None
+    risk_source_col = None
+    if "risk_score" in df.columns:
+        risk_source_col = "risk_score"
+    elif "anomaly_confidence" in df.columns:
+        risk_source_col = "anomaly_confidence"
+    if risk_source_col is not None:
+        def _risk_bucket(value: object) -> str:
+            try:
+                val = float(value)
+            except (TypeError, ValueError):
+                val = 0.0
+            if val >= 0.8:
+                return "HIGH"
+            if val >= 0.5:
+                return "MEDIUM"
+            return "LOW"
+
+        try:
+            df["risk_bucket"] = df[risk_source_col].apply(_risk_bucket)
+            risk_results_path = os.path.join(out_dir, "results_with_risk.csv")
+            df.to_csv(risk_results_path, index=False, encoding="utf-8")
+        except Exception as exc:
+            logger.warning("Failed to export risk bucket results: %s", exc)
+
     # -------- 补充信息 --------
     raw_quantiles = score_series.quantile([0.01, 0.05, 0.1, 0.5, 0.9]).to_dict()
     anomaly_score_quantiles = {str(k): _clean_number(v) for k, v in raw_quantiles.items()}
+    drift_alerts = _drift_alert(train_score_quantiles, score_series)
+    if drift_alerts:
+        logger.warning("Anomaly score drift detected: %%s", drift_alerts)
     score_threshold = train_threshold if train_threshold is not None else anomaly_score_quantiles.get("0.05")
     if score_threshold is None:
         fallback = _clean_number(score_series.min()) if len(score_series) else None
@@ -593,6 +673,8 @@ def analyze_results(
         f"建议异常得分阈值（越小越异常）：≤ {score_threshold:.6f}",
         f"文件级判定阈值：恶意占比 ≥ {ratio_threshold:.2%}",
     ]
+    if drift_alerts:
+        summary_lines.append(f"⚠ 分布漂移告警：{drift_alerts}")
     if avg_risk is not None:
         summary_lines.append(f"风险分均值：{avg_risk:.2%}")
     elif avg_confidence is not None:
@@ -656,12 +738,16 @@ def analyze_results(
         "ground_truth_column": ground_truth_column,
         "metadata_path": metadata_path,
         "score_std_train": score_std_train,
+        "score_quantiles_train": train_score_quantiles,
+        "drift_alerts": drift_alerts,
         "roc_auc": roc_auc_val,
         "pr_auc": pr_auc_val,
         "average_precision": avg_precision_val,
         "metrics_json": metrics_json_path,
         "roc_plot": roc_plot_path,
         "pr_plot": pr_plot_path,
+        "top_dst_csv": top_dst_path,
+        "risk_bucket_csv": risk_results_path,
     }
 
     export_payload = {
@@ -697,6 +783,8 @@ def analyze_results(
     payload = {
         "plots": [p for p in (out1, out2, roc_plot_path, pr_plot_path) if p],
         "top20_csv": out3,
+        "top_dst_csv": top_dst_path,
+        "risk_bucket_csv": risk_results_path,
         "out_dir": out_dir,
         "summary_csv": summary_path,
         "summary_json": summary_json_path,
