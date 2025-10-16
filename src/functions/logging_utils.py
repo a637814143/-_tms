@@ -14,7 +14,9 @@ _LOGGERS: Dict[str, logging.Logger] = {}
 def _resolve_log_dir() -> Path:
     base = Path(
         os.getenv("MALDET_DATA_DIR", Path.home() / "maldet_data")
-    ).expanduser().resolve()
+    ).expanduser()
+    base.mkdir(parents=True, exist_ok=True)
+    base = base.resolve()
     log_dir = Path(os.getenv("MALDET_LOG_DIR", base / "logs")).expanduser().resolve()
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
