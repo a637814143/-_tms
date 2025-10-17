@@ -312,13 +312,24 @@ class TrainWorker(QtCore.QThread):
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
-    def __init__(self, input_path, results_dir, models_dir, rbf_components=None, rbf_gamma=None):
+    def __init__(
+        self,
+        input_path,
+        results_dir,
+        models_dir,
+        rbf_components=None,
+        rbf_gamma=None,
+        fusion_enabled=True,
+        fusion_alpha=0.5,
+    ):
         super().__init__()
         self.input_path = input_path
         self.results_dir = results_dir
         self.models_dir = models_dir
         self.rbf_components = rbf_components
         self.rbf_gamma = rbf_gamma
+        self.fusion_enabled = fusion_enabled
+        self.fusion_alpha = fusion_alpha
 
     def run(self):
         try:
@@ -329,6 +340,8 @@ class TrainWorker(QtCore.QThread):
                 progress_cb=self.progress.emit,
                 rbf_components=self.rbf_components,
                 rbf_gamma=self.rbf_gamma,
+                enable_supervised_fusion=self.fusion_enabled,
+                fusion_alpha=float(self.fusion_alpha),
             )
             self.finished.emit(res)
         except Exception as e:
@@ -696,8 +709,19 @@ class Ui_MainWindow(object):
         self.rbf_gamma_spin.setSingleStep(0.05)
         self.rbf_gamma_spin.setSpecialValueText("自动 (≈1/√d)")
         self.rbf_gamma_spin.setValue(0.0)
+        self.fusion_checkbox = QtWidgets.QCheckBox("启用半监督融合")
+        self.fusion_checkbox.setChecked(True)
+        self.fusion_alpha_spin = QtWidgets.QDoubleSpinBox()
+        self.fusion_alpha_spin.setRange(0.0, 1.0)
+        self.fusion_alpha_spin.setDecimals(2)
+        self.fusion_alpha_spin.setSingleStep(0.05)
+        self.fusion_alpha_spin.setValue(0.50)
+        self.fusion_alpha_spin.setToolTip("α 越大越偏向无监督风险分数")
         ag_layout.addRow("RBF 维度：", self.rbf_components_spin)
         ag_layout.addRow("RBF γ：", self.rbf_gamma_spin)
+        ag_layout.addRow("半监督融合：", self.fusion_checkbox)
+        ag_layout.addRow("融合权重 α：", self.fusion_alpha_spin)
+        self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
         self.right_layout.addWidget(self.advanced_group)
 
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
@@ -754,6 +778,9 @@ class Ui_MainWindow(object):
         self.btn_show_all.clicked.connect(self._show_full_preview)
         self.rbf_components_spin.valueChanged.connect(self._on_rbf_settings_changed)
         self.rbf_gamma_spin.valueChanged.connect(self._on_rbf_settings_changed)
+        self.fusion_checkbox.toggled.connect(lambda checked: self.fusion_alpha_spin.setEnabled(checked))
+        self.fusion_checkbox.toggled.connect(self._on_rbf_settings_changed)
+        self.fusion_alpha_spin.valueChanged.connect(self._on_rbf_settings_changed)
 
         self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
         self.output_list.itemDoubleClicked.connect(self._on_output_double_click)
@@ -1494,12 +1521,16 @@ class Ui_MainWindow(object):
         self.btn_train.setEnabled(False); self.set_button_progress(self.btn_train, 1)
         comp = self.rbf_components_spin.value()
         gamma = self.rbf_gamma_spin.value()
+        fusion_enabled = self.fusion_checkbox.isChecked()
+        fusion_alpha = self.fusion_alpha_spin.value()
         self.train_worker = TrainWorker(
             path,
             res_dir,
             mdl_dir,
             rbf_components=int(comp) if comp > 0 else None,
             rbf_gamma=float(gamma) if gamma > 0 else None,
+            fusion_enabled=bool(fusion_enabled),
+            fusion_alpha=float(fusion_alpha),
         )
         self.train_worker.progress.connect(lambda p: self.set_button_progress(self.btn_train, p))
         self.train_worker.finished.connect(self._on_train_finished)
@@ -1511,6 +1542,44 @@ class Ui_MainWindow(object):
         self.set_button_progress(self.btn_train, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_train))
         self._set_action_buttons_enabled(True)
+        threshold = res.get("threshold")
+        vote_thr = res.get("vote_threshold")
+        thr_parts = []
+        if threshold is not None:
+            thr_parts.append(f"score_thr={threshold:.4f}")
+        if vote_thr is not None:
+            thr_parts.append(f"vote_thr={vote_thr:.3f}")
+        if thr_parts:
+            self.display_result(f"[阈值] {', '.join(thr_parts)}")
+        breakdown = res.get("threshold_breakdown") or {}
+        if isinstance(breakdown, dict) and breakdown:
+            try:
+                tb_text = json.dumps(breakdown, ensure_ascii=False, indent=2)
+            except Exception:
+                tb_text = str(breakdown)
+            self.display_result(f"[阈值溯源] {tb_text}")
+
+        data_quality = res.get("data_quality") or {}
+        empty_cols = list(data_quality.get("empty_columns") or [])
+        const_cols = list(data_quality.get("constant_columns") or [])
+        wins_cols = data_quality.get("winsorized_columns") or {}
+        if empty_cols:
+            preview = ", ".join(empty_cols[:5])
+            if len(empty_cols) > 5:
+                preview += f" ...(+{len(empty_cols) - 5})"
+            self.display_result(f"[数据质量] 空列已填充: {preview}")
+        if const_cols:
+            preview = ", ".join(const_cols[:5])
+            if len(const_cols) > 5:
+                preview += f" ...(+{len(const_cols) - 5})"
+            self.display_result(f"[数据质量] 常量列检测: {preview}")
+        if isinstance(wins_cols, dict) and wins_cols:
+            win_keys = list(wins_cols.keys())
+            preview = ", ".join(win_keys[:5])
+            if len(win_keys) > 5:
+                preview += f" ...(+{len(win_keys) - 5})"
+            self.display_result(f"[数据质量] 已稳健裁剪: {preview}")
+
         msg_lines = [
             "results:",
             f"- {res.get('results_csv')}",
@@ -1521,26 +1590,88 @@ class Ui_MainWindow(object):
             f"- 标准化器: {res.get('scaler_path')}",
             f"样本总数={res.get('flows')} 异常数={res.get('malicious')}",
         ]
-        if res.get("threshold") is not None:
-            msg_lines.append(f"自动阈值={res.get('threshold'):.6f}")
-        if res.get("vote_threshold") is not None:
-            msg_lines.append(f"投票阈值={res.get('vote_threshold'):.2f}")
-        breakdown = res.get("threshold_breakdown") or {}
-        if isinstance(breakdown, dict) and breakdown.get("adaptive") is not None:
-            adaptive = breakdown.get("adaptive")
-            quant = breakdown.get("quantile")
-            robust = breakdown.get("robust")
-            msg_lines.append(
-                "阈值拆解: 自适应 {:.6f} | 分位 {:.6f} | 鲁棒 {:.6f}".format(
-                    float(adaptive), float(quant if quant is not None else adaptive), float(robust if robust is not None else adaptive)
-                )
-            )
+        if threshold is not None:
+            msg_lines.append(f"得分阈值={threshold:.6f}")
+        if vote_thr is not None:
+            msg_lines.append(f"投票阈值={vote_thr:.3f}")
         if res.get("rbf_components"):
             msg_lines.append(f"RBF 维度={int(res['rbf_components'])}")
-        if res.get("rbf_gamma") is not None:
-            msg_lines.append(f"RBF γ={float(res['rbf_gamma']):.3f}")
+        if res.get("expanded_dim"):
+            msg_lines.append(f"展开后维度={int(res['expanded_dim'])}")
+        gamma_val = res.get("rbf_gamma")
+        if gamma_val is not None:
+            gamma_line = f"RBF γ={float(gamma_val):.3f}"
+            source = res.get("rbf_gamma_source")
+            if source == "auto":
+                gamma_line += "（自动）"
+            elif source == "manual":
+                gamma_line += "（手动）"
+            msg_lines.append(gamma_line)
+        if res.get("rbf_gamma_auto") is not None:
+            msg_lines.append(f"自动γ估计≈{float(res['rbf_gamma_auto']):.3f}")
+        fusion_enabled = res.get("fusion_enabled")
+        if fusion_enabled is not None:
+            if fusion_enabled:
+                alpha_val = float(res.get("fusion_alpha", 0.5))
+                fusion_source = res.get("fusion_source")
+                if fusion_source:
+                    readable = {
+                        "supervised_model": "监督模型",
+                        "calibration": "校准",
+                        "supervised_proba": "监督概率",
+                    }.get(fusion_source, str(fusion_source))
+                    source_txt = f", 来源={readable}"
+                else:
+                    source_txt = ""
+                msg_lines.append(f"半监督融合=开启(α={alpha_val:.2f}{source_txt})")
+            else:
+                msg_lines.append("半监督融合=关闭")
+        shapes = res.get("representation_shapes") or {}
+        if isinstance(shapes, dict) and shapes:
+            parts = []
+            base_shape = shapes.get("base")
+            expanded_shape = shapes.get("expanded")
+            reduced_shape = shapes.get("reduced")
+            if isinstance(base_shape, (list, tuple)) and len(base_shape) == 2:
+                parts.append(f"基础:{int(base_shape[0])}×{int(base_shape[1])}")
+            if isinstance(expanded_shape, (list, tuple)) and len(expanded_shape) == 2:
+                parts.append(f"展开:{int(expanded_shape[0])}×{int(expanded_shape[1])}")
+            if isinstance(reduced_shape, (list, tuple)) and len(reduced_shape) == 2:
+                parts.append(f"降维:{int(reduced_shape[0])}×{int(reduced_shape[1])}")
+            if parts:
+                msg_lines.append("特征形状: " + " -> ".join(parts))
+        svd_info = res.get("svd_info") or {}
+        if isinstance(svd_info, dict) and svd_info.get("components"):
+            top_ratio = svd_info.get("top_variance_ratio") or []
+            if top_ratio:
+                cumulative = float(svd_info.get("cumulative_top", sum(top_ratio)))
+                msg_lines.append(
+                    f"SVD前{len(top_ratio)}维累计解释≈{cumulative:.1%}"
+                )
+            else:
+                msg_lines.append(f"SVD保留维度={int(svd_info.get('components'))}")
+        if empty_cols:
+            msg_lines.append(f"空列填充={len(empty_cols)}")
+        if const_cols:
+            msg_lines.append(f"常量列={len(const_cols)}")
+        if isinstance(wins_cols, dict) and wins_cols:
+            msg_lines.append(f"稳健裁剪列={len(wins_cols)}")
         if res.get("estimated_precision") is not None:
             msg_lines.append(f"异常置信度均值≈{res.get('estimated_precision'):.2%}")
+        feature_importances = res.get("feature_importances_topk") or []
+        if feature_importances:
+            preview_items = []
+            for item in feature_importances[:5]:
+                feat = item.get("feature")
+                imp = item.get("importance")
+                if feat is None or imp is None:
+                    continue
+                try:
+                    preview_items.append(f"{feat}({float(imp):.3f})")
+                except Exception:
+                    continue
+            if preview_items:
+                msg_lines.append("Top特征重要性: " + ", ".join(preview_items))
         msg = "\n".join(msg_lines)
         self.display_result(f"[INFO] 训练完成：\n{msg}")
         for k in ("results_csv", "summary_csv", "model_path", "scaler_path", "pipeline_latest", "metadata_latest", "metadata_path"):
@@ -1981,6 +2112,8 @@ class Ui_MainWindow(object):
         try:
             self._settings.set("rbf_components", int(self.rbf_components_spin.value()))
             self._settings.set("rbf_gamma", float(self.rbf_gamma_spin.value()))
+            self._settings.set("fusion_enabled", bool(self.fusion_checkbox.isChecked()))
+            self._settings.set("fusion_alpha", float(self.fusion_alpha_spin.value()))
         except Exception:
             pass
 
@@ -2002,6 +2135,14 @@ class Ui_MainWindow(object):
                 self.rbf_gamma_spin.setValue(float(saved_gamma))
             except Exception:
                 self.rbf_gamma_spin.setValue(0.0)
+            fusion_enabled = self._settings.get("fusion_enabled", True)
+            self.fusion_checkbox.setChecked(bool(fusion_enabled))
+            saved_alpha = self._settings.get("fusion_alpha", 0.5)
+            try:
+                self.fusion_alpha_spin.setValue(float(saved_alpha))
+            except Exception:
+                self.fusion_alpha_spin.setValue(0.5)
+            self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
         finally:
             self._loading_settings = False
 
