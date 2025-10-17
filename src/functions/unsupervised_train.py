@@ -22,7 +22,7 @@ from joblib import dump
 from src.functions.feature_extractor import extract_features, extract_features_dir
 from src.functions.anomaly_detector import EnsembleAnomalyDetector
 from src.functions.logging_utils import get_logger
-from src.functions.transformers import PreprocessPipeline
+from src.functions.transformers import FeatureAligner, PreprocessPipeline
 
 logger = get_logger(__name__)
 
@@ -487,6 +487,8 @@ def _train_from_dataframe(
     rbf_gamma: Optional[float] = None,
     fill_values: Optional[Dict[str, object]] = None,
     categorical_maps: Optional[Dict[str, Dict[str, object]]] = None,
+    fusion_alpha: float = 0.5,
+    enable_supervised_fusion: bool = True,
 ) -> dict:
     if df.empty:
         raise RuntimeError("训练数据为空。")
@@ -513,27 +515,99 @@ def _train_from_dataframe(
         random_state=42,
     )
 
+    fill_values_clean: Dict[str, object] = (
+        {str(k): v for k, v in (fill_values or {}).items()}
+        if fill_values
+        else {}
+    )
+    categorical_maps_clean: Dict[str, Dict[str, object]] = (
+        {str(k): dict(v) if isinstance(v, dict) else {} for k, v in (categorical_maps or {}).items()}
+        if categorical_maps
+        else {}
+    )
+    categorical_fill_defaults = {key: -1 for key in categorical_maps_clean.keys()}
+    column_fill_values = dict(categorical_fill_defaults)
+    column_fill_values.update(fill_values_clean)
+
+    aligner = FeatureAligner(
+        feature_columns,
+        fill_value=0.0,
+        column_fill_values=column_fill_values,
+    )
     preprocessor = PreprocessPipeline(
         feature_order=feature_columns,
         fill_value=0.0,
-        fill_values=fill_values,
-        categorical_maps=categorical_maps,
+        fill_values=fill_values_clean,
+        categorical_maps=categorical_maps_clean,
+        aligner_in_pipeline=True,
     )
     feature_df_numeric = feature_df.loc[:, feature_columns].copy()
+
+    data_quality_report: Dict[str, object] = {}
+    empty_columns = [
+        col
+        for col in feature_columns
+        if feature_df_numeric[col].dropna().empty
+    ]
+    constant_columns = [
+        col
+        for col in feature_columns
+        if feature_df_numeric[col].nunique(dropna=True) <= 1
+    ]
+    if empty_columns:
+        logger.warning("Detected empty columns during training: %s", empty_columns[:20])
+    if constant_columns:
+        logger.warning("Detected constant columns during training: %s", constant_columns[:20])
+
+    winsor_bounds: Dict[str, Dict[str, float]] = {}
+    numeric_columns = [
+        col for col in feature_columns if is_numeric_dtype(feature_df_numeric[col])
+    ]
+    if numeric_columns:
+        lower_bounds = feature_df_numeric[numeric_columns].quantile(0.001)
+        upper_bounds = feature_df_numeric[numeric_columns].quantile(0.999)
+        for col in numeric_columns:
+            lower = lower_bounds.get(col)
+            upper = upper_bounds.get(col)
+            if pd.isna(lower) or pd.isna(upper) or lower >= upper:
+                continue
+            series = feature_df_numeric[col]
+            clipped = series.clip(lower, upper)
+            if not clipped.equals(series):
+                feature_df_numeric[col] = clipped
+                winsor_bounds[col] = {
+                    "lower": float(lower),
+                    "upper": float(upper),
+                }
+    if winsor_bounds:
+        logger.info(
+            "Applied winsorization to %d numeric columns", len(winsor_bounds)
+        )
+    data_quality_report["empty_columns"] = empty_columns
+    data_quality_report["constant_columns"] = constant_columns
+    data_quality_report["winsorized_columns"] = winsor_bounds
 
     sample_count = len(feature_df_numeric)
     base_dim = max(len(feature_columns), 1)
     auto_components = int(
         np.clip(np.sqrt(max(1, min(sample_count, base_dim))) * 40, 600, 2000)
     )
+    representation_shapes: Dict[str, List[int]] = {
+        "base": [int(sample_count), int(base_dim)]
+    }
     if rbf_components is not None and rbf_components > 0:
         used_components = int(rbf_components)
     else:
         used_components = auto_components
     auto_gamma = float(np.clip(1.0 / np.sqrt(float(base_dim)), 0.05, 0.5))
-    used_gamma = float(rbf_gamma) if rbf_gamma and rbf_gamma > 0 else auto_gamma
+    gamma_source = "manual" if rbf_gamma and rbf_gamma > 0 else "auto"
+    used_gamma = float(rbf_gamma) if gamma_source == "manual" else auto_gamma
+    fusion_alpha = float(np.clip(fusion_alpha if fusion_alpha is not None else 0.5, 0.0, 1.0))
+    fusion_enabled = bool(enable_supervised_fusion)
+    fusion_source: Optional[str] = None
 
     pipeline_steps = [
+        ("aligner", aligner),
         ("preprocessor", preprocessor),
         ("variance_filter", VarianceThreshold(threshold=1e-6)),
         ("scaler", StandardScaler()),
@@ -559,13 +633,14 @@ def _train_from_dataframe(
     pipeline = Pipeline(pipeline_steps)
 
     logger.info(
-        "Starting unsupervised training: rows=%d features=%d contamination=%.4f (adaptive=%.4f) rbf_components=%d rbf_gamma=%.3f",
+        "Starting unsupervised training: rows=%d features=%d contamination=%.4f (adaptive=%.4f) rbf_components=%d rbf_gamma=%.3f [%s]",
         len(feature_df_numeric),
         len(feature_columns),
         contamination,
         adaptive_contamination,
         used_components,
         used_gamma,
+        gamma_source,
     )
 
     if progress_cb:
@@ -586,11 +661,18 @@ def _train_from_dataframe(
     transformed_features: Optional[np.ndarray] = None
 
     supervised_metrics = None
+    svd_info: Optional[Dict[str, object]] = None
+    feature_importances_topk: Optional[List[Dict[str, object]]] = None
     if ground_truth is not None:
         transformed = pre_detector.transform(feature_df_numeric)
         transformed_features = transformed
         if transformed.ndim == 1:
             transformed = transformed.reshape(-1, 1)
+        if transformed.ndim == 2:
+            representation_shapes["expanded"] = [
+                int(transformed.shape[0]),
+                int(transformed.shape[1]),
+            ]
 
         svd = None
         reduced = transformed
@@ -598,6 +680,19 @@ def _train_from_dataframe(
             target_dim = min(512, max(64, transformed.shape[1] // 4))
             svd = TruncatedSVD(n_components=target_dim, random_state=42)
             reduced = svd.fit_transform(transformed)
+            representation_shapes["reduced"] = [
+                int(reduced.shape[0]),
+                int(reduced.shape[1]),
+            ]
+            if hasattr(svd, "explained_variance_ratio_"):
+                ratios = np.asarray(svd.explained_variance_ratio_, dtype=float)
+                top_k = min(20, ratios.size)
+                svd_info = {
+                    "components": int(ratios.size),
+                    "top_variance_ratio": [float(v) for v in ratios[:top_k]],
+                    "cumulative_top": float(ratios[:top_k].sum()) if top_k else 0.0,
+                    "total_variance": float(ratios.sum()),
+                }
 
         supervised_model = HistGradientBoostingClassifier(
             max_depth=5,
@@ -642,6 +737,31 @@ def _train_from_dataframe(
             "threshold": float(best_thr),
         }
 
+        try:
+            raw_supervised = HistGradientBoostingClassifier(
+                max_depth=5,
+                learning_rate=0.08,
+                max_iter=200,
+                l2_regularization=1.0,
+                early_stopping=True,
+                random_state=137,
+            )
+            raw_supervised.fit(feature_df_numeric, ground_truth)
+            importances = np.asarray(raw_supervised.feature_importances_, dtype=float)
+            if importances.size:
+                order = np.argsort(importances)[::-1]
+                top_limit = min(20, importances.size)
+                feature_importances_topk = [
+                    {
+                        "feature": feature_columns[idx],
+                        "importance": float(importances[idx]),
+                    }
+                    for idx in order[:top_limit]
+                    if importances[idx] > 0
+                ]
+        except Exception as exc:
+            logger.warning("Failed to compute feature importances: %s", exc)
+
     scores = None
     if detector.last_combined_scores_ is not None:
         scores = detector.last_combined_scores_
@@ -650,6 +770,15 @@ def _train_from_dataframe(
     else:
         if transformed_features is None:
             transformed_features = pre_detector.transform(feature_df_numeric)
+        if (
+            transformed_features is not None
+            and transformed_features.ndim == 2
+            and "expanded" not in representation_shapes
+        ):
+            representation_shapes["expanded"] = [
+                int(transformed_features.shape[0]),
+                int(transformed_features.shape[1]),
+            ]
         scores = detector.score_samples(transformed_features)
     scores = np.asarray(scores, dtype=float)
 
@@ -659,6 +788,8 @@ def _train_from_dataframe(
         expanded_dim = int(getattr(feature_expander, "n_components"))
     elif transformed_features is not None:
         expanded_dim = int(transformed_features.shape[1])
+    if expanded_dim is not None and "expanded" not in representation_shapes:
+        representation_shapes["expanded"] = [int(sample_count), int(expanded_dim)]
 
     preds = pipeline.predict(feature_df_numeric)
     is_malicious = (preds == -1).astype(int)
@@ -687,15 +818,26 @@ def _train_from_dataframe(
     vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
     risk_score = np.clip(0.6 * conf_from_score + 0.4 * vote_component, 0.0, 1.0)
 
-    if detector.last_supervised_scores_ is not None:
-        supervised_scores = detector.last_supervised_scores_.astype(float)
-        risk_score = np.clip(0.5 * risk_score + 0.5 * supervised_scores, 0.0, 1.0)
-    elif detector.last_calibrated_scores_ is not None:
-        calibrated_scores = detector.last_calibrated_scores_.astype(float)
-        risk_score = np.clip(0.6 * risk_score + 0.4 * calibrated_scores, 0.0, 1.0)
-    elif supervised_proba is not None:
-        sup_scores = np.clip(supervised_proba.astype(float), 0.0, 1.0)
-        risk_score = np.clip(0.5 * risk_score + 0.5 * sup_scores, 0.0, 1.0)
+    if fusion_enabled:
+        fusion_candidates = [
+            ("supervised_model", getattr(detector, "last_supervised_scores_", None)),
+            ("calibration", getattr(detector, "last_calibrated_scores_", None)),
+            ("supervised_proba", supervised_proba),
+        ]
+        for label, candidate in fusion_candidates:
+            if candidate is None:
+                continue
+            extra = np.asarray(candidate, dtype=float)
+            if extra.shape != risk_score.shape:
+                continue
+            extra = np.clip(extra, 0.0, 1.0)
+            risk_score = np.clip(
+                fusion_alpha * risk_score + (1.0 - fusion_alpha) * extra,
+                0.0,
+                1.0,
+            )
+            fusion_source = label
+            break
 
     anomaly_confidence = risk_score.copy()
 
@@ -817,6 +959,15 @@ def _train_from_dataframe(
         "rbf_components": used_components,
         "rbf_n_components": used_components,
         "rbf_gamma": used_gamma,
+        "rbf_gamma_auto": auto_gamma,
+        "rbf_gamma_source": gamma_source,
+        "fusion_enabled": fusion_enabled,
+        "fusion_alpha": fusion_alpha,
+        "fusion_source": fusion_source,
+        "representation_shapes": representation_shapes,
+        "svd_info": svd_info,
+        "feature_importances_topk": feature_importances_topk or [],
+        "data_quality": data_quality_report,
         "preprocessor_path": preprocessor_path,
         "preprocessor_latest": latest_preprocessor_path,
     }
@@ -895,6 +1046,15 @@ def _train_from_dataframe(
         "rbf_components": used_components,
         "rbf_n_components": used_components,
         "rbf_gamma": used_gamma,
+        "rbf_gamma_auto": auto_gamma,
+        "rbf_gamma_source": gamma_source,
+        "fusion_enabled": fusion_enabled,
+        "fusion_alpha": fusion_alpha,
+        "fusion_source": fusion_source,
+        "representation_shapes": representation_shapes,
+        "svd_info": svd_info,
+        "feature_importances_topk": feature_importances_topk or [],
+        "data_quality": data_quality_report,
     }
 
 
@@ -908,6 +1068,8 @@ def _train_from_preprocessed_csv(
     progress_cb=None,
     rbf_components: Optional[int] = None,
     rbf_gamma: Optional[float] = None,
+    fusion_alpha: float = 0.5,
+    enable_supervised_fusion: bool = True,
 ) -> dict:
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"预处理数据集不存在: {dataset_path}")
@@ -980,6 +1142,8 @@ def _train_from_preprocessed_csv(
         rbf_gamma=rbf_gamma,
         fill_values=fill_values_hint,
         categorical_maps=categorical_maps_hint,
+        fusion_alpha=fusion_alpha,
+        enable_supervised_fusion=enable_supervised_fusion,
     )
 
 
@@ -993,6 +1157,8 @@ def _train_from_npz(
     progress_cb=None,
     rbf_components: Optional[int] = None,
     rbf_gamma: Optional[float] = None,
+    fusion_alpha: float = 0.5,
+    enable_supervised_fusion: bool = True,
 ) -> dict:
     X, columns = _load_npz_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -1051,6 +1217,8 @@ def _train_from_npz(
         rbf_gamma=rbf_gamma,
         fill_values=fill_values_hint,
         categorical_maps=categorical_maps_hint,
+        fusion_alpha=fusion_alpha,
+        enable_supervised_fusion=enable_supervised_fusion,
     )
 
 
@@ -1064,6 +1232,8 @@ def _train_from_npy(
     progress_cb=None,
     rbf_components: Optional[int] = None,
     rbf_gamma: Optional[float] = None,
+    fusion_alpha: float = 0.5,
+    enable_supervised_fusion: bool = True,
 ) -> dict:
     X, columns, meta_data = _load_npy_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -1138,6 +1308,8 @@ def _train_from_npy(
         rbf_gamma=rbf_gamma,
         fill_values=fill_values_hint,
         categorical_maps=categorical_maps_hint,
+        fusion_alpha=fusion_alpha,
+        enable_supervised_fusion=enable_supervised_fusion,
     )
 
 
@@ -1151,6 +1323,8 @@ def train_unsupervised_on_split(
     workers: int = 4,
     rbf_components: Optional[int] = None,
     rbf_gamma: Optional[float] = None,
+    fusion_alpha: float = 0.5,
+    enable_supervised_fusion: bool = True,
 ):
     """
     无监督训练：
@@ -1211,6 +1385,8 @@ def train_unsupervised_on_split(
                 progress_cb=progress_cb,
                 rbf_components=rbf_components,
                 rbf_gamma=rbf_gamma,
+                fusion_alpha=fusion_alpha,
+                enable_supervised_fusion=enable_supervised_fusion,
             )
         if ext == ".npy":
             return _train_from_npy(
@@ -1222,6 +1398,8 @@ def train_unsupervised_on_split(
                 progress_cb=progress_cb,
                 rbf_components=rbf_components,
                 rbf_gamma=rbf_gamma,
+                fusion_alpha=fusion_alpha,
+                enable_supervised_fusion=enable_supervised_fusion,
             )
         if ext == ".npz":
             return _train_from_npz(
@@ -1233,6 +1411,8 @@ def train_unsupervised_on_split(
                 progress_cb=progress_cb,
                 rbf_components=rbf_components,
                 rbf_gamma=rbf_gamma,
+                fusion_alpha=fusion_alpha,
+                enable_supervised_fusion=enable_supervised_fusion,
             )
         raise FileNotFoundError(f"不支持的数据集格式: {dataset_path}")
 
@@ -1287,4 +1467,6 @@ def train_unsupervised_on_split(
         feature_columns_hint=None,
         rbf_components=rbf_components,
         rbf_gamma=rbf_gamma,
+        fusion_alpha=fusion_alpha,
+        enable_supervised_fusion=enable_supervised_fusion,
     )
