@@ -149,6 +149,7 @@ class PreprocessPipeline(BaseEstimator, TransformerMixin):
         *,
         fill_values: Optional[Dict[str, object]] = None,
         categorical_maps: Optional[Dict[str, Dict[str, object]]] = None,
+        aligner_in_pipeline: bool = False,
     ) -> None:
         self.feature_order = list(feature_order)
         self.fill_value = float(fill_value)
@@ -164,24 +165,26 @@ class PreprocessPipeline(BaseEstimator, TransformerMixin):
         column_fill_values = dict(categorical_fill)
         column_fill_values.update(self.fill_values)
 
+        self.column_fill_values = column_fill_values
+        self.aligner_in_pipeline = bool(aligner_in_pipeline)
         self.aligner = FeatureAligner(
             self.feature_order,
             self.fill_value,
-            column_fill_values=column_fill_values,
+            column_fill_values=self.column_fill_values,
         )
         self.imputer = SimpleImputerByDtype(preset_numeric=self.fill_values)
 
     def fit(self, X, y: Optional[object] = None):  # noqa: D401
         if not isinstance(X, pd.DataFrame):
             raise TypeError("PreprocessPipeline 仅支持 pandas DataFrame 输入。")
-        aligned = self.aligner.transform(X)
+        aligned = X if self.aligner_in_pipeline else self.aligner.transform(X)
         self.imputer.fit(aligned)
         return self
 
     def transform(self, X):  # noqa: D401
         if not isinstance(X, pd.DataFrame):
             raise TypeError("PreprocessPipeline 仅支持 pandas DataFrame 输入。")
-        aligned = self.aligner.transform(X)
+        aligned = X if self.aligner_in_pipeline else self.aligner.transform(X)
         return self.imputer.transform(aligned)
 
     # metadata helpers -------------------------------------------------
@@ -191,7 +194,8 @@ class PreprocessPipeline(BaseEstimator, TransformerMixin):
             "fill_value": float(self.fill_value),
             "fill_values": self.fill_values,
             "categorical_maps": self.categorical_maps,
-            "column_fill_values": self.aligner.column_fill_values,
+            "column_fill_values": self.column_fill_values,
+            "aligner_in_pipeline": self.aligner_in_pipeline,
             "input_columns": list(self.feature_order),
             "imputer": self.imputer.to_metadata(),
         }
@@ -202,16 +206,19 @@ class PreprocessPipeline(BaseEstimator, TransformerMixin):
         fill_value = payload.get("fill_value", 0.0)
         fill_values = payload.get("fill_values") or {}
         categorical_maps = payload.get("categorical_maps") or {}
+        aligner_in_pipeline = bool(payload.get("aligner_in_pipeline", False))
         inst = cls(
             feature_order=feature_order,
             fill_value=float(fill_value),
             fill_values=fill_values,
             categorical_maps=categorical_maps,
+            aligner_in_pipeline=aligner_in_pipeline,
         )
         imputer_meta = payload.get("imputer") or {}
         inst.imputer = SimpleImputerByDtype.from_metadata(imputer_meta)
         # 覆盖 aligner 的列填充值，确保与训练阶段保持一致
         column_fill_values = payload.get("column_fill_values") or {}
         if column_fill_values:
+            inst.column_fill_values = dict(column_fill_values)
             inst.aligner.column_fill_values = dict(column_fill_values)
         return inst
