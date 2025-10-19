@@ -1,6 +1,7 @@
 """特征 CSV 数据预处理，将其整理成可直接用于模型训练的标准化数据集。"""
 
 import glob
+import hashlib
 import json
 import math
 import os
@@ -205,6 +206,7 @@ def preprocess_feature_dir(
     dataset_path = os.path.join(output_dir, f"{base_name}.npy")
     manifest_path = os.path.join(output_dir, f"{base_name}_manifest.csv")
     meta_path = os.path.join(output_dir, f"{base_name}_meta.json")
+    feature_list_path = os.path.join(output_dir, f"{base_name}_feature_list.json")
 
     counter = 1
     while os.path.exists(dataset_path):
@@ -212,6 +214,7 @@ def preprocess_feature_dir(
         dataset_path = os.path.join(output_dir, f"{base_name}.npy")
         manifest_path = os.path.join(output_dir, f"{base_name}_manifest.csv")
         meta_path = os.path.join(output_dir, f"{base_name}_meta.json")
+        feature_list_path = os.path.join(output_dir, f"{base_name}_feature_list.json")
         counter += 1
 
     fill_strategies: Dict[str, float] = {}
@@ -336,6 +339,8 @@ def preprocess_feature_dir(
 
     feature_matrix = np.vstack(feature_parts).astype(np.float32, copy=False)
 
+    feature_hash = hashlib.sha256("\n".join(feature_columns).encode("utf-8")).hexdigest()
+
     meta_payload = {
         "type": "preprocessed_dataset",
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -348,6 +353,8 @@ def preprocess_feature_dir(
         "column_profiles": column_profiles,
         "files": [os.path.abspath(p) for p in csv_files],
         "dataset_format": "npy",
+        "feature_list_path": feature_list_path,
+        "feature_hash": feature_hash,
     }
 
     meta_arrays: Dict[str, np.ndarray] = {}
@@ -370,6 +377,16 @@ def preprocess_feature_dir(
     with open(meta_path, "w", encoding="utf-8") as fh:
         json.dump(meta_payload, fh, ensure_ascii=False, indent=2)
 
+    feature_list_payload = {
+        "schema_version": "2025.10",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "feature_columns": feature_columns,
+        "feature_hash": feature_hash,
+        "source": os.path.abspath(resolved_source) if resolved_source else "",
+    }
+    with open(feature_list_path, "w", encoding="utf-8") as fh:
+        json.dump(feature_list_payload, fh, ensure_ascii=False, indent=2)
+
     np.save(dataset_path, dataset_payload, allow_pickle=True)
 
     _notify(progress_cb, 100)
@@ -382,4 +399,6 @@ def preprocess_feature_dir(
         "total_cols": int(len(feature_columns)),
         "feature_columns": feature_columns,
         "files": csv_files,
+        "feature_list_path": feature_list_path,
+        "feature_hash": feature_hash,
     }

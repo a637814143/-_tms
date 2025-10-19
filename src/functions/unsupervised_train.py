@@ -1,5 +1,6 @@
 """无监督异常检测训练流程。"""
 
+import hashlib
 import json
 import os
 import shutil
@@ -13,8 +14,16 @@ from pandas.api.types import is_numeric_dtype
 from sklearn.decomposition import TruncatedSVD
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.feature_selection import VarianceThreshold
+from sklearn.inspection import permutation_importance
 from sklearn.kernel_approximation import RBFSampler
-from sklearn.metrics import accuracy_score, f1_score, fbeta_score, precision_score, recall_score
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    fbeta_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import QuantileTransformer, StandardScaler
 from joblib import dump
@@ -192,13 +201,14 @@ def _is_preprocessed_csv(path: str) -> bool:
 
 
 def _series_to_binary(series: pd.Series) -> Optional[np.ndarray]:
-    """尝试把标签列解析为 0/1。"""
+    """尝试把标签列解析为 0/1，并允许未标注值。"""
 
     if series.empty:
         return None
 
     if series.dtype == bool:
-        return series.fillna(False).astype(int).to_numpy()
+        arr = series.fillna(False).astype(int).to_numpy()
+        return arr.astype(float) if arr.size else None
 
     try:
         numeric = pd.to_numeric(series, errors="coerce")
@@ -206,9 +216,15 @@ def _series_to_binary(series: pd.Series) -> Optional[np.ndarray]:
         numeric = None
 
     if numeric is not None and not numeric.isna().all():
-        arr = numeric.fillna(0.0).to_numpy()
-        binary = np.where(arr > 0, 1, 0).astype(int)
-        if np.unique(binary).size >= 2:
+        arr = numeric.to_numpy(dtype=float)
+        binary = np.full(arr.shape, np.nan, dtype=float)
+        finite_mask = np.isfinite(arr)
+        if finite_mask.any():
+            positive_mask = finite_mask & (arr > 0)
+            zero_mask = finite_mask & (arr == 0)
+            binary[positive_mask] = 1.0
+            binary[zero_mask] = 0.0
+        if np.isfinite(binary).any():
             return binary
 
     normalized = (
@@ -223,7 +239,7 @@ def _series_to_binary(series: pd.Series) -> Optional[np.ndarray]:
     if normalized.eq("unknown").all():
         return None
 
-    parsed = np.full(len(normalized), fill_value=-1, dtype=int)
+    parsed = np.full(len(normalized), np.nan, dtype=float)
 
     for idx, value in enumerate(normalized):
         candidates = {
@@ -233,60 +249,27 @@ def _series_to_binary(series: pd.Series) -> Optional[np.ndarray]:
             value.replace(" ", "").strip("。.,，!！?？；;:"),
         }
         if any(candidate in NORMAL_TOKEN_VARIANTS for candidate in candidates if candidate):
-            parsed[idx] = 0
-        elif any(candidate in ANOMALY_TOKEN_VARIANTS for candidate in candidates if candidate):
-            parsed[idx] = 1
-        else:
-            try:
-                numeric_value = float(value)
-            except Exception:
-                numeric_value = None
-            if numeric_value is not None:
-                parsed[idx] = 1 if numeric_value > 0 else 0
+            parsed[idx] = 0.0
+            continue
+        if any(candidate in ANOMALY_TOKEN_VARIANTS for candidate in candidates if candidate):
+            parsed[idx] = 1.0
+            continue
+        try:
+            numeric_value = float(value)
+        except Exception:
+            numeric_value = None
+        if numeric_value is None:
+            continue
+        if numeric_value > 0:
+            parsed[idx] = 1.0
+        elif numeric_value == 0:
+            parsed[idx] = 0.0
 
-    unresolved_mask = parsed == -1
-    if np.all(unresolved_mask):
-        # 完全未知的取值，尝试根据主频词推断
-        value_counts = normalized.value_counts()
-        if value_counts.size < 2:
-            return None
-        majority = value_counts.idxmax()
-        majority_mask = normalized.eq(majority).to_numpy()
-        parsed = np.where(majority_mask, 0, 1)
-    elif np.any(unresolved_mask):
-        unresolved_values = normalized[unresolved_mask]
-        known_normal = np.count_nonzero(parsed == 0)
-        known_anomaly = np.count_nonzero(parsed == 1)
-
-        unresolved_unique = unresolved_values.unique()
-        unresolved_ratio = len(unresolved_values) / len(parsed)
-
-        if known_normal == 0 and known_anomaly == 0:
-            # 没有任何已识别标签，仍退化为主频词推断
-            value_counts = normalized.value_counts()
-            if value_counts.size < 2:
-                return None
-            majority = value_counts.idxmax()
-            majority_mask = normalized.eq(majority).to_numpy()
-            parsed = np.where(majority_mask, 0, 1)
-        elif known_normal > 0 and known_anomaly == 0:
-            # 已知正常类别存在。若未知类别种类丰富，则把它们视为异常；
-            # 若仅出现单一取值且占比过大，则认为信息不足直接放弃。
-            if unresolved_unique.size == 1 and unresolved_ratio > 0.4:
-                return None
-            parsed[unresolved_mask] = 1
-        elif known_anomaly > 0 and known_normal == 0:
-            if unresolved_unique.size == 1 and unresolved_ratio > 0.4:
-                return None
-            parsed[unresolved_mask] = 0
-        else:
-            # 已经识别出正负样本，剩余全部按异常处理
-            parsed[unresolved_mask] = 1
-
-    unique = np.unique(parsed)
-    if unique.size < 2:
+    labeled_mask = np.isfinite(parsed)
+    if not labeled_mask.any():
         return None
-    return parsed.astype(int)
+
+    return parsed
 
 
 def _extract_ground_truth(df: pd.DataFrame) -> Tuple[Optional[str], Optional[np.ndarray]]:
@@ -494,14 +477,29 @@ def _train_from_dataframe(
         raise RuntimeError("训练数据为空。")
 
     working_df = df.copy()
-    ground_truth_column, ground_truth = _extract_ground_truth(working_df)
+    ground_truth_column, ground_truth_raw = _extract_ground_truth(working_df)
+    ground_truth: Optional[np.ndarray] = None
+    ground_truth_mask: Optional[np.ndarray] = None
+    ground_truth_labels: Optional[np.ndarray] = None
+    if ground_truth_raw is not None:
+        arr = np.asarray(ground_truth_raw, dtype=float)
+        labeled_mask = np.isfinite(arr) & (arr >= 0)
+        if labeled_mask.any():
+            labeled_values = np.where(arr[labeled_mask] > 0, 1.0, 0.0)
+            arr = arr.astype(float)
+            arr[~labeled_mask] = np.nan
+            arr[labeled_mask] = labeled_values
+            ground_truth = arr
+            ground_truth_mask = labeled_mask.astype(bool)
+            ground_truth_labels = labeled_values.astype(int)
+
     feature_df, feature_columns = _prepare_feature_frame(
         working_df, feature_columns_hint=feature_columns_hint
     )
 
     adaptive_contamination = float(contamination)
-    if ground_truth is not None:
-        anomaly_ratio = float(np.mean(ground_truth))
+    if ground_truth is not None and ground_truth_labels is not None and ground_truth_labels.size:
+        anomaly_ratio = float(np.mean(ground_truth_labels))
         if anomaly_ratio > 0.0:
             adaptive_contamination = float(
                 np.clip(anomaly_ratio * 1.2 + 1e-3, 0.001, 0.4)
@@ -663,6 +661,7 @@ def _train_from_dataframe(
     supervised_metrics = None
     svd_info: Optional[Dict[str, object]] = None
     feature_importances_topk: Optional[List[Dict[str, object]]] = None
+    permutation_topk: Optional[List[Dict[str, object]]] = None
     if ground_truth is not None:
         transformed = pre_detector.transform(feature_df_numeric)
         transformed_features = transformed
@@ -694,73 +693,123 @@ def _train_from_dataframe(
                     "total_variance": float(ratios.sum()),
                 }
 
-        supervised_model = HistGradientBoostingClassifier(
-            max_depth=5,
-            learning_rate=0.08,
-            max_iter=200,
-            l2_regularization=1.0,
-            early_stopping=True,
-            random_state=42,
+        can_train_supervised = (
+            ground_truth_mask is not None
+            and ground_truth_labels is not None
+            and np.unique(ground_truth_labels).size >= 2
         )
-        supervised_model.fit(reduced, ground_truth)
-        supervised_proba = supervised_model.predict_proba(reduced)[:, 1]
-        thr_candidates = np.linspace(0.1, 0.9, 41)
-        best_thr = 0.5
-        best_f1 = -1.0
-        best_f05 = -1.0
-        best_prec = 0.0
-        best_rec = 0.0
-        for thr in thr_candidates:
-            preds = (supervised_proba >= thr).astype(int)
-            precision = precision_score(ground_truth, preds, zero_division=0)
-            recall = recall_score(ground_truth, preds, zero_division=0)
-            f1 = f1_score(ground_truth, preds, zero_division=0)
-            f05 = fbeta_score(ground_truth, preds, beta=0.5, zero_division=0)
-            if (f05 > best_f05 + 1e-12) or (
-                abs(f05 - best_f05) <= 1e-12 and f1 > best_f1
-            ):
-                best_f1 = f1
-                best_f05 = f05
-                best_thr = thr
-                best_prec = precision
-                best_rec = recall
-        detector.supervised_model_ = supervised_model
-        detector.supervised_threshold_ = float(best_thr)
-        detector.supervised_input_dim_ = reduced.shape[1]
-        detector.supervised_projector_ = svd
-        detector.last_supervised_scores_ = supervised_proba.astype(float)
-        supervised_metrics = {
-            "precision": float(best_prec),
-            "recall": float(best_rec),
-            "f1": float(best_f1),
-            "f0.5": float(best_f05),
-            "threshold": float(best_thr),
-        }
+        if can_train_supervised:
+            mask_series = pd.Series(ground_truth_mask, index=feature_df_numeric.index)
+            labeled_reduced = reduced[ground_truth_mask]
+            labeled_truth = ground_truth_labels
 
-        try:
-            raw_supervised = HistGradientBoostingClassifier(
+            supervised_model = HistGradientBoostingClassifier(
                 max_depth=5,
                 learning_rate=0.08,
                 max_iter=200,
                 l2_regularization=1.0,
                 early_stopping=True,
-                random_state=137,
+                random_state=42,
             )
-            raw_supervised.fit(feature_df_numeric, ground_truth)
-            importances = np.asarray(raw_supervised.feature_importances_, dtype=float)
-            if importances.size:
-                order = np.argsort(importances)[::-1]
-                top_limit = min(20, importances.size)
-                feature_importances_topk = [
-                    {
-                        "feature": feature_columns[idx],
-                        "importance": float(importances[idx]),
-                    }
-                    for idx in order[:top_limit]
-                    if importances[idx] > 0
-                ]
-        except Exception as exc:
-            logger.warning("Failed to compute feature importances: %s", exc)
+            supervised_model.fit(labeled_reduced, labeled_truth)
+            supervised_proba_all = supervised_model.predict_proba(reduced)[:, 1]
+            supervised_proba = supervised_proba_all
+            thr_candidates = np.linspace(0.1, 0.9, 41)
+            best_thr = 0.5
+            best_f1 = -1.0
+            best_f05 = -1.0
+            best_prec = 0.0
+            best_rec = 0.0
+            labeled_scores = supervised_proba_all[ground_truth_mask]
+            for thr in thr_candidates:
+                preds = (labeled_scores >= thr).astype(int)
+                precision = precision_score(labeled_truth, preds, zero_division=0)
+                recall = recall_score(labeled_truth, preds, zero_division=0)
+                f1 = f1_score(labeled_truth, preds, zero_division=0)
+                f05 = fbeta_score(labeled_truth, preds, beta=0.5, zero_division=0)
+                if (f05 > best_f05 + 1e-12) or (
+                    abs(f05 - best_f05) <= 1e-12 and f1 > best_f1
+                ):
+                    best_f1 = f1
+                    best_f05 = f05
+                    best_thr = thr
+                    best_prec = precision
+                    best_rec = recall
+            detector.supervised_model_ = supervised_model
+            detector.supervised_threshold_ = float(best_thr)
+            detector.supervised_input_dim_ = reduced.shape[1]
+            detector.supervised_projector_ = svd
+            detector.last_supervised_scores_ = supervised_proba_all.astype(float)
+            supervised_metrics = {
+                "precision": float(best_prec),
+                "recall": float(best_rec),
+                "f1": float(best_f1),
+                "f0.5": float(best_f05),
+                "threshold": float(best_thr),
+            }
+
+            try:
+                raw_supervised = HistGradientBoostingClassifier(
+                    max_depth=5,
+                    learning_rate=0.08,
+                    max_iter=200,
+                    l2_regularization=1.0,
+                    early_stopping=True,
+                    random_state=137,
+                )
+                labeled_features = feature_df_numeric.loc[mask_series, feature_columns]
+                labeled_truth_series = pd.Series(labeled_truth, index=labeled_features.index)
+                raw_supervised.fit(labeled_features, labeled_truth_series.to_numpy())
+                importances = np.asarray(raw_supervised.feature_importances_, dtype=float)
+                if importances.size:
+                    order = np.argsort(importances)[::-1]
+                    top_limit = min(20, importances.size)
+                    feature_importances_topk = [
+                        {
+                            "feature": feature_columns[idx],
+                            "importance": float(importances[idx]),
+                        }
+                        for idx in order[:top_limit]
+                        if importances[idx] > 0
+                    ]
+
+                try:
+                    perm_features = labeled_features
+                    max_perm_samples = 5000
+                    if len(perm_features) > max_perm_samples:
+                        rng = np.random.default_rng(42)
+                        sample_idx = rng.choice(
+                            perm_features.index.to_numpy(), size=max_perm_samples, replace=False
+                        )
+                        perm_features = perm_features.loc[sample_idx]
+                        perm_labels = labeled_truth_series.loc[sample_idx].to_numpy()
+                    else:
+                        perm_labels = labeled_truth_series.to_numpy()
+                    perm_result = permutation_importance(
+                        raw_supervised,
+                        perm_features,
+                        perm_labels,
+                        n_repeats=5,
+                        random_state=42,
+                        n_jobs=-1,
+                    )
+                    perm_scores = perm_result.importances_mean
+                    order = np.argsort(perm_scores)[::-1]
+                    permutation_topk = [
+                        {
+                            "feature": feature_columns[idx],
+                            "importance": float(perm_scores[idx]),
+                        }
+                        for idx in order[: min(20, len(order))]
+                        if perm_scores[idx] > 0
+                    ]
+                except Exception as exc:
+                    logger.warning("Failed to compute permutation importance: %s", exc)
+
+            except Exception as exc:
+                logger.warning("Failed to compute feature importances: %s", exc)
+        else:
+            logger.info("Skipping supervised fine-tuning due to insufficient labeled samples.")
 
     scores = None
     if detector.last_combined_scores_ is not None:
@@ -925,6 +974,22 @@ def _train_from_dataframe(
             except Exception:
                 continue
 
+    feature_hash = hashlib.sha256("\n".join(feature_columns).encode("utf-8")).hexdigest()
+    feature_list_payload = {
+        "schema_version": MODEL_SCHEMA_VERSION,
+        "timestamp": timestamp,
+        "feature_columns": feature_columns,
+        "feature_hash": feature_hash,
+    }
+    feature_list_name = f"iforest_features_{timestamp}.json"
+    feature_list_path = os.path.join(models_dir, feature_list_name)
+    with open(feature_list_path, "w", encoding="utf-8") as fh:
+        json.dump(feature_list_payload, fh, ensure_ascii=False, indent=2)
+
+    latest_feature_list_path = os.path.join(models_dir, "latest_feature_list.json")
+    with open(latest_feature_list_path, "w", encoding="utf-8") as fh:
+        json.dump(feature_list_payload, fh, ensure_ascii=False, indent=2)
+
     metadata = {
         "schema_version": MODEL_SCHEMA_VERSION,
         "timestamp": timestamp,
@@ -966,10 +1031,12 @@ def _train_from_dataframe(
         "fusion_source": fusion_source,
         "representation_shapes": representation_shapes,
         "svd_info": svd_info,
-        "feature_importances_topk": feature_importances_topk or [],
         "data_quality": data_quality_report,
         "preprocessor_path": preprocessor_path,
         "preprocessor_latest": latest_preprocessor_path,
+        "feature_hash": feature_hash,
+        "feature_list_path": feature_list_path,
+        "feature_list_latest": latest_feature_list_path,
     }
 
     if detector.calibration_report_ is not None:
@@ -980,19 +1047,33 @@ def _train_from_dataframe(
 
     if supervised_metrics is not None:
         metadata["supervised"] = supervised_metrics
+    if feature_importances_topk:
+        metadata["feature_importances_topk"] = feature_importances_topk
+    if permutation_topk:
+        metadata["permutation_importance_topk"] = permutation_topk
 
-    if ground_truth is not None:
-        precision = precision_score(ground_truth, is_malicious, zero_division=0)
-        recall = recall_score(ground_truth, is_malicious, zero_division=0)
-        f1 = f1_score(ground_truth, is_malicious, zero_division=0)
-        acc = accuracy_score(ground_truth, is_malicious)
+    if (
+        ground_truth is not None
+        and ground_truth_mask is not None
+        and ground_truth_labels is not None
+        and ground_truth_labels.size
+    ):
+        labeled_preds = is_malicious[ground_truth_mask]
+        labeled_truth = ground_truth_labels
+        precision = precision_score(labeled_truth, labeled_preds, zero_division=0)
+        recall = recall_score(labeled_truth, labeled_preds, zero_division=0)
+        f1 = f1_score(labeled_truth, labeled_preds, zero_division=0)
+        acc = accuracy_score(labeled_truth, labeled_preds)
+        cm = confusion_matrix(labeled_truth, labeled_preds).tolist()
         metadata["ground_truth_column"] = ground_truth_column
-        metadata["ground_truth_ratio"] = float(np.mean(ground_truth))
+        metadata["ground_truth_ratio"] = float(np.mean(labeled_truth))
+        metadata["ground_truth_samples"] = int(labeled_truth.size)
         metadata["evaluation"] = {
             "precision": float(precision),
             "recall": float(recall),
             "f1": float(f1),
             "accuracy": float(acc),
+            "confusion_matrix": cm,
         }
 
     metadata_path = os.path.join(models_dir, f"iforest_metadata_{timestamp}.json")
@@ -1014,7 +1095,7 @@ def _train_from_dataframe(
     if progress_cb:
         progress_cb(100)
 
-    return {
+    result_payload = {
         "results_csv": results_csv,
         "summary_csv": summary_csv,
         "model_path": pipeline_path,
@@ -1053,9 +1134,18 @@ def _train_from_dataframe(
         "fusion_source": fusion_source,
         "representation_shapes": representation_shapes,
         "svd_info": svd_info,
-        "feature_importances_topk": feature_importances_topk or [],
         "data_quality": data_quality_report,
     }
+
+    if feature_importances_topk:
+        result_payload["feature_importances_topk"] = feature_importances_topk
+    if permutation_topk:
+        result_payload["permutation_importance_topk"] = permutation_topk
+    result_payload["feature_list_path"] = feature_list_path
+    result_payload["feature_list_latest"] = latest_feature_list_path
+    result_payload["feature_hash"] = feature_hash
+
+    return result_payload
 
 
 def _train_from_preprocessed_csv(
