@@ -12,3 +12,4 @@ seaborn
 dpkt
 scapy
 PyQt5
+PyYAML

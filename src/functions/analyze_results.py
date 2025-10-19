@@ -22,6 +22,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 
+from src.configuration import get_path
 from src.functions.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -44,15 +45,13 @@ def _resolve_data_base() -> str:
     env = os.getenv("MALDET_DATA_DIR")
     if env and env.strip():
         try:
-            Path(env).expanduser().resolve().mkdir(parents=True, exist_ok=True)
-            return str(Path(env).expanduser().resolve())
+            base = Path(env).expanduser().resolve()
+            base.mkdir(parents=True, exist_ok=True)
+            return str(base)
         except Exception:
             pass
     try:
-        proj_root = Path(__file__).resolve().parents[2]
-        local_data = proj_root / "data"
-        local_data.mkdir(parents=True, exist_ok=True)
-        return str(local_data)
+        return str(get_path("data_dir"))
     except Exception:
         fallback = Path.home() / "maldet_data"
         fallback.mkdir(parents=True, exist_ok=True)
@@ -453,6 +452,52 @@ def analyze_results(
     out3 = os.path.join(out_dir, "top20_packets.csv")
     top20.to_csv(out3, index=False, encoding="utf-8")
 
+    confusion_plot_path: Optional[str] = None
+    permutation_plot_path: Optional[str] = None
+    importance_source: Optional[str] = None
+    if isinstance(loaded_metadata, dict):
+        evaluation_meta = loaded_metadata.get("evaluation")
+        if isinstance(evaluation_meta, dict):
+            cm = evaluation_meta.get("confusion_matrix")
+            if isinstance(cm, (list, tuple)):
+                arr = np.asarray(cm, dtype=float)
+                if arr.size == 4:
+                    arr = arr.reshape(2, 2)
+                if arr.shape == (2, 2):
+                    plt.figure(figsize=(4, 3))
+                    plt.imshow(arr, cmap="Blues")
+                    for i in range(2):
+                        for j in range(2):
+                            plt.text(j, i, f"{int(arr[i, j])}", ha="center", va="center", color="black")
+                    plt.xticks([0, 1], ["Normal", "Anomaly"])
+                    plt.yticks([0, 1], ["Normal", "Anomaly"])
+                    plt.xlabel("Predicted")
+                    plt.ylabel("Actual")
+                    plt.title("Confusion Matrix")
+                    plt.tight_layout()
+                    confusion_plot_path = os.path.join(out_dir, "confusion_matrix.png")
+                    plt.savefig(confusion_plot_path)
+                    plt.close()
+
+        for key in ("permutation_importance_topk", "feature_importances_topk"):
+            data = loaded_metadata.get(key)
+            if isinstance(data, list) and data:
+                importance_source = key
+                df_imp = pd.DataFrame(data)
+                if {"feature", "importance"}.issubset(df_imp.columns):
+                    df_imp = df_imp.sort_values("importance", ascending=False).head(20)
+                    plt.figure(figsize=(8, max(4, len(df_imp) * 0.35)))
+                    plt.barh(df_imp["feature"], df_imp["importance"], color="#4C72B0")
+                    plt.gca().invert_yaxis()
+                    plt.xlabel("Importance")
+                    title_label = "Permutation Importance" if key == "permutation_importance_topk" else "Feature Importance"
+                    plt.title(title_label)
+                    plt.tight_layout()
+                    permutation_plot_path = os.path.join(out_dir, "feature_importance.png")
+                    plt.savefig(permutation_plot_path)
+                    plt.close()
+                break
+
     top_dst_path = None
     dst_group_cols = [col for col in ("dst_ip", "dst_port") if col in df.columns]
     if dst_group_cols:
@@ -748,6 +793,9 @@ def analyze_results(
         "pr_plot": pr_plot_path,
         "top_dst_csv": top_dst_path,
         "risk_bucket_csv": risk_results_path,
+        "confusion_plot": confusion_plot_path,
+        "feature_importance_plot": permutation_plot_path,
+        "feature_importance_source": importance_source,
     }
 
     export_payload = {
@@ -781,7 +829,11 @@ def analyze_results(
         )
 
     payload = {
-        "plots": [p for p in (out1, out2, roc_plot_path, pr_plot_path) if p],
+        "plots": [
+            p
+            for p in (out1, out2, confusion_plot_path, permutation_plot_path, roc_plot_path, pr_plot_path)
+            if p
+        ],
         "top20_csv": out3,
         "top_dst_csv": top_dst_path,
         "risk_bucket_csv": risk_results_path,
