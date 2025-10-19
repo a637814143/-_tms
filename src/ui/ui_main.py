@@ -7,6 +7,7 @@ from typing import List, Optional, Set
 from datetime import datetime
 
 # ---- 业务函数（保持导入路径）----
+from src.configuration import get_path, get_paths
 from src.functions.info import get_pcap_features as info
 from src.functions.feature_extractor import (
     extract_features as fe_single,
@@ -28,10 +29,7 @@ def _resolve_data_base() -> Path:
         base.mkdir(parents=True, exist_ok=True)
         return base.resolve()
     try:
-        proj_root = Path(__file__).resolve().parents[2]
-        data_dir = proj_root / "data"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        return data_dir.resolve()
+        return get_path("data_dir")
     except Exception:
         fallback = Path.home() / "maldet_data"
         fallback.mkdir(parents=True, exist_ok=True)
@@ -53,20 +51,43 @@ QGroupBox::title { subcontrol-origin: margin; left:12px; padding:0 6px; backgrou
 PREVIEW_LIMIT_FOR_TABLE = 50
 
 DATA_BASE = _resolve_data_base()
-PATHS = {
-    "split": DATA_BASE / "split",
-    "csv_info": DATA_BASE / "CSV" / "info",
-    "csv_feature": DATA_BASE / "CSV" / "feature",
-    "csv_preprocess": DATA_BASE / "CSV" / "DP",
-    "models": DATA_BASE / "models",
-    "results_analysis": DATA_BASE / "results" / "analysis",
-    "results_pred": DATA_BASE / "results" / "modelprediction",
-    "results_abnormal": DATA_BASE / "results" / "abnormal",
-}
-for _path in PATHS.values():
-    _path.mkdir(parents=True, exist_ok=True)
+PATHS = get_paths(
+    {
+        "split": "split_dir",
+        "csv_info": "csv_info_dir",
+        "csv_feature": "csv_feature_dir",
+        "csv_preprocess": "csv_preprocess_dir",
+        "models": "models_dir",
+        "results_analysis": "results_analysis_dir",
+        "results_pred": "results_prediction_dir",
+        "results_abnormal": "results_abnormal_dir",
+        "results": "results_dir",
+        "logs": "logs_dir",
+    }
+)
+if "results" in PATHS and "results_analysis" not in PATHS:
+    PATHS["results_analysis"] = PATHS["results"] / "analysis"
+if "results" in PATHS and "results_pred" not in PATHS:
+    PATHS["results_pred"] = PATHS["results"] / "modelprediction"
+if "results" in PATHS and "results_abnormal" not in PATHS:
+    PATHS["results_abnormal"] = PATHS["results"] / "abnormal"
+for key in ("split", "csv_info", "csv_feature", "csv_preprocess", "models", "results_analysis", "results_pred", "results_abnormal"):
+    if key not in PATHS:
+        PATHS[key] = DATA_BASE / {
+            "split": "split",
+            "csv_info": "CSV/info",
+            "csv_feature": "CSV/feature",
+            "csv_preprocess": "CSV/DP",
+            "models": "models",
+            "results_analysis": "results/analysis",
+            "results_pred": "results/modelprediction",
+            "results_abnormal": "results/abnormal",
+        }[key]
+    PATHS[key].mkdir(parents=True, exist_ok=True)
 
-LOGS_DIR = Path(os.getenv("MALDET_LOG_DIR", DATA_BASE / "logs")).expanduser().resolve()
+default_logs = PATHS.get("logs", DATA_BASE / "logs")
+logs_env = os.getenv("MALDET_LOG_DIR")
+LOGS_DIR = Path(logs_env).expanduser().resolve() if logs_env else Path(default_logs).expanduser().resolve()
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_PATH = DATA_BASE / "settings.json"
 
