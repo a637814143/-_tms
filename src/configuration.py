@@ -66,7 +66,10 @@ def get_paths(keys: Optional[Dict[str, str]] = None, *, ensure_exists: bool = Tr
     result: Dict[str, Path] = {}
     if keys:
         for alias, config_key in keys.items():
-            result[alias] = get_path(config_key, ensure_exists=ensure_exists)
+            try:
+                result[alias] = get_path(config_key, ensure_exists=ensure_exists)
+            except KeyError:
+                continue
         return result
 
     config = load_config()
