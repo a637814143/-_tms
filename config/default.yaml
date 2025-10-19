@@ -1,0 +1,12 @@
+paths:
+  data_dir: data
+  split_dir: data/split
+  csv_info_dir: data/CSV/info
+  csv_feature_dir: data/CSV/feature
+  csv_preprocess_dir: data/CSV/DP
+  models_dir: data/models
+  results_dir: data/results
+  results_analysis_dir: data/results/analysis
+  results_prediction_dir: data/results/modelprediction
+  results_abnormal_dir: data/results/abnormal
+  logs_dir: data/logs

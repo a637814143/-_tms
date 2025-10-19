@@ -299,54 +299,69 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         if y is not None:
             y_arr = np.asarray(y).ravel()
             if y_arr.size == n_samples:
+                y_binary: Optional[np.ndarray]
+                labeled_mask: Optional[np.ndarray]
                 try:
-                    y_binary = np.asarray(y_arr, dtype=float)
-                    if not np.all(np.isfinite(y_binary)):
-                        raise ValueError
-                    # 将非零视为异常
-                    y_binary = np.where(y_binary > 0, 1, 0).astype(int)
+                    y_numeric = np.asarray(y_arr, dtype=float)
+                    labeled_mask = np.isfinite(y_numeric) & (y_numeric >= 0)
+                    y_binary = np.zeros_like(y_numeric, dtype=int)
+                    if labeled_mask.any():
+                        y_binary[labeled_mask] = np.where(y_numeric[labeled_mask] > 0, 1, 0)
                 except Exception:
-                    y_binary = np.where(np.asarray(y_arr, dtype=object).astype(str) != "0", 1, 0)
+                    labeled_mask = None
+                    y_binary = None
 
-                if np.unique(y_binary).size >= 2:
-                    features = self._build_calibration_features(
-                        combined, vote_ratio, stacked, raw_input
-                    )
-                    self.calibrator_ = LogisticRegression(
-                        max_iter=1000, class_weight="balanced", solver="lbfgs"
-                    )
-                    self.calibrator_.fit(features, y_binary)
-                    proba = self.calibrator_.predict_proba(features)[:, 1]
-                    thr_candidates = np.linspace(0.1, 0.9, 41)
-                    best_thr = 0.5
-                    best_f1 = -1.0
-                    best_f05 = -1.0
-                    best_metrics = None
-                    for thr in thr_candidates:
-                        preds = (proba >= thr).astype(int)
-                        precision = precision_score(
-                            y_binary, preds, zero_division=0
+                if y_binary is None or labeled_mask is None:
+                    y_str = np.asarray(y_arr, dtype=object).astype(str)
+                    normalized = np.char.strip(np.char.lower(y_str))
+                    labeled_mask = normalized != ""
+                    y_binary = np.zeros_like(normalized, dtype=int)
+                    if labeled_mask.any():
+                        y_binary[labeled_mask] = np.where(normalized[labeled_mask] != "0", 1, 0)
+
+                if labeled_mask is not None and labeled_mask.any():
+                    y_labeled = y_binary[labeled_mask]
+                    if np.unique(y_labeled).size >= 2:
+                        features_all = self._build_calibration_features(
+                            combined, vote_ratio, stacked, raw_input
                         )
-                        recall = recall_score(y_binary, preds, zero_division=0)
-                        f1 = f1_score(y_binary, preds, zero_division=0)
-                        f05 = fbeta_score(
-                            y_binary, preds, beta=0.5, zero_division=0
+                        features = features_all[labeled_mask]
+                        self.calibrator_ = LogisticRegression(
+                            max_iter=1000, class_weight="balanced", solver="lbfgs"
                         )
-                        if (f05 > best_f05 + 1e-12) or (
-                            abs(f05 - best_f05) <= 1e-12 and f1 > best_f1
-                        ):
-                            best_f1 = f1
-                            best_f05 = f05
-                            best_thr = thr
-                            best_metrics = {
-                                "precision": float(precision),
-                                "recall": float(recall),
-                                "f1": float(f1),
-                                "f0.5": float(f05),
-                            }
-                    self.calibration_threshold_ = float(best_thr)
-                    self.calibration_report_ = best_metrics
-                    self.last_calibrated_scores_ = proba.astype(float)
+                        self.calibrator_.fit(features, y_labeled)
+                        proba_all = self.calibrator_.predict_proba(features_all)[:, 1]
+                        thr_candidates = np.linspace(0.1, 0.9, 41)
+                        best_thr = 0.5
+                        best_f1 = -1.0
+                        best_f05 = -1.0
+                        best_metrics = None
+                        labeled_proba = proba_all[labeled_mask]
+                        for thr in thr_candidates:
+                            preds = (labeled_proba >= thr).astype(int)
+                            precision = precision_score(
+                                y_labeled, preds, zero_division=0
+                            )
+                            recall = recall_score(y_labeled, preds, zero_division=0)
+                            f1 = f1_score(y_labeled, preds, zero_division=0)
+                            f05 = fbeta_score(
+                                y_labeled, preds, beta=0.5, zero_division=0
+                            )
+                            if (f05 > best_f05 + 1e-12) or (
+                                abs(f05 - best_f05) <= 1e-12 and f1 > best_f1
+                            ):
+                                best_f1 = f1
+                                best_f05 = f05
+                                best_thr = thr
+                                best_metrics = {
+                                    "precision": float(precision),
+                                    "recall": float(recall),
+                                    "f1": float(f1),
+                                    "f0.5": float(f05),
+                                }
+                        self.calibration_threshold_ = float(best_thr)
+                        self.calibration_report_ = best_metrics
+                        self.last_calibrated_scores_ = proba_all.astype(float)
         self._apply_false_positive_guard(combined, vote_ratio)
         return self
 
