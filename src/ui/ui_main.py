@@ -342,6 +342,7 @@ class TrainWorker(QtCore.QThread):
         rbf_gamma=None,
         fusion_enabled=True,
         fusion_alpha=0.5,
+        feature_ratio=None,
     ):
         super().__init__()
         self.input_path = input_path
@@ -351,6 +352,7 @@ class TrainWorker(QtCore.QThread):
         self.rbf_gamma = rbf_gamma
         self.fusion_enabled = fusion_enabled
         self.fusion_alpha = fusion_alpha
+        self.feature_ratio = feature_ratio
 
     def run(self):
         try:
@@ -363,6 +365,7 @@ class TrainWorker(QtCore.QThread):
                 rbf_gamma=self.rbf_gamma,
                 enable_supervised_fusion=self.fusion_enabled,
                 fusion_alpha=float(self.fusion_alpha),
+                feature_selection_ratio=self.feature_ratio,
             )
             self.finished.emit(res)
         except Exception as e:
@@ -738,11 +741,26 @@ class Ui_MainWindow(object):
         self.fusion_alpha_spin.setSingleStep(0.05)
         self.fusion_alpha_spin.setValue(0.50)
         self.fusion_alpha_spin.setToolTip("α 越大越偏向无监督风险分数")
+        self.feature_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.feature_slider.setRange(0, 100)
+        self.feature_slider.setSingleStep(5)
+        self.feature_slider.setPageStep(10)
+        self.feature_slider.setValue(0)
+        self.feature_slider.setToolTip("0 表示保留全部特征，其它值表示按重要性保留前 N% 的特征")
+        feature_slider_row = QtWidgets.QWidget()
+        feature_slider_layout = QtWidgets.QHBoxLayout(feature_slider_row)
+        feature_slider_layout.setContentsMargins(0, 0, 0, 0)
+        feature_slider_layout.setSpacing(6)
+        feature_slider_layout.addWidget(self.feature_slider)
+        self.feature_slider_value = QtWidgets.QLabel("全部")
+        feature_slider_layout.addWidget(self.feature_slider_value)
         ag_layout.addRow("RBF 维度：", self.rbf_components_spin)
         ag_layout.addRow("RBF γ：", self.rbf_gamma_spin)
         ag_layout.addRow("半监督融合：", self.fusion_checkbox)
         ag_layout.addRow("融合权重 α：", self.fusion_alpha_spin)
+        ag_layout.addRow("特征筛选阈值：", feature_slider_row)
         self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
+        self._on_feature_slider_changed(self.feature_slider.value())
         self.right_layout.addWidget(self.advanced_group)
 
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
@@ -802,6 +820,7 @@ class Ui_MainWindow(object):
         self.fusion_checkbox.toggled.connect(lambda checked: self.fusion_alpha_spin.setEnabled(checked))
         self.fusion_checkbox.toggled.connect(self._on_rbf_settings_changed)
         self.fusion_alpha_spin.valueChanged.connect(self._on_rbf_settings_changed)
+        self.feature_slider.valueChanged.connect(self._on_feature_slider_changed)
 
         self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
         self.output_list.itemDoubleClicked.connect(self._on_output_double_click)
@@ -977,6 +996,12 @@ class Ui_MainWindow(object):
             names = []
         names.sort()
         return [os.path.join(d, n) for n in names]
+
+    def _on_feature_slider_changed(self, value: int) -> None:
+        if value <= 0:
+            self.feature_slider_value.setText("全部")
+        else:
+            self.feature_slider_value.setText(f"{int(value)}%")
 
     # ——按钮进度视觉条——
     def set_button_progress(self, button: QtWidgets.QPushButton, progress: int):
@@ -1544,6 +1569,8 @@ class Ui_MainWindow(object):
         gamma = self.rbf_gamma_spin.value()
         fusion_enabled = self.fusion_checkbox.isChecked()
         fusion_alpha = self.fusion_alpha_spin.value()
+        feature_ratio = self.feature_slider.value()
+        feature_ratio = (float(feature_ratio) / 100.0) if feature_ratio > 0 else None
         self.train_worker = TrainWorker(
             path,
             res_dir,
@@ -1552,6 +1579,7 @@ class Ui_MainWindow(object):
             rbf_gamma=float(gamma) if gamma > 0 else None,
             fusion_enabled=bool(fusion_enabled),
             fusion_alpha=float(fusion_alpha),
+            feature_ratio=feature_ratio,
         )
         self.train_worker.progress.connect(lambda p: self.set_button_progress(self.btn_train, p))
         self.train_worker.finished.connect(self._on_train_finished)
@@ -1679,6 +1707,25 @@ class Ui_MainWindow(object):
             msg_lines.append(f"稳健裁剪列={len(wins_cols)}")
         if res.get("estimated_precision") is not None:
             msg_lines.append(f"异常置信度均值≈{res.get('estimated_precision'):.2%}")
+        weight_info = res.get("feature_weighting") or {}
+        if isinstance(weight_info, dict) and weight_info.get("ratio"):
+            ratio_val = float(weight_info.get("ratio", 0.0))
+            selected = weight_info.get("selected_features") or []
+            total_feats = len(res.get("feature_columns") or [])
+            msg_lines.append(
+                f"特征筛选≈{ratio_val * 100:.0f}% (保留 {len(selected)}/{total_feats})"
+            )
+        if res.get("active_learning_csv"):
+            msg_lines.append(f"主动学习候选: {res['active_learning_csv']}")
+        pseudo_info = res.get("pseudo_labels") or {}
+        if isinstance(pseudo_info, dict) and pseudo_info.get("total"):
+            msg_lines.append(
+                "半监督样本：人工 {human} 条 | 伪标签 异常 {pseudo_anomaly} 条 / 正常 {pseudo_normal} 条".format(
+                    human=int(pseudo_info.get("human", 0)),
+                    pseudo_anomaly=int(pseudo_info.get("pseudo_anomaly", 0)),
+                    pseudo_normal=int(pseudo_info.get("pseudo_normal", 0)),
+                )
+            )
         feature_importances = res.get("feature_importances_topk") or []
         if feature_importances:
             preview_items = []
@@ -1700,6 +1747,8 @@ class Ui_MainWindow(object):
             if p and os.path.exists(p): self._add_output(p)
         if res.get("results_csv") and os.path.exists(res["results_csv"]):
             self._open_csv_paged(res["results_csv"])
+        if res.get("active_learning_csv") and os.path.exists(res["active_learning_csv"]):
+            self._add_output(res["active_learning_csv"])
 
     def _on_train_error(self, msg):
         self.btn_train.setEnabled(True); self.reset_button_progress(self.btn_train)

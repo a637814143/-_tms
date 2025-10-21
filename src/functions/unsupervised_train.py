@@ -31,7 +31,12 @@ from joblib import dump
 from src.functions.feature_extractor import extract_features, extract_features_dir
 from src.functions.anomaly_detector import EnsembleAnomalyDetector
 from src.functions.logging_utils import get_logger
-from src.functions.transformers import FeatureAligner, PreprocessPipeline
+from src.functions.transformers import (
+    FeatureAligner,
+    FeatureWeighter,
+    PreprocessPipeline,
+    DeepFeatureExtractor,
+)
 
 logger = get_logger(__name__)
 
@@ -429,6 +434,101 @@ def _load_feature_frames(paths: List[str], workers: int) -> List[pd.DataFrame]:
     return [df for _, df in frames]
 
 
+def _sanitize_ratio(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return None
+    if ratio <= 0:
+        return None
+    return float(np.clip(ratio, 0.01, 1.0))
+
+
+def _build_feature_weights(
+    feature_columns: List[str],
+    importances: Dict[str, float],
+    *,
+    ratio: Optional[float],
+    min_weight: float = 0.25,
+) -> Optional[Dict[str, float]]:
+    if not importances:
+        return None
+    ratio = _sanitize_ratio(ratio)
+    if ratio is None:
+        return None
+
+    sorted_features = sorted(
+        ((feat, float(val)) for feat, val in importances.items()),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    if not sorted_features:
+        return None
+
+    keep_count = max(1, int(round(len(feature_columns) * ratio)))
+    selected = {name for name, _ in sorted_features[:keep_count]}
+    if not selected:
+        return None
+
+    max_importance = sorted_features[0][1] or 1.0
+    weights: Dict[str, float] = {}
+    for col in feature_columns:
+        score = float(importances.get(col, 0.0))
+        if col in selected:
+            weights[col] = 1.0
+        else:
+            weights[col] = float(np.clip(score / max_importance, min_weight, 1.0))
+    return weights
+
+
+def _summarize_errors(errors: np.ndarray) -> Dict[str, float]:
+    if errors.size == 0:
+        return {}
+    return {
+        "min": float(np.min(errors)),
+        "max": float(np.max(errors)),
+        "mean": float(np.mean(errors)),
+        "median": float(np.median(errors)),
+        "p90": float(np.quantile(errors, 0.9)),
+        "p95": float(np.quantile(errors, 0.95)),
+        "std": float(np.std(errors)),
+    }
+
+
+def _export_active_learning_candidates(
+    df: pd.DataFrame,
+    *,
+    risk_score: np.ndarray,
+    vote_ratio: np.ndarray,
+    anomaly_score: np.ndarray,
+    pseudo_labels: Optional[np.ndarray],
+    output_path: str,
+    max_candidates: int = 200,
+) -> Optional[str]:
+    if df.empty or risk_score.size == 0:
+        return None
+    uncertainty = np.abs(risk_score - 0.5)
+    order = np.argsort(uncertainty)
+    if order.size == 0:
+        return None
+    top_n = order[: min(max_candidates, order.size)]
+    subset = df.iloc[top_n].copy()
+    subset["risk_score"] = risk_score[top_n]
+    subset["anomaly_score"] = anomaly_score[top_n]
+    subset["vote_ratio"] = vote_ratio[top_n]
+    subset["active_learning_uncertainty"] = uncertainty[top_n]
+    if pseudo_labels is not None and pseudo_labels.size == len(df):
+        subset["semi_supervised_label"] = pseudo_labels[top_n]
+    try:
+        subset.to_csv(output_path, index=False, encoding="utf-8")
+        return output_path
+    except Exception as exc:
+        logger.warning("Failed to export active learning candidates: %s", exc)
+        return None
+
+
 def _prepare_feature_frame(
     df: pd.DataFrame, feature_columns_hint: Optional[List[str]] = None
 ) -> Tuple[pd.DataFrame, List[str]]:
@@ -472,6 +572,7 @@ def _train_from_dataframe(
     categorical_maps: Optional[Dict[str, Dict[str, object]]] = None,
     fusion_alpha: float = 0.5,
     enable_supervised_fusion: bool = True,
+    feature_selection_ratio: Optional[float] = None,
 ) -> dict:
     if df.empty:
         raise RuntimeError("训练数据为空。")
@@ -541,6 +642,37 @@ def _train_from_dataframe(
     )
     feature_df_numeric = feature_df.loc[:, feature_columns].copy()
 
+    ratio_clean = _sanitize_ratio(feature_selection_ratio)
+    feature_weights: Optional[Dict[str, float]] = None
+    feature_weight_info: Optional[Dict[str, object]] = None
+    if ratio_clean is not None:
+        numeric_for_var = feature_df_numeric.apply(pd.to_numeric, errors="coerce")
+        var_series = numeric_for_var.var(axis=0, skipna=True, ddof=0)
+        variance_scores = {
+            col: float(var_series.get(col, 0.0)) for col in feature_columns
+        }
+        candidate_weights = _build_feature_weights(
+            feature_columns,
+            variance_scores,
+            ratio=ratio_clean,
+            min_weight=0.15,
+        )
+        if candidate_weights:
+            feature_weights = candidate_weights
+            feature_weight_info = {
+                "strategy": "variance",
+                "ratio": ratio_clean,
+                "selected_features": [
+                    col for col, w in feature_weights.items() if w >= 0.999
+                ],
+            }
+            logger.info(
+                "Applying variance-based feature weighting: keep_ratio=%.2f selected=%d/%d",
+                ratio_clean,
+                len(feature_weight_info["selected_features"]),
+                len(feature_columns),
+            )
+
     data_quality_report: Dict[str, object] = {}
     empty_columns = [
         col
@@ -601,14 +733,40 @@ def _train_from_dataframe(
     gamma_source = "manual" if rbf_gamma and rbf_gamma > 0 else "auto"
     used_gamma = float(rbf_gamma) if gamma_source == "manual" else auto_gamma
     fusion_alpha = float(np.clip(fusion_alpha if fusion_alpha is not None else 0.5, 0.0, 1.0))
-    fusion_enabled = bool(enable_supervised_fusion)
+    fusion_requested = bool(enable_supervised_fusion)
+    fusion_enabled = fusion_requested
+    fusion_auto_enabled = False
+    if (
+        ground_truth_mask is not None
+        and ground_truth_mask.any()
+        and not fusion_requested
+    ):
+        fusion_auto_enabled = True
+        fusion_enabled = True
+        logger.info(
+            "Detected ground truth column '%s', automatically enabling semi-supervised fusion.",
+            ground_truth_column or "unknown",
+        )
+    elif ground_truth_mask is not None and ground_truth_mask.any():
+        fusion_enabled = True
     fusion_source: Optional[str] = None
+
+    feature_weighter = FeatureWeighter(feature_weights or {})
+    deep_latent_dim = int(np.clip(len(feature_columns) // 2, 8, 128))
+    deep_extractor = DeepFeatureExtractor(
+        latent_dim=deep_latent_dim,
+        random_state=42,
+        max_epochs=25,
+        batch_size=256,
+    )
 
     pipeline_steps = [
         ("aligner", aligner),
         ("preprocessor", preprocessor),
+        ("feature_weighter", feature_weighter),
         ("variance_filter", VarianceThreshold(threshold=1e-6)),
         ("scaler", StandardScaler()),
+        ("deep_features", deep_extractor),
         (
             "gaussianizer",
             QuantileTransformer(
@@ -657,6 +815,44 @@ def _train_from_dataframe(
     preprocessor = pipeline.named_steps.get("preprocessor", preprocessor)
     pre_detector = Pipeline(pipeline.steps[:-1])
     transformed_features: Optional[np.ndarray] = None
+    deep_errors: Optional[np.ndarray] = None
+    deep_feature_info: Dict[str, object] = {}
+
+    deep_step = pipeline.named_steps.get("deep_features")
+    if deep_step is not None:
+        deep_feature_info["latent_dim"] = int(
+            getattr(deep_step, "latent_dim_", getattr(deep_step, "latent_dim", 0))
+            or deep_latent_dim
+        )
+        deep_feature_info["training_loss"] = float(
+            getattr(deep_step, "training_loss_", 0.0) or 0.0
+        )
+        try:
+            gaussianizer_idx = next(
+                i for i, (name, _) in enumerate(pipeline.steps) if name == "gaussianizer"
+            )
+            pre_gaussianizer = Pipeline(pipeline.steps[:gaussianizer_idx])
+            deep_output = pre_gaussianizer.transform(feature_df_numeric)
+            if isinstance(deep_output, np.ndarray) and deep_output.ndim == 2:
+                representation_shapes["deep_augmented"] = [
+                    int(deep_output.shape[0]),
+                    int(deep_output.shape[1]),
+                ]
+                error_idx = getattr(deep_step, "error_index_", None)
+                if error_idx is None:
+                    error_idx = deep_output.shape[1] - 1
+                deep_errors = np.asarray(deep_output[:, int(error_idx)], dtype=float)
+                latent_slice = getattr(deep_step, "latent_slice_", None)
+                if isinstance(latent_slice, slice):
+                    representation_shapes["latent"] = [
+                        int(deep_output.shape[0]),
+                        int(latent_slice.stop - latent_slice.start),
+                    ]
+                deep_summary = _summarize_errors(deep_errors)
+                if deep_summary:
+                    deep_feature_info["reconstruction_error"] = deep_summary
+        except Exception as exc:
+            logger.warning("Failed to derive deep feature representation: %s", exc)
 
     supervised_metrics = None
     svd_info: Optional[Dict[str, object]] = None
@@ -867,6 +1063,14 @@ def _train_from_dataframe(
     vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
     risk_score = np.clip(0.6 * conf_from_score + 0.4 * vote_component, 0.0, 1.0)
 
+    if deep_errors is not None and deep_errors.size == risk_score.size:
+        ae_min = float(np.min(deep_errors))
+        ae_range = float(np.max(deep_errors) - ae_min)
+        ae_norm = (deep_errors - ae_min) / max(ae_range, 1e-6)
+        risk_score = np.clip(0.5 * risk_score + 0.5 * ae_norm, 0.0, 1.0)
+        if deep_feature_info is not None:
+            deep_feature_info.setdefault("reconstruction_error", _summarize_errors(deep_errors))
+
     if fusion_enabled:
         fusion_candidates = [
             ("supervised_model", getattr(detector, "last_supervised_scores_", None)),
@@ -895,6 +1099,25 @@ def _train_from_dataframe(
     working_df["anomaly_confidence"] = anomaly_confidence
     working_df["risk_score"] = risk_score
     working_df["is_malicious"] = is_malicious
+    if deep_errors is not None and deep_errors.size == len(working_df):
+        working_df["ae_reconstruction_error"] = deep_errors
+
+    pseudo_labels = getattr(detector, "pseudo_labels_", None)
+    pseudo_origins = getattr(detector, "pseudo_label_origins_", None)
+    if pseudo_labels is not None and len(pseudo_labels) == len(working_df):
+        working_df["semi_supervised_label"] = pseudo_labels
+        if pseudo_origins is not None and len(pseudo_origins) == len(working_df):
+            working_df["semi_label_origin"] = pseudo_origins
+    pseudo_summary = getattr(detector, "pseudo_label_summary_", None)
+
+    active_learning_csv = _export_active_learning_candidates(
+        working_df,
+        risk_score=risk_score,
+        vote_ratio=vote_ratio,
+        anomaly_score=scores,
+        pseudo_labels=pseudo_labels if pseudo_labels is not None else None,
+        output_path=os.path.join(results_dir, "active_learning_candidates.csv"),
+    )
 
     results_csv = os.path.join(results_dir, "iforest_results.csv")
     working_df.to_csv(results_csv, index=False, encoding="utf-8")
@@ -974,6 +1197,17 @@ def _train_from_dataframe(
             except Exception:
                 continue
 
+    score_histogram = None
+    if scores.size:
+        try:
+            hist_counts, hist_bins = np.histogram(scores, bins=min(60, max(10, int(np.sqrt(scores.size)))))
+            score_histogram = {
+                "bins": [float(v) for v in hist_bins.tolist()],
+                "counts": [int(v) for v in hist_counts.tolist()],
+            }
+        except Exception:
+            score_histogram = None
+
     feature_hash = hashlib.sha256("\n".join(feature_columns).encode("utf-8")).hexdigest()
     feature_list_payload = {
         "schema_version": MODEL_SCHEMA_VERSION,
@@ -1004,6 +1238,7 @@ def _train_from_dataframe(
         "score_min": float(np.min(scores)),
         "score_max": float(np.max(scores)),
         "score_quantiles": score_quantiles,
+        "score_histogram": score_histogram,
         "vote_mean": float(np.mean(vote_ratio)),
         "vote_threshold": float(vote_threshold),
         "threshold_breakdown": detector.threshold_breakdown_,
@@ -1013,6 +1248,7 @@ def _train_from_dataframe(
         "estimated_anomaly_ratio": float(is_malicious.mean()),
         "results_csv": results_csv,
         "summary_csv": summary_csv,
+        "active_learning_csv": active_learning_csv,
         "gaussianizer_path": gaussianizer_path,
         "projection_dim": int(detector.projected_dim_) if detector.projected_dim_ is not None else None,
         "projected_dim": int(detector.projected_dim_) if detector.projected_dim_ is not None else None,
@@ -1029,15 +1265,30 @@ def _train_from_dataframe(
         "fusion_enabled": fusion_enabled,
         "fusion_alpha": fusion_alpha,
         "fusion_source": fusion_source,
+        "fusion_auto_enabled": fusion_auto_enabled,
         "representation_shapes": representation_shapes,
         "svd_info": svd_info,
         "data_quality": data_quality_report,
         "preprocessor_path": preprocessor_path,
         "preprocessor_latest": latest_preprocessor_path,
+        "pipeline_path": pipeline_path,
+        "pipeline_latest": latest_pipeline_path,
+        "model_path": model_path,
         "feature_hash": feature_hash,
         "feature_list_path": feature_list_path,
         "feature_list_latest": latest_feature_list_path,
     }
+
+    if feature_weight_info and feature_weights:
+        weight_payload = dict(feature_weight_info)
+        weight_payload["weights"] = feature_weights
+        metadata["feature_weighting"] = weight_payload
+
+    if deep_feature_info:
+        metadata["deep_features"] = deep_feature_info
+
+    if pseudo_summary:
+        metadata["pseudo_labels"] = pseudo_summary
 
     if detector.calibration_report_ is not None:
         metadata["calibration"] = detector.calibration_report_
@@ -1098,7 +1349,7 @@ def _train_from_dataframe(
     result_payload = {
         "results_csv": results_csv,
         "summary_csv": summary_csv,
-        "model_path": pipeline_path,
+        "model_path": model_path,
         "scaler_path": scaler_path,
         "pipeline_path": pipeline_path,
         "pipeline_latest": latest_pipeline_path,
@@ -1132,10 +1383,24 @@ def _train_from_dataframe(
         "fusion_enabled": fusion_enabled,
         "fusion_alpha": fusion_alpha,
         "fusion_source": fusion_source,
+        "fusion_auto_enabled": fusion_auto_enabled,
         "representation_shapes": representation_shapes,
         "svd_info": svd_info,
         "data_quality": data_quality_report,
+        "active_learning_csv": active_learning_csv,
+        "score_histogram": score_histogram,
     }
+
+    if feature_weight_info and feature_weights:
+        weight_payload = dict(feature_weight_info)
+        weight_payload["weights"] = feature_weights
+        result_payload["feature_weighting"] = weight_payload
+
+    if deep_feature_info:
+        result_payload["deep_features"] = deep_feature_info
+
+    if pseudo_summary:
+        result_payload["pseudo_labels"] = pseudo_summary
 
     if feature_importances_topk:
         result_payload["feature_importances_topk"] = feature_importances_topk
@@ -1160,6 +1425,7 @@ def _train_from_preprocessed_csv(
     rbf_gamma: Optional[float] = None,
     fusion_alpha: float = 0.5,
     enable_supervised_fusion: bool = True,
+    feature_selection_ratio: Optional[float] = None,
 ) -> dict:
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"预处理数据集不存在: {dataset_path}")
@@ -1234,6 +1500,7 @@ def _train_from_preprocessed_csv(
         categorical_maps=categorical_maps_hint,
         fusion_alpha=fusion_alpha,
         enable_supervised_fusion=enable_supervised_fusion,
+        feature_selection_ratio=feature_selection_ratio,
     )
 
 
@@ -1249,6 +1516,7 @@ def _train_from_npz(
     rbf_gamma: Optional[float] = None,
     fusion_alpha: float = 0.5,
     enable_supervised_fusion: bool = True,
+    feature_selection_ratio: Optional[float] = None,
 ) -> dict:
     X, columns = _load_npz_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -1309,6 +1577,7 @@ def _train_from_npz(
         categorical_maps=categorical_maps_hint,
         fusion_alpha=fusion_alpha,
         enable_supervised_fusion=enable_supervised_fusion,
+        feature_selection_ratio=feature_selection_ratio,
     )
 
 
@@ -1324,6 +1593,7 @@ def _train_from_npy(
     rbf_gamma: Optional[float] = None,
     fusion_alpha: float = 0.5,
     enable_supervised_fusion: bool = True,
+    feature_selection_ratio: Optional[float] = None,
 ) -> dict:
     X, columns, meta_data = _load_npy_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -1400,6 +1670,7 @@ def _train_from_npy(
         categorical_maps=categorical_maps_hint,
         fusion_alpha=fusion_alpha,
         enable_supervised_fusion=enable_supervised_fusion,
+        feature_selection_ratio=feature_selection_ratio,
     )
 
 
@@ -1415,6 +1686,7 @@ def train_unsupervised_on_split(
     rbf_gamma: Optional[float] = None,
     fusion_alpha: float = 0.5,
     enable_supervised_fusion: bool = True,
+    feature_selection_ratio: Optional[float] = None,
 ):
     """
     无监督训练：
@@ -1477,6 +1749,7 @@ def train_unsupervised_on_split(
                 rbf_gamma=rbf_gamma,
                 fusion_alpha=fusion_alpha,
                 enable_supervised_fusion=enable_supervised_fusion,
+                feature_selection_ratio=feature_selection_ratio,
             )
         if ext == ".npy":
             return _train_from_npy(
@@ -1490,6 +1763,7 @@ def train_unsupervised_on_split(
                 rbf_gamma=rbf_gamma,
                 fusion_alpha=fusion_alpha,
                 enable_supervised_fusion=enable_supervised_fusion,
+                feature_selection_ratio=feature_selection_ratio,
             )
         if ext == ".npz":
             return _train_from_npz(
@@ -1503,6 +1777,7 @@ def train_unsupervised_on_split(
                 rbf_gamma=rbf_gamma,
                 fusion_alpha=fusion_alpha,
                 enable_supervised_fusion=enable_supervised_fusion,
+                feature_selection_ratio=feature_selection_ratio,
             )
         raise FileNotFoundError(f"不支持的数据集格式: {dataset_path}")
 
@@ -1559,4 +1834,5 @@ def train_unsupervised_on_split(
         rbf_gamma=rbf_gamma,
         fusion_alpha=fusion_alpha,
         enable_supervised_fusion=enable_supervised_fusion,
+        feature_selection_ratio=feature_selection_ratio,
     )
