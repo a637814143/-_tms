@@ -1,21 +1,34 @@
 # -*- coding: utf-8 -*-
 from PyQt5 import QtCore, QtGui, QtWidgets
-import sys, os, platform, subprocess, math, shutil, json
+import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap
 from pathlib import Path
 import numpy as np
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 from datetime import datetime
 
+import yaml
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+from joblib import load as joblib_load
+
 # ---- 业务函数（保持导入路径）----
-from src.configuration import get_path, get_paths
+from src.configuration import get_path, get_paths, load_config, project_root
 from src.functions.info import get_pcap_features as info
 from src.functions.feature_extractor import (
     extract_features as fe_single,
     extract_features_dir as fe_dir,
+    get_loaded_plugin_info,
 )
 from src.functions.unsupervised_train import train_unsupervised_on_split as run_train
 from src.functions.analyze_results import analyze_results as run_analysis
 from src.functions.preprocess import preprocess_feature_dir as preprocess_dir
+from src.functions.annotations import (
+    upsert_annotation,
+    annotation_summary,
+    apply_annotations_to_frame,
+)
 
 try:
     import pandas as pd
@@ -328,73 +341,50 @@ class PreprocessWorker(QtCore.QThread):
             self.error.emit(str(e))
 
 
-class TrainWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(dict)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-    def __init__(
-        self,
-        input_path,
-        results_dir,
-        models_dir,
-        rbf_components=None,
-        rbf_gamma=None,
-        fusion_enabled=True,
-        fusion_alpha=0.5,
-    ):
-        super().__init__()
-        self.input_path = input_path
-        self.results_dir = results_dir
-        self.models_dir = models_dir
-        self.rbf_components = rbf_components
-        self.rbf_gamma = rbf_gamma
-        self.fusion_enabled = fusion_enabled
-        self.fusion_alpha = fusion_alpha
-
-    def run(self):
-        try:
-            res = run_train(
-                self.input_path,
-                self.results_dir,
-                self.models_dir,
-                progress_cb=self.progress.emit,
-                rbf_components=self.rbf_components,
-                rbf_gamma=self.rbf_gamma,
-                enable_supervised_fusion=self.fusion_enabled,
-                fusion_alpha=float(self.fusion_alpha),
-            )
-            self.finished.emit(res)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class AnalysisWorker(QtCore.QThread):
+class WorkerSignals(QtCore.QObject):
     finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
-    def __init__(self, results_csv, out_dir, metadata_path=None):
+
+class BackgroundTask(QtCore.QRunnable):
+    def __init__(self, fn, *args, **kwargs):
         super().__init__()
-        self.results_csv = results_csv
-        self.out_dir = out_dir
-        self.metadata_path = metadata_path
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+        self.signals = WorkerSignals()
+
+    @property
+    def finished(self):
+        return self.signals.finished
+
+    @property
+    def error(self):
+        return self.signals.error
+
+    @property
+    def progress(self):
+        return self.signals.progress
 
     def run(self):
+        kwargs = dict(self._kwargs)
+
+        def _emit_progress(value):
+            try:
+                value_int = int(float(value))
+            except Exception:
+                value_int = 0
+            self.signals.progress.emit(max(0, min(100, value_int)))
+
+        kwargs["progress_cb"] = _emit_progress
         try:
-            result = run_analysis(
-                self.results_csv,
-                self.out_dir,
-                metadata_path=self.metadata_path,
-                progress_cb=self.progress.emit,
-            )
-            if not isinstance(result, dict):
-                result = {"out_dir": self.out_dir}
-            elif "out_dir" not in result:
-                result["out_dir"] = self.out_dir
-            self.finished.emit(result)
-        except Exception as e:
-            self.error.emit(str(e))
+            result = self._fn(*self._args, **kwargs)
+        except Exception as exc:
+            self.signals.error.emit(str(exc))
+            return
+
+        self.signals.finished.emit(result)
 
 # ======= 交互式列选择（用于 scaler+model 场景）=======
 class FeaturePickDialog(QtWidgets.QDialog):
@@ -469,6 +459,257 @@ class FeaturePickDialog(QtWidgets.QDialog):
         super().accept()
 
 
+class ResultsDashboard(QtWidgets.QGroupBox):
+    def __init__(self, parent=None):
+        super().__init__("结果仪表盘", parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+
+        self.anomaly_bar = QtWidgets.QProgressBar()
+        self.anomaly_bar.setRange(0, 100)
+        self.anomaly_bar.setFormat("尚无结果")
+        layout.addWidget(QtWidgets.QLabel("异常占比"))
+        layout.addWidget(self.anomaly_bar)
+
+        self.training_compare = QtWidgets.QLabel("训练/当前比较尚未加载")
+        self.training_compare.setWordWrap(True)
+        layout.addWidget(self.training_compare)
+
+        self.metrics_label = QtWidgets.QLabel("Precision / Recall / F1 待更新")
+        self.metrics_label.setWordWrap(True)
+        layout.addWidget(self.metrics_label)
+
+        self.timeline_label = QtWidgets.QLabel("暂无风险趋势数据")
+        self.timeline_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.timeline_label.setMinimumHeight(140)
+        self.timeline_label.setStyleSheet("QLabel { border:1px solid #E6E9EF; border-radius:6px; background:#FFFFFF; }")
+        self.timeline_label.setScaledContents(True)
+        layout.addWidget(self.timeline_label)
+
+        self._timeline_path: Optional[str] = None
+
+    def update_metrics(self, analysis: Optional[dict], metadata: Optional[dict]) -> None:
+        ratio: Optional[float] = None
+        metrics = None
+        if isinstance(analysis, dict):
+            metrics = analysis.get("metrics") if isinstance(analysis.get("metrics"), dict) else None
+            if metrics:
+                ratio = metrics.get("malicious_ratio")
+        if ratio is not None:
+            self.anomaly_bar.setValue(int(np.clip(ratio, 0.0, 1.0) * 100))
+            self.anomaly_bar.setFormat(f"{ratio:.2%}")
+        else:
+            self.anomaly_bar.reset()
+            self.anomaly_bar.setFormat("尚无结果")
+
+        train_ratio = None
+        if isinstance(metadata, dict):
+            train_ratio = metadata.get("training_anomaly_ratio")
+        compare_lines = []
+        if train_ratio is not None:
+            compare_lines.append(f"训练异常占比：{float(train_ratio):.2%}")
+        if ratio is not None:
+            compare_lines.append(f"当前检测异常占比：{ratio:.2%}")
+        if isinstance(metadata, dict) and metadata.get("timestamp"):
+            compare_lines.append(f"模型时间：{metadata.get('timestamp')}")
+        self.training_compare.setText("\n".join(compare_lines) if compare_lines else "训练/当前比较尚未加载")
+
+        eval_block = None
+        if isinstance(metadata, dict) and isinstance(metadata.get("evaluation"), dict):
+            eval_block = metadata.get("evaluation")
+        if eval_block is None and metrics and isinstance(metrics.get("model_metrics"), dict):
+            eval_block = metrics.get("model_metrics")
+        if eval_block:
+            precision = float(eval_block.get("precision", 0.0))
+            recall = float(eval_block.get("recall", 0.0))
+            f1 = float(eval_block.get("f1", 0.0))
+            text = f"Precision：{precision:.2%}  Recall：{recall:.2%}  F1：{f1:.2%}"
+        else:
+            text = "Precision / Recall / F1 待更新"
+        if metrics:
+            roc_val = metrics.get("roc_auc")
+            pr_val = metrics.get("pr_auc")
+            if roc_val is not None or pr_val is not None:
+                parts = [text]
+                if roc_val is not None:
+                    parts.append(f"ROC AUC：{float(roc_val):.3f}")
+                if pr_val is not None:
+                    parts.append(f"PR AUC：{float(pr_val):.3f}")
+                text = "\n".join(parts)
+        self.metrics_label.setText(text)
+
+        timeline_path = None
+        if analysis:
+            timeline_path = analysis.get("timeline_plot")
+            if not timeline_path and metrics:
+                timeline_path = metrics.get("timeline_plot")
+        if timeline_path and os.path.exists(timeline_path):
+            if timeline_path != self._timeline_path:
+                pixmap = QtGui.QPixmap(timeline_path)
+                if not pixmap.isNull():
+                    self.timeline_label.setPixmap(pixmap)
+                    self.timeline_label.setText("")
+                    self._timeline_path = timeline_path
+        else:
+            self.timeline_label.setPixmap(QtGui.QPixmap())
+            self.timeline_label.setText("暂无风险趋势数据")
+            self._timeline_path = None
+
+
+class AnomalyDetailDialog(QtWidgets.QDialog):
+    annotation_saved = QtCore.pyqtSignal(float)
+
+    def __init__(self, record: Dict[str, object], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("异常样本详情")
+        self.resize(720, 520)
+        self._record = record
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        header = QtWidgets.QHBoxLayout()
+        header.addWidget(QtWidgets.QLabel("双击列可复制，支持筛选"))
+        self.notes_edit = QtWidgets.QLineEdit()
+        self.notes_edit.setPlaceholderText("标注备注（可选）")
+        header.addWidget(self.notes_edit)
+        layout.addLayout(header)
+
+        self.table = QtWidgets.QTableWidget(len(record), 2)
+        self.table.setHorizontalHeaderLabels(["字段", "值"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for row, (key, value) in enumerate(sorted(record.items())):
+            key_item = QtWidgets.QTableWidgetItem(str(key))
+            val_item = QtWidgets.QTableWidgetItem(str(value))
+            self.table.setItem(row, 0, key_item)
+            self.table.setItem(row, 1, val_item)
+        layout.addWidget(self.table)
+
+        btns = QtWidgets.QDialogButtonBox()
+        self.btn_mark_normal = btns.addButton("标注为正常", QtWidgets.QDialogButtonBox.ActionRole)
+        self.btn_mark_anomaly = btns.addButton("标注为异常", QtWidgets.QDialogButtonBox.ActionRole)
+        btns.addButton(QtWidgets.QDialogButtonBox.Close)
+        layout.addWidget(btns)
+
+        btns.rejected.connect(self.reject)
+        self.btn_mark_normal.clicked.connect(lambda: self._store_label(0.0))
+        self.btn_mark_anomaly.clicked.connect(lambda: self._store_label(1.0))
+
+    def _store_label(self, value: float) -> None:
+        try:
+            upsert_annotation(self._record, label=value, notes=self.notes_edit.text().strip() or None)
+            QtWidgets.QMessageBox.information(self, "标注成功", "已保存人工标注。")
+            self.annotation_saved.emit(value)
+            self.accept()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "保存失败", f"无法写入标注：{exc}")
+
+
+class ConfigEditorDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("编辑全局配置 (YAML)")
+        self.resize(720, 540)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        self.path = project_root() / "config" / "default.yaml"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        layout.addWidget(QtWidgets.QLabel(f"配置文件：{self.path}"))
+        self.editor = QtWidgets.QPlainTextEdit()
+        layout.addWidget(self.editor, 1)
+
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(btns)
+
+        btn_reload = QtWidgets.QPushButton("重新加载")
+        btns.addButton(btn_reload, QtWidgets.QDialogButtonBox.ResetRole)
+
+        btns.accepted.connect(self._on_save)
+        btns.rejected.connect(self.reject)
+        btn_reload.clicked.connect(self._load)
+
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            with open(self.path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except FileNotFoundError:
+            text = yaml.safe_dump(load_config() or {}, allow_unicode=True, sort_keys=False)
+        self.editor.setPlainText(text)
+
+    def _on_save(self) -> None:
+        text = self.editor.toPlainText()
+        try:
+            yaml.safe_load(text or "{}")
+        except yaml.YAMLError as exc:
+            QtWidgets.QMessageBox.critical(self, "格式错误", f"YAML 解析失败：{exc}")
+            return
+        try:
+            with open(self.path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            if hasattr(load_config, "cache_clear"):
+                load_config.cache_clear()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "保存失败", f"无法写入配置：{exc}")
+            return
+        QtWidgets.QMessageBox.information(self, "已保存", "配置已保存。部分修改可能需重启生效。")
+        self.accept()
+
+
+class OnlineDetectionWorker(QtCore.QThread):
+    new_file = QtCore.pyqtSignal(str)
+    status = QtCore.pyqtSignal(str)
+    error = QtCore.pyqtSignal(str)
+    stopped = QtCore.pyqtSignal()
+
+    def __init__(self, watch_dir: str, poll_seconds: int = 5, parent=None):
+        super().__init__(parent)
+        self.watch_dir = Path(watch_dir)
+        self.poll_seconds = max(1, int(poll_seconds))
+        self._stop_flag = False
+        self._seen: Set[str] = set()
+
+    def stop(self) -> None:
+        self._stop_flag = True
+
+    def run(self) -> None:
+        if not self.watch_dir.exists():
+            try:
+                self.watch_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self.error.emit(f"无法创建监控目录：{exc}")
+                return
+        self.status.emit(f"监控目录：{self.watch_dir}")
+        patterns = ("*.pcap", "*.pcapng")
+        while not self._stop_flag:
+            try:
+                files: List[Path] = []
+                for pattern in patterns:
+                    files.extend(sorted(self.watch_dir.glob(pattern)))
+                for path in files:
+                    norm = str(path.resolve())
+                    if norm in self._seen:
+                        continue
+                    self._seen.add(norm)
+                    self.new_file.emit(norm)
+            except Exception as exc:
+                self.error.emit(str(exc))
+            for _ in range(self.poll_seconds * 10):
+                if self._stop_flag:
+                    break
+                self.msleep(100)
+        self.stopped.emit()
+
+
 # =============== 主 UI ===============
 class Ui_MainWindow(object):
     # --------- 基本结构 ----------
@@ -516,6 +757,7 @@ class Ui_MainWindow(object):
         self._last_preview_df: Optional["pd.DataFrame"] = None
         self._last_out_csv: Optional[str] = None
         self._analysis_summary: Optional[dict] = None
+        self._latest_prediction_summary: Optional[dict] = None
 
         # 分页状态
         self._csv_paged_path: Optional[str] = None
@@ -525,11 +767,26 @@ class Ui_MainWindow(object):
         # worker
         self.worker: Optional[InfoWorker] = None
         self.preprocess_worker: Optional[PreprocessWorker] = None
+        self.thread_pool = QtCore.QThreadPool.globalInstance()
+        self._running_tasks: Set[BackgroundTask] = set()
 
         # 用户偏好
         self._settings = AppSettings(SETTINGS_PATH)
         self._loading_settings = False
+        self._settings_ready = False
         self._apply_saved_preferences()
+
+        self._model_registry: Dict[str, dict] = {}
+        self._selected_model_key: Optional[str] = None
+        self._selected_metadata: Optional[dict] = None
+        self._selected_metadata_path: Optional[str] = None
+        self._selected_pipeline_path: Optional[str] = None
+        self._online_worker: Optional[OnlineDetectionWorker] = None
+        self._online_output_dir: Optional[str] = None
+
+        self._refresh_model_versions()
+        self._update_plugin_summary()
+        self.dashboard.update_metrics(None, None)
 
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
@@ -703,6 +960,45 @@ class Ui_MainWindow(object):
         for btn in self._action_buttons():
             btn.setEnabled(enabled)
 
+    def _start_background_task(
+        self,
+        task: BackgroundTask,
+        finished_cb,
+        error_cb,
+        progress_cb=None,
+    ) -> None:
+        self._running_tasks.add(task)
+        if finished_cb:
+            task.finished.connect(finished_cb)
+        if error_cb:
+            task.error.connect(error_cb)
+        if progress_cb:
+            task.progress.connect(progress_cb)
+
+        def _cleanup(*_args):
+            self._running_tasks.discard(task)
+
+        task.finished.connect(_cleanup)
+        task.error.connect(_cleanup)
+        self.thread_pool.start(task)
+
+    def _collect_pipeline_config(self) -> Dict[str, bool]:
+        if not hasattr(self, "pipeline_checks"):
+            return {}
+        return {key: checkbox.isChecked() for key, checkbox in self.pipeline_checks.items()}
+
+    def _on_pipeline_option_toggled(self) -> None:
+        if getattr(self, "_loading_settings", False):
+            return
+        if not getattr(self, "_settings_ready", False):
+            return
+        if not hasattr(self, "_settings"):
+            return
+        try:
+            self._settings.set("pipeline_components", self._collect_pipeline_config())
+        except Exception:
+            pass
+
     def _update_status_message(self, message: Optional[str] = None) -> None:
         base = f"数据目录: {DATA_BASE}"
         if message:
@@ -738,12 +1034,86 @@ class Ui_MainWindow(object):
         self.fusion_alpha_spin.setSingleStep(0.05)
         self.fusion_alpha_spin.setValue(0.50)
         self.fusion_alpha_spin.setToolTip("α 越大越偏向无监督风险分数")
+        self.feature_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.feature_slider.setRange(0, 100)
+        self.feature_slider.setSingleStep(5)
+        self.feature_slider.setPageStep(10)
+        self.feature_slider.setValue(0)
+        self.feature_slider.setToolTip("0 表示保留全部特征，其它值表示按重要性保留前 N% 的特征")
+        feature_slider_row = QtWidgets.QWidget()
+        feature_slider_layout = QtWidgets.QHBoxLayout(feature_slider_row)
+        feature_slider_layout.setContentsMargins(0, 0, 0, 0)
+        feature_slider_layout.setSpacing(6)
+        feature_slider_layout.addWidget(self.feature_slider)
+        self.feature_slider_value = QtWidgets.QLabel("全部")
+        feature_slider_layout.addWidget(self.feature_slider_value)
         ag_layout.addRow("RBF 维度：", self.rbf_components_spin)
         ag_layout.addRow("RBF γ：", self.rbf_gamma_spin)
         ag_layout.addRow("半监督融合：", self.fusion_checkbox)
         ag_layout.addRow("融合权重 α：", self.fusion_alpha_spin)
+        ag_layout.addRow("特征筛选阈值：", feature_slider_row)
         self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
+        self._on_feature_slider_changed(self.feature_slider.value())
         self.right_layout.addWidget(self.advanced_group)
+
+        pipeline_options = [
+            ("feature_weighter", "特征加权"),
+            ("variance_filter", "低方差过滤"),
+            ("scaler", "标准化"),
+            ("deep_features", "深度表征 (AutoEncoder)"),
+            ("gaussianizer", "分位数正态化"),
+            ("rbf_expander", "RBF 特征扩展"),
+        ]
+        self.pipeline_labels = {key: label for key, label in pipeline_options}
+        self.pipeline_group = QtWidgets.QGroupBox("Pipeline 组件")
+        pipeline_layout = QtWidgets.QVBoxLayout(self.pipeline_group)
+        pipeline_layout.setContentsMargins(10, 8, 10, 8)
+        pipeline_layout.setSpacing(4)
+        self.pipeline_checks = {}
+        for key, label in pipeline_options:
+            checkbox = QtWidgets.QCheckBox(label)
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(self._on_pipeline_option_toggled)
+            self.pipeline_checks[key] = checkbox
+            pipeline_layout.addWidget(checkbox)
+        pipeline_layout.addStretch(1)
+        self.right_layout.addWidget(self.pipeline_group)
+
+        self.dashboard = ResultsDashboard()
+        self.right_layout.addWidget(self.dashboard)
+
+        self.model_group = QtWidgets.QGroupBox("模型版本管理")
+        mg_layout = QtWidgets.QVBoxLayout(self.model_group)
+        mg_layout.setContentsMargins(10, 8, 10, 8)
+        model_row = QtWidgets.QHBoxLayout()
+        self.model_combo = QtWidgets.QComboBox()
+        self.model_refresh_btn = QtWidgets.QPushButton("刷新")
+        model_row.addWidget(self.model_combo)
+        model_row.addWidget(self.model_refresh_btn)
+        mg_layout.addLayout(model_row)
+        self.model_info_label = QtWidgets.QLabel("尚未加载模型")
+        self.model_info_label.setWordWrap(True)
+        mg_layout.addWidget(self.model_info_label)
+        self.right_layout.addWidget(self.model_group)
+
+        self.plugin_group = QtWidgets.QGroupBox("特征插件")
+        pg_layout = QtWidgets.QVBoxLayout(self.plugin_group)
+        pg_layout.setContentsMargins(10, 8, 10, 8)
+        self.plugin_label = QtWidgets.QLabel("未发现插件")
+        self.plugin_label.setWordWrap(True)
+        pg_layout.addWidget(self.plugin_label)
+        self.right_layout.addWidget(self.plugin_group)
+
+        self.btn_export_report = QtWidgets.QPushButton("导出 PDF 报告")
+        self.btn_config_editor = QtWidgets.QPushButton("编辑全局配置")
+        self.btn_online_toggle = QtWidgets.QPushButton("开启在线检测")
+        self.online_status_label = QtWidgets.QLabel("在线检测未启动")
+        self.online_status_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.online_status_label.setStyleSheet("QLabel { color:#555; font-size:12px; }")
+        self.right_layout.addWidget(self.btn_export_report)
+        self.right_layout.addWidget(self.btn_config_editor)
+        self.right_layout.addWidget(self.btn_online_toggle)
+        self.right_layout.addWidget(self.online_status_label)
 
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
         self.btn_fe = QtWidgets.QPushButton("提取特征")
@@ -773,6 +1143,228 @@ class Ui_MainWindow(object):
         self.right_layout.addStretch(1)
         self.right_frame.setMinimumWidth(200)
 
+    def _update_plugin_summary(self):
+        if not hasattr(self, "plugin_label"):
+            return
+        try:
+            info = get_loaded_plugin_info()
+        except Exception:
+            info = []
+        if not info:
+            self.plugin_label.setText("未发现插件")
+            return
+        lines = []
+        for item in info:
+            module = item.get("module")
+            extractors = item.get("extractors")
+            if isinstance(extractors, (list, tuple)) and extractors:
+                desc = ", ".join(str(e) for e in extractors)
+            else:
+                desc = "未公开特征"
+            lines.append(f"{module}: {desc}")
+        self.plugin_label.setText("\n".join(lines))
+
+    def _open_config_editor_dialog(self) -> None:
+        dialog = ConfigEditorDialog(self.right_frame)
+        result = dialog.exec_()
+        if result != QtWidgets.QDialog.Accepted:
+            return
+
+        try:
+            if hasattr(load_config, "cache_clear"):
+                load_config.cache_clear()
+        except Exception:
+            pass
+
+        self._update_plugin_summary()
+        self._refresh_model_versions()
+        self._update_status_message()
+        self.display_result("[INFO] 配置已更新，相关目录和插件信息已刷新。")
+
+    def _toggle_online_detection(self) -> None:
+        if pd is None:
+            QtWidgets.QMessageBox.warning(None, "缺少依赖", "当前环境未安装 pandas，无法执行在线检测。")
+            return
+
+        worker = getattr(self, "_online_worker", None)
+        if worker and worker.isRunning():
+            self.display_result("[INFO] 正在停止在线检测...")
+            worker.stop()
+            self.btn_online_toggle.setEnabled(False)
+            return
+
+        config = load_config() or {}
+        online_cfg = config.get("online_detection") if isinstance(config, dict) else {}
+        watch_dir = online_cfg.get("watch_dir") or os.path.join(str(DATA_BASE), "live")
+        output_dir = online_cfg.get("output_dir") or os.path.join(self._prediction_out_dir(), "online")
+
+        poll_seconds = None
+        ui_cfg = config.get("ui") if isinstance(config, dict) else {}
+        if isinstance(ui_cfg, dict):
+            poll_seconds = ui_cfg.get("online_detection_poll_seconds")
+        if poll_seconds is None:
+            poll_seconds = online_cfg.get("poll_seconds", 5)
+        try:
+            poll_seconds = max(1, int(poll_seconds))
+        except Exception:
+            poll_seconds = 5
+
+        self._online_output_dir = output_dir
+        worker = OnlineDetectionWorker(watch_dir, poll_seconds=poll_seconds)
+        worker.new_file.connect(self._on_online_file_detected)
+        worker.status.connect(self._on_online_status)
+        worker.error.connect(self._on_online_error)
+        worker.stopped.connect(self._on_online_stopped)
+        self._online_worker = worker
+        self.btn_online_toggle.setText("停止在线检测")
+        self.online_status_label.setText(f"监控目录：{watch_dir}")
+        worker.start()
+        self.display_result(f"[INFO] 在线检测已启动，监控目录：{watch_dir}")
+
+    def _on_online_status(self, message: str) -> None:
+        if message:
+            self.online_status_label.setText(message)
+
+    def _on_online_error(self, message: str) -> None:
+        self.display_result(f"[错误] 在线检测：{message}")
+        QtWidgets.QMessageBox.warning(None, "在线检测错误", message)
+
+    def _on_online_stopped(self) -> None:
+        self._online_worker = None
+        self._online_output_dir = None
+        self.btn_online_toggle.setEnabled(True)
+        self.btn_online_toggle.setText("开启在线检测")
+        self.online_status_label.setText("在线检测未启动")
+
+    def _on_online_file_detected(self, path: str) -> None:
+        if not path:
+            return
+        self.display_result(f"[INFO] 在线检测发现新文件：{path}")
+        metadata = self._selected_metadata if isinstance(self._selected_metadata, dict) else None
+        output_dir = self._online_output_dir or self._prediction_out_dir()
+
+        basename = os.path.basename(path)
+
+        def _progress(value: int) -> None:
+            self.online_status_label.setText(f"处理 {basename} ({int(value)}%)")
+
+        task = BackgroundTask(
+            self._process_online_pcap,
+            path,
+            output_dir=output_dir,
+            metadata=metadata,
+        )
+        self._start_background_task(
+            task,
+            self._on_online_prediction_finished,
+            self._on_online_prediction_error,
+            _progress,
+        )
+
+    def _process_online_pcap(
+        self,
+        pcap_path: str,
+        *,
+        output_dir: str,
+        metadata: Optional[dict],
+        progress_cb=None,
+    ) -> dict:
+        if pd is None:
+            raise RuntimeError("pandas 未安装，无法执行在线检测。")
+
+        base = os.path.splitext(os.path.basename(pcap_path))[0]
+        os.makedirs(output_dir, exist_ok=True)
+        feature_dir = os.path.join(output_dir, "features")
+        os.makedirs(feature_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        feature_csv = os.path.join(feature_dir, f"{base}_features_{stamp}.csv")
+
+        def _map_progress(value: int) -> None:
+            if not progress_cb:
+                return
+            try:
+                scaled = int(max(0, min(40, float(value) * 0.4)))
+            except Exception:
+                scaled = 0
+            progress_cb(scaled)
+
+        fast_mode = bool((load_config() or {}).get("online_detection", {}).get("fast", True))
+        fe_single(pcap_path, feature_csv, progress_cb=_map_progress, fast=fast_mode)
+        if progress_cb:
+            progress_cb(55)
+
+        try:
+            df = pd.read_csv(feature_csv, encoding="utf-8")
+        except Exception as exc:
+            raise RuntimeError(f"读取特征失败：{exc}") from exc
+
+        if df.empty:
+            raise RuntimeError("提取的特征为空，无法进行检测。")
+
+        result = self._predict_dataframe(
+            df,
+            source_name=base,
+            output_dir=output_dir,
+            metadata_override=metadata,
+            silent=True,
+        )
+        if progress_cb:
+            progress_cb(100)
+
+        payload = {
+            "pcap_path": pcap_path,
+            "feature_csv": feature_csv,
+            "prediction": result,
+        }
+        return payload
+
+    def _on_online_prediction_finished(self, payload) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        prediction = payload.get("prediction") if isinstance(payload.get("prediction"), dict) else {}
+        messages = prediction.get("messages") or []
+        if messages:
+            self.display_result("\n".join(f"[在线检测] {line}" for line in messages))
+
+        output_csv = prediction.get("output_csv")
+        if output_csv and os.path.exists(output_csv):
+            self._add_output(output_csv)
+            self._last_out_csv = output_csv
+            self._open_csv_paged(output_csv)
+
+        dataframe = prediction.get("dataframe")
+        if isinstance(dataframe, pd.DataFrame):
+            self.populate_table_from_df(dataframe)
+
+        metadata = prediction.get("metadata") if isinstance(prediction.get("metadata"), dict) else self._selected_metadata
+        ratio = prediction.get("ratio")
+        analysis_stub = None
+        if ratio is not None:
+            analysis_stub = {
+                "metrics": {
+                    "malicious_ratio": ratio,
+                    "anomaly_count": int(prediction.get("malicious", 0)),
+                    "total_count": int(prediction.get("total", 0)),
+                }
+            }
+        self.dashboard.update_metrics(analysis_stub, metadata if isinstance(metadata, dict) else None)
+
+        snapshot = dict(prediction)
+        if isinstance(dataframe, pd.DataFrame):
+            snapshot["dataframe"] = dataframe
+        snapshot["source_pcap"] = payload.get("pcap_path")
+        self._latest_prediction_summary = snapshot
+
+        basename = os.path.basename(payload.get("pcap_path") or "")
+        self.online_status_label.setText(f"最近完成：{basename}" if basename else "在线检测运行中")
+        self.display_result(f"[INFO] 在线检测完成：{payload.get('pcap_path')}")
+
+    def _on_online_prediction_error(self, message: str) -> None:
+        self.display_result(f"[错误] 在线检测任务失败：{message}")
+        QtWidgets.QMessageBox.warning(None, "在线检测任务失败", message)
+        self.online_status_label.setText(f"检测任务失败：{message}")
+
     def _bind_signals(self):
         self.btn_pick_file.clicked.connect(self._choose_file)
         self.btn_pick_dir.clicked.connect(self._choose_dir)
@@ -792,6 +1384,11 @@ class Ui_MainWindow(object):
         self.btn_predict.clicked.connect(self._on_predict)
         self.btn_open_results.clicked.connect(self._open_results_dir)
         self.btn_view_logs.clicked.connect(self._open_logs_dir)
+        self.btn_export_report.clicked.connect(self._on_export_report)
+        self.btn_config_editor.clicked.connect(self._open_config_editor_dialog)
+        self.btn_online_toggle.clicked.connect(self._toggle_online_detection)
+        self.model_combo.currentIndexChanged.connect(self._on_model_combo_changed)
+        self.model_refresh_btn.clicked.connect(self._refresh_model_versions)
 
         self.btn_page_prev.clicked.connect(self._on_page_prev)
         self.btn_page_next.clicked.connect(self._on_page_next)
@@ -802,9 +1399,11 @@ class Ui_MainWindow(object):
         self.fusion_checkbox.toggled.connect(lambda checked: self.fusion_alpha_spin.setEnabled(checked))
         self.fusion_checkbox.toggled.connect(self._on_rbf_settings_changed)
         self.fusion_alpha_spin.valueChanged.connect(self._on_rbf_settings_changed)
+        self.feature_slider.valueChanged.connect(self._on_feature_slider_changed)
 
         self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
         self.output_list.itemDoubleClicked.connect(self._on_output_double_click)
+        self.table_view.doubleClicked.connect(self._on_table_double_click)
 
     # --------- 路径小工具 ----------
     def _project_root(self):
@@ -836,7 +1435,111 @@ class Ui_MainWindow(object):
     def _preprocess_out_dir(self):
         return str(PATHS["csv_preprocess"])
 
+    def _refresh_model_versions(self):
+        if not hasattr(self, "model_combo"):
+            return
+        models_dir = Path(self._default_models_dir())
+        registry: Dict[str, dict] = {}
+        candidates: List[Path] = []
+        if models_dir.exists():
+            latest_path = models_dir / "latest_iforest_metadata.json"
+            if latest_path.exists():
+                candidates.append(latest_path)
+            pattern_files = sorted(models_dir.glob("iforest_metadata_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+            candidates.extend(pattern_files)
+        for path in candidates:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    metadata = json.load(fh)
+                if not isinstance(metadata, dict):
+                    continue
+            except Exception:
+                continue
+            pipeline_path = metadata.get("pipeline_latest") or metadata.get("pipeline_path")
+            if pipeline_path and not os.path.isabs(pipeline_path):
+                pipeline_path = str((models_dir / pipeline_path).resolve())
+            display_timestamp = metadata.get("timestamp") or path.stem
+            anomaly_ratio = metadata.get("estimated_anomaly_ratio") or metadata.get("training_anomaly_ratio")
+            if anomaly_ratio is not None:
+                try:
+                    display_text = f"{display_timestamp} | 异常占比 {float(anomaly_ratio):.2%}"
+                except Exception:
+                    display_text = str(display_timestamp)
+            else:
+                display_text = str(display_timestamp)
+            registry[str(path)] = {
+                "metadata_path": str(path),
+                "metadata": metadata,
+                "pipeline_path": pipeline_path,
+                "display": display_text,
+            }
+
+        self._model_registry = registry
+        current_key = self._selected_model_key
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for key, entry in registry.items():
+            self.model_combo.addItem(entry["display"], key)
+        self.model_combo.blockSignals(False)
+
+        if current_key and current_key in registry:
+            idx = self.model_combo.findData(current_key)
+            if idx >= 0:
+                self.model_combo.setCurrentIndex(idx)
+                self._on_model_combo_changed(idx)
+                return
+
+        if self.model_combo.count():
+            self.model_combo.setCurrentIndex(0)
+            self._on_model_combo_changed(0)
+        else:
+            self._on_model_combo_changed(-1)
+
+    def _on_model_combo_changed(self, index: int) -> None:
+        if not hasattr(self, "model_combo"):
+            return
+        if index < 0:
+            key = None
+        else:
+            key = self.model_combo.itemData(index)
+        entry = self._model_registry.get(key) if key else None
+        if not entry:
+            self.model_info_label.setText("尚未加载模型")
+            self._selected_model_key = None
+            self._selected_metadata = None
+            self._selected_metadata_path = None
+            self._selected_pipeline_path = None
+            return
+
+        metadata = entry.get("metadata") or {}
+        self._selected_model_key = key
+        self._selected_metadata = metadata
+        self._selected_metadata_path = entry.get("metadata_path")
+        self._selected_pipeline_path = entry.get("pipeline_path")
+
+        info_lines = []
+        if metadata.get("timestamp"):
+            info_lines.append(f"时间：{metadata['timestamp']}")
+        if metadata.get("contamination") is not None:
+            info_lines.append(f"训练污染率：{float(metadata['contamination']):.3%}")
+        if metadata.get("estimated_precision") is not None:
+            info_lines.append(f"估计精度：{float(metadata['estimated_precision']):.2%}")
+        if metadata.get("training_anomaly_ratio") is not None:
+            info_lines.append(f"训练异常占比：{float(metadata['training_anomaly_ratio']):.2%}")
+        if metadata.get("pseudo_labels"):
+            info_lines.append("含伪标签增强")
+        if metadata.get("manual_annotations"):
+            manual = metadata.get("manual_annotations")
+            info_lines.append(f"手工标注：{manual.get('total', 0)} 条")
+
+        self.model_info_label.setText("\n".join(info_lines) if info_lines else entry.get("display", ""))
+        self.dashboard.update_metrics(self._analysis_summary, metadata if isinstance(metadata, dict) else None)
+
+
     def _latest_pipeline_bundle(self):
+        if self._selected_pipeline_path and os.path.exists(self._selected_pipeline_path):
+            return self._selected_pipeline_path, self._selected_metadata_path
+
         models_dir = self._default_models_dir()
         latest_path = os.path.join(models_dir, "latest_iforest_pipeline.joblib")
         latest_meta = os.path.join(models_dir, "latest_iforest_metadata.json")
@@ -977,6 +1680,12 @@ class Ui_MainWindow(object):
             names = []
         names.sort()
         return [os.path.join(d, n) for n in names]
+
+    def _on_feature_slider_changed(self, value: int) -> None:
+        if value <= 0:
+            self.feature_slider_value.setText("全部")
+        else:
+            self.feature_slider_value.setText(f"{int(value)}%")
 
     # ——按钮进度视觉条——
     def set_button_progress(self, button: QtWidgets.QPushButton, progress: int):
@@ -1156,7 +1865,8 @@ class Ui_MainWindow(object):
         return df
 
     def populate_table_from_df(self, df: "pd.DataFrame"):
-        if pd is None: raise RuntimeError("pandas required")
+        if pd is None:
+            raise RuntimeError("pandas required")
         if pd is not None and isinstance(df, pd.DataFrame):
             df = self._auto_tag_dataframe(df)
         self._last_preview_df = df
@@ -1165,17 +1875,106 @@ class Ui_MainWindow(object):
         try:
             m = PandasFrameModel(show_df, self.table_view)
             proxy = QtCore.QSortFilterProxyModel(self.table_view)
-            proxy.setSourceModel(m); proxy.setFilterKeyColumn(-1)
+            proxy.setSourceModel(m)
+            proxy.setFilterKeyColumn(-1)
             self.table_view.setModel(proxy)
             self.table_view.setSortingEnabled(True)
             self.table_view.resizeColumnsToContents()
+
             def _current_df():
-                src = proxy.sourceModel(); return getattr(src, "_df", None)
+                src = proxy.sourceModel()
+                return getattr(src, "_df", None)
+
             self.table_view.setItemDelegate(RowHighlighter(_current_df, self.table_view))
             self.display_tabs.setCurrentWidget(self.table_widget)
         finally:
             self.table_view.setUpdatesEnabled(True)
+
+    def _on_table_double_click(self, index: QtCore.QModelIndex) -> None:
+        if not index.isValid():
+            return
+
+        model = self.table_view.model()
+        if model is None:
+            return
+
+        source_model = model
+        source_index = index
+        if isinstance(model, QtCore.QSortFilterProxyModel):
+            source_index = model.mapToSource(index)
+            source_model = model.sourceModel()
+
+        df = getattr(source_model, "_df", None)
+        if df is None or pd is None or not isinstance(df, pd.DataFrame):
+            return
+
+        row = source_index.row()
+        if row < 0 or row >= len(df):
+            return
+
+        record = dict(df.iloc[row])
+        dialog = AnomalyDetailDialog(record, self.table_view)
+        dialog.annotation_saved.connect(lambda value, rec=record: self._on_manual_annotation_saved(rec, value))
+        dialog.exec_()
+
+    def _on_manual_annotation_saved(self, record: Dict[str, object], value: float) -> None:
+        try:
+            summary = annotation_summary()
+        except Exception:
+            summary = {}
+
+        key_hint = record.get("flow_id") or record.get("__source_file__") or record.get("pcap_file")
+        if key_hint:
+            self.display_result(f"[INFO] 已保存人工标注：{key_hint} -> {value}")
+        else:
+            self.display_result(f"[INFO] 已保存人工标注值：{value}")
+
+        if summary:
+            self.display_result(
+                "[INFO] 人工标注统计：总 {} 条（异常 {}，正常 {}）".format(
+                    int(summary.get("total", 0)),
+                    int(summary.get("anomalies", 0)),
+                    int(summary.get("normals", 0)),
+                )
+            )
+
+        if pd is None:
+            return
+
+        try:
+            if self._last_out_csv and os.path.exists(self._last_out_csv):
+                df_full = pd.read_csv(self._last_out_csv, encoding="utf-8")
+                labels = apply_annotations_to_frame(df_full)
+                if labels is not None:
+                    df_full = df_full.copy()
+                    df_full["manual_label"] = labels
+                    df_full.to_csv(self._last_out_csv, index=False, encoding="utf-8")
+
+            if isinstance(self._latest_prediction_summary, dict):
+                df_latest = self._latest_prediction_summary.get("dataframe")
+                if isinstance(df_latest, pd.DataFrame):
+                    labels = apply_annotations_to_frame(df_latest)
+                    if labels is not None:
+                        df_latest = df_latest.copy()
+                        df_latest["manual_label"] = labels
+                        self._latest_prediction_summary["dataframe"] = df_latest
+
+            if self._last_preview_df is not None and isinstance(self._last_preview_df, pd.DataFrame):
+                df_preview = self._last_preview_df.copy()
+                labels = apply_annotations_to_frame(df_preview)
+                if labels is not None:
+                    df_preview["manual_label"] = labels
+                self.populate_table_from_df(df_preview)
+        except Exception as exc:
+            self.display_result(f"[WARN] 刷新标注视图失败：{exc}")
+
+        self.dashboard.update_metrics(
+            self._analysis_summary,
+            self._selected_metadata if isinstance(self._selected_metadata, dict) else None,
+        )
+
     # --------- 批次按钮 ----------
+
     def _on_prev_batch(self):
         if not self.btn_prev.isEnabled(): return
         step = max(1, self.batch_spin.value())
@@ -1375,6 +2174,153 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 已导出异常CSV：{outp}")
         self._open_csv_paged(outp)
 
+    def _on_export_report(self):
+        analysis = self._analysis_summary if isinstance(self._analysis_summary, dict) else {}
+        if not analysis:
+            QtWidgets.QMessageBox.warning(None, "暂无分析数据", "请先运行一次分析以生成报告内容。")
+            return
+
+        out_dir = self._analysis_out_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        default_name = os.path.join(out_dir, f"analysis_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            None,
+            "导出分析报告",
+            default_name,
+            "PDF 文件 (*.pdf)",
+        )
+        if not file_path:
+            return
+        if not file_path.lower().endswith(".pdf"):
+            file_path += ".pdf"
+
+        metadata = self._selected_metadata if isinstance(self._selected_metadata, dict) else analysis.get("metadata")
+        prediction = self._latest_prediction_summary if isinstance(self._latest_prediction_summary, dict) else None
+        try:
+            annot_info = annotation_summary()
+        except Exception:
+            annot_info = {}
+
+        try:
+            with PdfPages(file_path) as pdf:
+                fig, ax = plt.subplots(figsize=(8.27, 11.69))
+                ax.axis("off")
+                y_pos = 0.95
+                ax.text(0.5, y_pos, "恶意流量检测自动化报告", ha="center", va="top", fontsize=20, weight="bold")
+                y_pos -= 0.06
+
+                def add_line(text_line: str, *, indent: float = 0.0, fontsize: int = 12) -> None:
+                    nonlocal fig, ax, y_pos
+                    if y_pos < 0.08:
+                        pdf.savefig(fig, bbox_inches="tight")
+                        plt.close(fig)
+                        fig, ax = plt.subplots(figsize=(8.27, 11.69))
+                        ax.axis("off")
+                        y_pos = 0.95
+                    ax.text(0.05 + indent, y_pos, text_line, fontsize=fontsize, va="top")
+                    y_pos -= 0.035
+
+                add_line(f"报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                if metadata:
+                    if metadata.get("timestamp"):
+                        add_line(f"模型训练时间：{metadata['timestamp']}")
+                    if metadata.get("contamination") is not None:
+                        add_line(f"训练污染率：{float(metadata['contamination']):.2%}")
+                    if metadata.get("training_anomaly_ratio") is not None:
+                        add_line(f"训练异常占比：{float(metadata['training_anomaly_ratio']):.2%}")
+                    if metadata.get("estimated_precision") is not None:
+                        add_line(f"估计精度：{float(metadata['estimated_precision']):.2%}")
+                if analysis.get("out_dir"):
+                    add_line(f"分析输出目录：{analysis.get('out_dir')}")
+
+                summary_text = analysis.get("summary_text")
+                if summary_text:
+                    add_line("分析摘要：")
+                    for line in textwrap.wrap(str(summary_text), width=68):
+                        add_line(line, indent=0.02)
+
+                metrics = analysis.get("metrics") if isinstance(analysis.get("metrics"), dict) else {}
+                if metrics:
+                    add_line("关键指标：")
+                    if metrics.get("malicious_ratio") is not None:
+                        add_line(f"当前异常占比：{float(metrics['malicious_ratio']):.2%}", indent=0.02)
+                    if metrics.get("anomaly_count") is not None:
+                        add_line(f"异常样本数量：{int(metrics['anomaly_count'])}", indent=0.02)
+                    if metrics.get("total_count") is not None:
+                        add_line(f"总样本数量：{int(metrics['total_count'])}", indent=0.02)
+                    drift_block = metrics.get("drift") if isinstance(metrics.get("drift"), dict) else {}
+                    if drift_block:
+                        add_line("漂移检测：", indent=0.02)
+                        for key, label in (
+                            ("kl_divergence", "KL 散度"),
+                            ("psi", "PSI"),
+                            ("p_value", "p-value"),
+                        ):
+                            if drift_block.get(key) is not None:
+                                add_line(f"{label}：{float(drift_block[key]):.4f}", indent=0.04)
+                    eval_block = metrics.get("model_metrics") if isinstance(metrics.get("model_metrics"), dict) else {}
+                    if eval_block:
+                        add_line("模型评估：", indent=0.02)
+                        for key in ("precision", "recall", "f1", "roc_auc", "pr_auc"):
+                            if eval_block.get(key) is None:
+                                continue
+                            value = eval_block[key]
+                            if key in {"precision", "recall", "f1"}:
+                                add_line(f"{key.upper()}：{float(value):.2%}", indent=0.04)
+                            else:
+                                add_line(f"{key.upper()}：{float(value):.3f}", indent=0.04)
+
+                if annot_info and annot_info.get("total"):
+                    add_line(
+                        "人工标注累计：{} 条（异常 {}，正常 {}）".format(
+                            int(annot_info.get("total", 0)),
+                            int(annot_info.get("anomalies", 0)),
+                            int(annot_info.get("normals", 0)),
+                        ),
+                        indent=0.02,
+                    )
+
+                if prediction and prediction.get("summary"):
+                    add_line("最近一次预测：")
+                    for line in prediction.get("summary") or []:
+                        add_line(str(line), indent=0.02)
+
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close(fig)
+
+                plot_candidates: List[str] = []
+                timeline_path = analysis.get("timeline_plot")
+                if not timeline_path and metrics:
+                    timeline_path = metrics.get("timeline_plot")
+                if timeline_path:
+                    plot_candidates.append(str(timeline_path))
+                plots = analysis.get("plots")
+                if isinstance(plots, (list, tuple)):
+                    plot_candidates.extend(str(p) for p in plots if p)
+
+                seen: Set[str] = set()
+                for plot_path in plot_candidates:
+                    abs_path = os.path.abspath(plot_path)
+                    if abs_path in seen or not os.path.exists(abs_path):
+                        continue
+                    seen.add(abs_path)
+                    fig, ax = plt.subplots(figsize=(8.27, 11.69))
+                    ax.axis("off")
+                    try:
+                        image = plt.imread(abs_path)
+                        ax.imshow(image)
+                        ax.set_title(os.path.basename(abs_path), fontsize=12)
+                    except Exception as exc:
+                        ax.text(0.5, 0.5, f"无法加载图像：{os.path.basename(abs_path)}\n{exc}", ha="center", va="center")
+                    pdf.savefig(fig, bbox_inches="tight")
+                    plt.close(fig)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(None, "导出失败", f"生成报告时出错：{exc}")
+            return
+
+        self.display_result(f"[INFO] 报告已导出：{file_path}")
+        self._add_output(file_path)
+
     # --------- 提取特征（按顶部路径） ----------
     def _on_extract_features(self):
         selection = self._ask_pcap_input()
@@ -1544,25 +2490,35 @@ class Ui_MainWindow(object):
         gamma = self.rbf_gamma_spin.value()
         fusion_enabled = self.fusion_checkbox.isChecked()
         fusion_alpha = self.fusion_alpha_spin.value()
-        self.train_worker = TrainWorker(
+        feature_ratio = self.feature_slider.value()
+        feature_ratio = (float(feature_ratio) / 100.0) if feature_ratio > 0 else None
+        pipeline_config = self._collect_pipeline_config()
+        train_task = BackgroundTask(
+            run_train,
             path,
             res_dir,
             mdl_dir,
             rbf_components=int(comp) if comp > 0 else None,
             rbf_gamma=float(gamma) if gamma > 0 else None,
-            fusion_enabled=bool(fusion_enabled),
+            enable_supervised_fusion=bool(fusion_enabled),
             fusion_alpha=float(fusion_alpha),
+            feature_selection_ratio=feature_ratio,
+            pipeline_components=pipeline_config,
         )
-        self.train_worker.progress.connect(lambda p: self.set_button_progress(self.btn_train, p))
-        self.train_worker.finished.connect(self._on_train_finished)
-        self.train_worker.error.connect(self._on_train_error)
-        self.train_worker.start()
+        self._start_background_task(
+            train_task,
+            self._on_train_finished,
+            self._on_train_error,
+            lambda p: self.set_button_progress(self.btn_train, p),
+        )
 
     def _on_train_finished(self, res):
         self.btn_train.setEnabled(True)
         self.set_button_progress(self.btn_train, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_train))
         self._set_action_buttons_enabled(True)
+        if not isinstance(res, dict):
+            res = {} if res is None else {"result": res}
         threshold = res.get("threshold")
         vote_thr = res.get("vote_threshold")
         thr_parts = []
@@ -1679,6 +2635,53 @@ class Ui_MainWindow(object):
             msg_lines.append(f"稳健裁剪列={len(wins_cols)}")
         if res.get("estimated_precision") is not None:
             msg_lines.append(f"异常置信度均值≈{res.get('estimated_precision'):.2%}")
+        weight_info = res.get("feature_weighting") or {}
+        if isinstance(weight_info, dict) and weight_info.get("ratio"):
+            ratio_val = float(weight_info.get("ratio", 0.0))
+            selected = weight_info.get("selected_features") or []
+            total_feats = len(res.get("feature_columns") or [])
+            msg_lines.append(
+                f"特征筛选≈{ratio_val * 100:.0f}% (保留 {len(selected)}/{total_feats})"
+            )
+        if res.get("active_learning_csv"):
+            msg_lines.append(f"主动学习候选: {res['active_learning_csv']}")
+        pseudo_info = res.get("pseudo_labels") or {}
+        if isinstance(pseudo_info, dict) and pseudo_info.get("total"):
+            msg_lines.append(
+                "半监督样本：人工 {human} 条 | 伪标签 异常 {pseudo_anomaly} 条 / 正常 {pseudo_normal} 条".format(
+                    human=int(pseudo_info.get("human", 0)),
+                    pseudo_anomaly=int(pseudo_info.get("pseudo_anomaly", 0)),
+                    pseudo_normal=int(pseudo_info.get("pseudo_normal", 0)),
+                )
+            )
+        pipeline_cfg = res.get("pipeline_components") or {}
+        if isinstance(pipeline_cfg, dict) and pipeline_cfg:
+            enabled_labels = [
+                self.pipeline_labels.get(key, key)
+                for key, flag in pipeline_cfg.items()
+                if flag and key in self.pipeline_labels
+            ]
+            disabled_labels = [
+                self.pipeline_labels.get(key, key)
+                for key, flag in pipeline_cfg.items()
+                if not flag and key in self.pipeline_labels
+            ]
+            if enabled_labels:
+                msg_lines.append("启用组件: " + ", ".join(enabled_labels))
+            if disabled_labels:
+                msg_lines.append("停用组件: " + ", ".join(disabled_labels))
+        compute_device = res.get("compute_device") or res.get("deep_features", {}).get("device")
+        backend_name = None
+        deep_info = res.get("deep_features") or {}
+        if isinstance(deep_info, dict):
+            backend_name = deep_info.get("backend") or res.get("deep_backend")
+            loss_val = deep_info.get("training_loss")
+            if loss_val is not None:
+                msg_lines.append(f"自编码器训练误差≈{float(loss_val):.4f}")
+        if compute_device or backend_name:
+            msg_lines.append(
+                f"深度特征运行于 {backend_name or 'numpy'} @ {compute_device or 'CPU'}"
+            )
         feature_importances = res.get("feature_importances_topk") or []
         if feature_importances:
             preview_items = []
@@ -1700,6 +2703,8 @@ class Ui_MainWindow(object):
             if p and os.path.exists(p): self._add_output(p)
         if res.get("results_csv") and os.path.exists(res["results_csv"]):
             self._open_csv_paged(res["results_csv"])
+        if res.get("active_learning_csv") and os.path.exists(res["active_learning_csv"]):
+            self._add_output(res["active_learning_csv"])
 
     def _on_train_error(self, msg):
         self.btn_train.setEnabled(True); self.reset_button_progress(self.btn_train)
@@ -1725,12 +2730,29 @@ class Ui_MainWindow(object):
         self._analysis_summary = None
         self._set_action_buttons_enabled(False)
         self.btn_analysis.setEnabled(False); self.set_button_progress(self.btn_analysis, 1)
-        _, meta_path = self._latest_pipeline_bundle()
-        self.analysis_worker = AnalysisWorker(csv, out_dir, metadata_path=meta_path)
-        self.analysis_worker.progress.connect(lambda p: self.set_button_progress(self.btn_analysis, p))
-        self.analysis_worker.finished.connect(self._on_analysis_finished)
-        self.analysis_worker.error.connect(self._on_analysis_error)
-        self.analysis_worker.start()
+        meta_path = self._selected_metadata_path
+        if not meta_path or not os.path.exists(meta_path):
+            _, meta_path = self._latest_pipeline_bundle()
+        def _analysis_finished(result):
+            payload = result
+            if not isinstance(payload, dict):
+                payload = {"out_dir": out_dir}
+            else:
+                payload.setdefault("out_dir", out_dir)
+            self._on_analysis_finished(payload)
+
+        analysis_task = BackgroundTask(
+            run_analysis,
+            csv,
+            out_dir,
+            metadata_path=meta_path,
+        )
+        self._start_background_task(
+            analysis_task,
+            _analysis_finished,
+            self._on_analysis_error,
+            lambda p: self.set_button_progress(self.btn_analysis, p),
+        )
 
     def _on_analysis_finished(self, result):
         self.btn_analysis.setEnabled(True)
@@ -1757,6 +2779,7 @@ class Ui_MainWindow(object):
             summary_text = result.get("summary_text") if isinstance(result.get("summary_text"), str) else None
             summary_json = result.get("summary_json") if isinstance(result.get("summary_json"), str) else None
             metrics_csv = result.get("metrics_csv") if isinstance(result.get("metrics_csv"), str) else None
+            metrics_info = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
         else:
             out_dir = str(result) if result is not None else None
 
@@ -1768,6 +2791,19 @@ class Ui_MainWindow(object):
             self.display_result(f"{base_msg}\n{summary_text}")
         else:
             self.display_result(base_msg)
+
+        if "metrics_info" not in locals():
+            metrics_info = {}
+        if isinstance(metrics_info, dict) and metrics_info.get("drift_retrain"):
+            reasons = metrics_info.get("drift_retrain_reasons") or []
+            reason_text = "; ".join(str(item) for item in reasons if item)
+            if not reason_text:
+                reason_text = "分布漂移指标超出阈值"
+            QtWidgets.QMessageBox.warning(
+                None,
+                "建议重新训练",
+                f"检测到显著数据漂移：{reason_text}\n建议重新训练模型以适应最新数据。",
+            )
 
         added_paths: Set[str] = set()
 
@@ -1815,6 +2851,12 @@ class Ui_MainWindow(object):
         if out_dir and os.path.isdir(out_dir):
             _mark(out_dir)
 
+        metadata_for_dashboard = self._selected_metadata if isinstance(self._selected_metadata, dict) else (result.get("metadata") if isinstance(result, dict) else None)
+        self.dashboard.update_metrics(
+            self._analysis_summary,
+            metadata_for_dashboard if isinstance(metadata_for_dashboard, dict) else None,
+        )
+
     def _on_analysis_error(self, msg):
         self.btn_analysis.setEnabled(True); self.reset_button_progress(self.btn_analysis)
         self._set_action_buttons_enabled(True)
@@ -1823,78 +2865,48 @@ class Ui_MainWindow(object):
         self._analysis_summary = None
 
     # --------- 模型预测（支持 Pipeline / 模型+scaler / 仅模型） ----------
-    def _on_predict(self):
-        csv_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            None, "选择特征CSV", self._default_csv_feature_dir(), "CSV (*.csv)"
-        )
-        if not csv_path:
-            return
-        try:
-            df = pd.read_csv(csv_path, encoding="utf-8")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{e}")
-            return
-        if df.empty:
-            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
-            return
-
-        self._remember_path(csv_path)
-
-        from joblib import load as joblib_load
+    def _predict_dataframe(
+        self,
+        df: "pd.DataFrame",
+        *,
+        source_name: str,
+        output_dir: Optional[str] = None,
+        metadata_override: Optional[dict] = None,
+        silent: bool = False,
+    ) -> dict:
+        if pd is None:
+            raise RuntimeError("pandas 未安装，无法执行预测。")
 
         pipeline_path, meta_path = self._latest_pipeline_bundle()
         if not pipeline_path or not os.path.exists(pipeline_path):
-            QtWidgets.QMessageBox.warning(None, "缺少模型", "未找到最新的管线模型，请先完成一次训练。")
-            return
+            raise RuntimeError("未找到可用的模型管线，请先训练模型。")
 
-        try:
-            pipeline = joblib_load(pipeline_path)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(None, "加载失败", f"无法加载模型：{e}")
-            return
+        pipeline = joblib_load(pipeline_path)
 
-        metadata = {}
-        if meta_path and os.path.exists(meta_path):
+        metadata = dict(metadata_override) if isinstance(metadata_override, dict) else {}
+        if not metadata and meta_path and os.path.exists(meta_path):
             try:
                 with open(meta_path, "r", encoding="utf-8") as fh:
-                    metadata = json.load(fh)
+                    loaded = json.load(fh)
+                if isinstance(loaded, dict):
+                    metadata = loaded
             except Exception:
                 metadata = {}
 
-        threshold_breakdown_meta = metadata.get("threshold_breakdown") if isinstance(metadata, dict) else None
-        threshold = None
-        if isinstance(threshold_breakdown_meta, dict) and threshold_breakdown_meta.get("adaptive") is not None:
-            threshold = threshold_breakdown_meta.get("adaptive")
-        elif isinstance(metadata, dict):
-            threshold = metadata.get("threshold")
-        score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
-        vote_mean_meta = metadata.get("vote_mean") if isinstance(metadata, dict) else None
-        vote_threshold_meta = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
-
-        preprocessor_meta = metadata.get("preprocessor") if isinstance(metadata, dict) else None
-
-        try:
-            feature_df_raw, align_info = _align_input_features(df, metadata)
-        except ValueError as exc:
-            QtWidgets.QMessageBox.critical(None, "特征校验失败", str(exc))
-            return
-
+        feature_df_raw, align_info = _align_input_features(df, metadata)
+        messages: List[str] = []
         missing_cols = align_info.get("missing_filled") or []
         extra_cols = align_info.get("extra_columns") or []
-        schema_version = align_info.get("schema_version")
         if missing_cols:
-            msg = "以下列在输入数据中缺失，已按训练时填充值自动补齐：\n" + ", ".join(missing_cols)
-            QtWidgets.QMessageBox.information(None, "已自动补齐特征列", msg)
-            self.display_result(f"[WARN] 自动补齐缺失列: {', '.join(missing_cols)}")
+            messages.append(f"自动补齐缺失列: {', '.join(missing_cols)}")
         if extra_cols:
-            self.display_result(f"[INFO] 预测时忽略未使用列: {', '.join(extra_cols[:10])}{' ...' if len(extra_cols) > 10 else ''}")
+            messages.append(f"忽略未使用列: {', '.join(extra_cols[:10])}{' ...' if len(extra_cols) > 10 else ''}")
+        schema_version = align_info.get("schema_version")
         if schema_version and schema_version != MODEL_SCHEMA_VERSION:
-            self.display_result(
-                f"[WARN] 模型 schema_version={schema_version} 与当前期望 {MODEL_SCHEMA_VERSION} 不一致，请确认兼容性。"
-            )
+            messages.append(f"模型 schema_version={schema_version} 与当前 {MODEL_SCHEMA_VERSION} 不一致")
 
         models_dir = self._default_models_dir()
-        preproc_candidates = []
+        preproc_candidates: List[str] = []
         if isinstance(metadata, dict):
             if metadata.get("preprocessor_latest"):
                 preproc_candidates.append(metadata.get("preprocessor_latest"))
@@ -1903,53 +2915,40 @@ class Ui_MainWindow(object):
         preproc_candidates.append(os.path.join(models_dir, "latest_preprocessor.joblib"))
 
         loaded_preprocessor = None
-        last_preproc_error = None
         for path in preproc_candidates:
-            if not path:
-                continue
-            if not os.path.exists(path):
+            if not path or not os.path.exists(path):
                 continue
             try:
                 loaded_preprocessor = joblib_load(path)
                 break
-            except Exception as exc:
-                last_preproc_error = exc
+            except Exception:
                 continue
-
+        if loaded_preprocessor is None and hasattr(pipeline, "named_steps"):
+            loaded_preprocessor = pipeline.named_steps.get("preprocessor")
         if loaded_preprocessor is None:
-            loaded_preprocessor = pipeline.named_steps.get("preprocessor") if hasattr(pipeline, "named_steps") else None
-
-        if loaded_preprocessor is None:
-            detail = f"（最近一次错误：{last_preproc_error}）" if last_preproc_error else ""
-            QtWidgets.QMessageBox.critical(None, "模型不完整", f"缺少可用的特征预处理器，请重新训练。{detail}")
-            return
+            raise RuntimeError("模型缺少特征预处理器。")
 
         try:
             feature_df_aligned = loaded_preprocessor.transform(feature_df_raw)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(None, "转换失败", f"特征预处理失败：{e}")
-            return
+        except Exception as exc:
+            raise RuntimeError(f"特征预处理失败：{exc}")
 
         named_steps = getattr(pipeline, "named_steps", {}) if hasattr(pipeline, "named_steps") else {}
         detector = named_steps.get("detector") if isinstance(named_steps, dict) else None
-
         if detector is None:
-            QtWidgets.QMessageBox.critical(None, "模型不完整", "当前模型缺少集成检测器，请重新训练。")
-            return
+            raise RuntimeError("当前模型缺少集成检测器，请重新训练。")
 
         transformed = feature_df_aligned
         for name, step in pipeline.steps[1:-1]:
             try:
                 transformed = step.transform(transformed)
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(None, "转换失败", f"特征变换失败（{name}）：{e}")
-                return
+            except Exception as exc:
+                raise RuntimeError(f"特征变换失败（{name}）：{exc}")
 
         try:
             preds = detector.predict(transformed)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(None, "预测失败", f"预测错误：{e}")
-            return
+        except Exception as exc:
+            raise RuntimeError(f"预测失败：{exc}")
 
         scores = getattr(detector, "last_combined_scores_", None)
         if scores is None:
@@ -1974,22 +2973,30 @@ class Ui_MainWindow(object):
             if vote_blocks:
                 vote_ratio = np.vstack(vote_blocks).mean(axis=0)
         if vote_ratio is None:
+            vote_mean_meta = metadata.get("vote_mean") if isinstance(metadata, dict) else None
             fallback_vote = 0.5 if vote_mean_meta is None else float(vote_mean_meta)
             vote_ratio = np.full(len(feature_df_aligned), fallback_vote, dtype=float)
         vote_ratio = np.asarray(vote_ratio, dtype=float)
 
+        threshold_breakdown_meta = metadata.get("threshold_breakdown") if isinstance(metadata, dict) else None
+        threshold = None
+        if isinstance(threshold_breakdown_meta, dict) and threshold_breakdown_meta.get("adaptive") is not None:
+            threshold = threshold_breakdown_meta.get("adaptive")
+        elif isinstance(metadata, dict):
+            threshold = metadata.get("threshold")
         if threshold is None:
             threshold = getattr(detector, "threshold_", None)
         if threshold is None:
             threshold = float(np.quantile(scores, 0.05)) if len(scores) else 0.0
 
-        vote_threshold = vote_threshold_meta
+        vote_threshold = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
         if vote_threshold is None:
             vote_threshold = getattr(detector, "vote_threshold_", None)
         if vote_threshold is None:
             vote_threshold = float(np.mean(vote_ratio)) if len(vote_ratio) else 0.5
         vote_threshold = float(np.clip(vote_threshold, 0.0, 1.0))
 
+        score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
         if score_std is None:
             score_std = float(np.std(scores) or 1.0)
 
@@ -2007,75 +3014,137 @@ class Ui_MainWindow(object):
                 1.0,
             )
 
-        anomaly_confidence = risk_score.copy()
-
         out_df = df.copy()
         out_df["prediction"] = preds
         out_df["is_malicious"] = (preds == -1).astype(int)
         out_df["anomaly_score"] = scores
-        out_df["anomaly_confidence"] = anomaly_confidence
+        out_df["anomaly_confidence"] = risk_score
         out_df["vote_ratio"] = vote_ratio
         out_df["risk_score"] = risk_score
 
         malicious = int(out_df["is_malicious"].sum())
         total = int(len(out_df))
         ratio = (malicious / total) if total else 0.0
-        status = "异常" if malicious else "正常"
-
-        out_dir = self._prediction_out_dir()
-        os.makedirs(out_dir, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        base = os.path.splitext(os.path.basename(csv_path))[0]
-        out_csv = os.path.join(out_dir, f"prediction_{base}_{stamp}.csv")
-        try:
-            out_df.to_csv(out_csv, index=False, encoding="utf-8")
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(None, "保存失败", f"无法写出预测结果：{e}")
-            return
 
         score_min = float(np.min(scores)) if len(scores) else 0.0
         score_max = float(np.max(scores)) if len(scores) else 0.0
-        msg = [
-            f"模型预测完成：{out_csv}",
-            f"整体判定：{status}",
+
+        summary_lines = [
+            f"模型预测完成：{source_name}",
             f"检测包数：{total}",
             f"异常包数：{malicious} ({ratio:.2%})",
-            f"自动阈值：{threshold:.6f}",
+            f"自动阈值：{float(threshold):.6f}",
             f"投票阈值：{vote_threshold:.2f}",
             f"分数范围：{score_min:.4f} ~ {score_max:.4f}",
             f"平均风险分：{float(risk_score.mean()):.2%}",
         ]
-        if missing_cols:
-            msg.append(
-                "已自动补齐缺失列: "
-                + ", ".join(missing_cols[:10])
-                + (" ..." if len(missing_cols) > 10 else "")
-            )
-        if extra_cols:
-            msg.append(
-                "已忽略未在训练中使用的列: "
-                + ", ".join(extra_cols[:10])
-                + (" ..." if len(extra_cols) > 10 else "")
-            )
-        if schema_version and schema_version != MODEL_SCHEMA_VERSION:
-            msg.append(
-                f"⚠ 模型 schema_version={schema_version} 与期望 {MODEL_SCHEMA_VERSION} 不一致"
-            )
-        if isinstance(threshold_breakdown_meta, dict) and threshold_breakdown_meta.get("adaptive") is not None:
-            msg.append(
-                "阈值拆解: 自适应 {:.6f} | 分位 {:.6f} | 鲁棒 {:.6f}".format(
-                    float(threshold_breakdown_meta.get("adaptive")),
-                    float(threshold_breakdown_meta.get("quantile", threshold)),
-                    float(threshold_breakdown_meta.get("robust", threshold)),
-                )
-            )
-        self.display_result("\n".join(msg))
 
-        self._add_output(out_csv)
-        self._last_out_csv = out_csv
-        self._open_csv_paged(out_csv)
+        if output_dir is None:
+            output_dir = self._prediction_out_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in source_name)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_csv = os.path.join(output_dir, f"prediction_{safe_name}_{stamp}.csv")
+        out_df.to_csv(out_csv, index=False, encoding="utf-8")
+
+        messages.extend(summary_lines)
+        if not silent:
+            for msg in messages:
+                self.display_result(f"[INFO] {msg}")
+
+        return {
+            "output_csv": out_csv,
+            "dataframe": out_df,
+            "summary": summary_lines,
+            "messages": messages,
+            "metadata": metadata,
+            "malicious": malicious,
+            "total": total,
+            "ratio": ratio,
+        }
+
+
+    def _on_predict(self):
+        if pd is None:
+            QtWidgets.QMessageBox.warning(None, "缺少依赖", "当前环境未安装 pandas，无法执行预测。")
+            return
+
+        csv_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None, "选择特征CSV", self._default_csv_feature_dir(), "CSV (*.csv)"
+        )
+        if not csv_path:
+            return
+
+        try:
+            df = pd.read_csv(csv_path, encoding="utf-8")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{exc}")
+            return
+
+        if df.empty:
+            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
+            return
+
+        self._remember_path(csv_path)
+
+        source_name = os.path.splitext(os.path.basename(csv_path))[0] or os.path.basename(csv_path)
+        metadata_override = self._selected_metadata if isinstance(self._selected_metadata, dict) else None
+
+        try:
+            result = self._predict_dataframe(
+                df,
+                source_name=source_name,
+                metadata_override=metadata_override,
+                silent=True,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
+            return
+
+        messages = result.get("messages") or []
+        if messages:
+            log_text = "\n".join(f"[INFO] {line}" for line in messages)
+            self.display_result(log_text)
+
+        output_csv = result.get("output_csv")
+        if output_csv and os.path.exists(output_csv):
+            self._add_output(output_csv)
+            self._last_out_csv = output_csv
+            self._open_csv_paged(output_csv)
+
+        dataframe = result.get("dataframe")
+        if isinstance(dataframe, pd.DataFrame):
+            self.populate_table_from_df(dataframe)
+
+        metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else metadata_override
+        ratio = result.get("ratio")
+        analysis_stub = None
+        if ratio is not None:
+            analysis_stub = {
+                "metrics": {
+                    "malicious_ratio": ratio,
+                    "anomaly_count": int(result.get("malicious", 0)),
+                    "total_count": int(result.get("total", 0)),
+                }
+            }
+
+        self.dashboard.update_metrics(analysis_stub, metadata)
+
+        snapshot = {key: value for key, value in result.items() if key != "dataframe"}
+        snapshot["dataframe"] = dataframe
+        snapshot["source_csv"] = csv_path
+        if metadata and "metadata" not in snapshot:
+            snapshot["metadata"] = metadata
+        self._latest_prediction_summary = snapshot
+
+        QtWidgets.QMessageBox.information(
+            None,
+            "预测完成",
+            "\n".join(result.get("summary") or ["模型预测已完成并写出结果。"]),
+        )
 
     # --------- 输出列表 ----------
+
     def _add_output(self, path):
         if not path: return
         it = QtWidgets.QListWidgetItem(os.path.basename(path))
@@ -2128,6 +3197,8 @@ class Ui_MainWindow(object):
     def _on_rbf_settings_changed(self):
         if getattr(self, "_loading_settings", False):
             return
+        if not getattr(self, "_settings_ready", False):
+            return
         if not hasattr(self, "_settings"):
             return
         try:
@@ -2140,6 +3211,7 @@ class Ui_MainWindow(object):
 
     def _apply_saved_preferences(self):
         if not hasattr(self, "_settings"):
+            self._settings_ready = True
             return
         self._loading_settings = True
         try:
@@ -2164,8 +3236,40 @@ class Ui_MainWindow(object):
             except Exception:
                 self.fusion_alpha_spin.setValue(0.5)
             self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
+            saved_pipeline = self._settings.get("pipeline_components", {})
+            if isinstance(saved_pipeline, dict) and hasattr(self, "pipeline_checks"):
+                for key, checkbox in self.pipeline_checks.items():
+                    if key in saved_pipeline:
+                        try:
+                            checkbox.setChecked(bool(saved_pipeline[key]))
+                        except Exception:
+                            pass
         finally:
             self._loading_settings = False
+            self._settings_ready = True
+
+    def shutdown(self) -> None:
+        try:
+            self._cancel_running()
+        except Exception:
+            pass
+
+        if getattr(self, "preprocess_worker", None) and self.preprocess_worker.isRunning():
+            try:
+                self.preprocess_worker.requestInterruption()
+                self.preprocess_worker.wait(1000)
+            except Exception:
+                pass
+
+        worker = getattr(self, "_online_worker", None)
+        if worker and worker.isRunning():
+            try:
+                worker.stop()
+                worker.wait(2000)
+            except Exception:
+                pass
+        self._online_worker = None
+        self._online_output_dir = None
 
     # --------- 清空 ----------
     def _on_clear(self):
@@ -2212,6 +3316,13 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__(parent)
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+
+    def closeEvent(self, event):
+        try:
+            self.ui.shutdown()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
 
 def main() -> int:

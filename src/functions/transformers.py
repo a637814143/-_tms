@@ -4,9 +4,20 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List, Optional
 
+import numpy as np
 import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from sklearn.base import BaseEstimator, TransformerMixin
+
+try:  # optional GPU acceleration backend
+    import torch
+    from torch import nn
+    from torch.utils.data import DataLoader, TensorDataset
+except Exception:  # pragma: no cover - optional dependency may be absent
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    DataLoader = None  # type: ignore[assignment]
+    TensorDataset = None  # type: ignore[assignment]
 
 
 def _maybe_float(value: object) -> object:
@@ -222,3 +233,282 @@ class PreprocessPipeline(BaseEstimator, TransformerMixin):
             inst.column_fill_values = dict(column_fill_values)
             inst.aligner.column_fill_values = dict(column_fill_values)
         return inst
+
+
+class FeatureWeighter(BaseEstimator, TransformerMixin):
+    """Apply per-feature weights to attenuate low-importance columns."""
+
+    def __init__(self, weights: Optional[Dict[str, float]] = None) -> None:
+        self.weights = {str(k): float(v) for k, v in (weights or {}).items()}
+        self._columns_: List[str] = []
+
+    def set_weights(self, weights: Dict[str, float]) -> None:
+        self.weights = {str(k): float(v) for k, v in weights.items()}
+
+    def fit(self, X, y: Optional[object] = None):  # noqa: D401
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("FeatureWeighter 仅支持 pandas DataFrame 输入。")
+        self._columns_ = list(X.columns)
+        return self
+
+    def transform(self, X):  # noqa: D401
+        if not isinstance(X, pd.DataFrame):
+            raise TypeError("FeatureWeighter 仅支持 pandas DataFrame 输入。")
+        if not self.weights:
+            return X.copy()
+        Xc = X.copy()
+        for col, weight in self.weights.items():
+            if col in Xc.columns:
+                try:
+                    Xc[col] = pd.to_numeric(Xc[col], errors="coerce").fillna(0.0) * float(weight)
+                except Exception:
+                    Xc[col] = Xc[col]
+        return Xc
+
+    def to_metadata(self) -> Dict[str, float]:
+        return dict(self.weights)
+
+
+if torch is not None:  # pragma: no cover - optional backend container
+
+    class _TorchAutoencoder(nn.Module):
+        def __init__(self, input_dim: int, latent_dim: int) -> None:
+            super().__init__()
+            self.encoder = nn.Sequential(nn.Linear(input_dim, latent_dim), nn.Tanh())
+            self.decoder = nn.Sequential(nn.Linear(latent_dim, input_dim))
+
+        def forward(self, x):  # type: ignore[override]
+            latent = self.encoder(x)
+            recon = self.decoder(latent)
+            return latent, recon
+
+
+class DeepFeatureExtractor(BaseEstimator, TransformerMixin):
+    """Lightweight autoencoder-style projector with reconstruction error output."""
+
+    def __init__(
+        self,
+        latent_dim: int = 32,
+        *,
+        max_epochs: int = 20,
+        batch_size: int = 256,
+        learning_rate: float = 1e-2,
+        max_samples: int = 20000,
+        random_state: int = 42,
+    ) -> None:
+        self.latent_dim = int(max(2, latent_dim))
+        self.max_epochs = int(max(1, max_epochs))
+        self.batch_size = int(max(8, batch_size))
+        self.learning_rate = float(max(1e-5, learning_rate))
+        self.max_samples = int(max(500, max_samples))
+        self.random_state = int(random_state)
+
+        self.input_dim_: Optional[int] = None
+        self.latent_dim_: Optional[int] = None
+        self.training_loss_: Optional[float] = None
+        self.encoder_weights_: Optional[np.ndarray] = None
+        self.encoder_bias_: Optional[np.ndarray] = None
+        self.decoder_weights_: Optional[np.ndarray] = None
+        self.decoder_bias_: Optional[np.ndarray] = None
+        self.latent_slice_: Optional[slice] = None
+        self.error_index_: Optional[int] = None
+        self.device_: str = "cpu"
+        self.training_backend_: str = "numpy"
+        self.actual_batch_size_: int = self.batch_size
+        self.last_reconstruction_error_: Optional[np.ndarray] = None
+
+    def _init_parameters(self, input_dim: int) -> None:
+        rng = np.random.default_rng(self.random_state)
+        latent = max(1, min(self.latent_dim, max(2, input_dim // 2)))
+        latent = min(latent, input_dim)
+        limit = 1.0 / max(1.0, np.sqrt(input_dim))
+        self.encoder_weights_ = rng.uniform(-limit, limit, size=(input_dim, latent))
+        self.encoder_bias_ = np.zeros(latent, dtype=float)
+        self.decoder_weights_ = rng.uniform(-limit, limit, size=(latent, input_dim))
+        self.decoder_bias_ = np.zeros(input_dim, dtype=float)
+        self.input_dim_ = input_dim
+        self.latent_dim_ = latent
+        self.latent_slice_ = slice(input_dim, input_dim + latent)
+        self.error_index_ = input_dim + latent
+
+    def _encode(self, X: np.ndarray) -> np.ndarray:
+        hidden = X @ self.encoder_weights_ + self.encoder_bias_
+        return np.tanh(hidden)
+
+    def _decode(self, H: np.ndarray) -> np.ndarray:
+        return H @ self.decoder_weights_ + self.decoder_bias_
+
+    def _forward(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        latent = self._encode(X)
+        recon = self._decode(latent)
+        return latent, recon
+
+    def fit(self, X, y: Optional[object] = None):  # noqa: D401
+        arr = np.asarray(X, dtype=float)
+        if arr.ndim != 2:
+            raise ValueError("DeepFeatureExtractor 需要二维输入矩阵。")
+
+        n_samples, n_features = arr.shape
+        self._init_parameters(n_features)
+
+        rng = np.random.default_rng(self.random_state)
+        if n_samples > self.max_samples:
+            idx = rng.choice(n_samples, size=self.max_samples, replace=False)
+            train_arr = arr[idx]
+        else:
+            train_arr = arr
+
+        self.training_backend_ = "numpy"
+        self.device_ = "cpu"
+        self.actual_batch_size_ = self.batch_size
+
+        use_torch = False
+        device = None
+        if torch is not None:
+            try:
+                if torch.cuda.is_available():
+                    device = torch.device("cuda")
+                elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                    device = torch.device("mps")
+            except Exception:
+                device = None
+            if device is not None:
+                use_torch = True
+
+        if use_torch:
+            self.training_backend_ = "torch"
+            self.device_ = str(device)
+            best_loss = self._fit_with_torch(train_arr, device)
+        else:
+            best_loss = self._fit_with_numpy(train_arr)
+
+        self.training_loss_ = float(best_loss if np.isfinite(best_loss) else 0.0)
+        return self
+
+    def transform(self, X):  # noqa: D401
+        arr = np.asarray(X, dtype=float)
+        if arr.ndim != 2:
+            raise ValueError("DeepFeatureExtractor 需要二维输入矩阵。")
+        if self.encoder_weights_ is None or self.decoder_weights_ is None:
+            raise RuntimeError("DeepFeatureExtractor 尚未拟合。")
+
+        latent, recon = self._forward(arr)
+        error = np.mean((recon - arr) ** 2, axis=1)
+        error = error.reshape(-1, 1)
+        output = np.hstack([arr, latent, error])
+        self.last_reconstruction_error_ = error.ravel()
+        return output
+
+    # Internal helpers -------------------------------------------------
+
+    def _fit_with_numpy(self, train_arr: np.ndarray) -> float:
+        rng = np.random.default_rng(self.random_state)
+        patience = 3
+        stalled = 0
+        best_loss = np.inf
+        self.actual_batch_size_ = self.batch_size
+        for _epoch in range(self.max_epochs):
+            idx = rng.permutation(len(train_arr))
+            shuffled = train_arr[idx]
+            epoch_loss = 0.0
+            steps = 0
+            for start in range(0, len(shuffled), self.batch_size):
+                end = start + self.batch_size
+                batch = shuffled[start:end]
+                if batch.size == 0:
+                    continue
+                steps += 1
+                latent, recon = self._forward(batch)
+                error = recon - batch
+                loss = float(np.mean(error**2))
+                epoch_loss += loss
+
+                grad_recon = error / max(1, batch.shape[0])
+                grad_W2 = latent.T @ grad_recon
+                grad_b2 = grad_recon.sum(axis=0)
+                grad_hidden = grad_recon @ self.decoder_weights_.T
+                grad_hidden *= (1.0 - latent**2)
+                grad_W1 = batch.T @ grad_hidden
+                grad_b1 = grad_hidden.sum(axis=0)
+
+                self.decoder_weights_ -= self.learning_rate * grad_W2
+                self.decoder_bias_ -= self.learning_rate * grad_b2
+                self.encoder_weights_ -= self.learning_rate * grad_W1
+                self.encoder_bias_ -= self.learning_rate * grad_b1
+
+            epoch_loss /= max(1, steps)
+            if epoch_loss < best_loss - 1e-6:
+                best_loss = epoch_loss
+                stalled = 0
+            else:
+                stalled += 1
+                if stalled >= patience:
+                    break
+        return float(best_loss)
+
+    def _fit_with_torch(self, train_arr: np.ndarray, device) -> float:
+        if torch is None or nn is None or DataLoader is None or TensorDataset is None:
+            return self._fit_with_numpy(train_arr)
+
+        torch.manual_seed(self.random_state)
+        tensor = torch.from_numpy(train_arr.astype(np.float32))
+        dataset = TensorDataset(tensor)
+        max_batch = max(self.batch_size, self.batch_size * 4)
+        self.actual_batch_size_ = int(min(len(dataset), max_batch)) or self.batch_size
+        batch_size = max(8, self.actual_batch_size_)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False,
+        )
+        model = _TorchAutoencoder(self.input_dim_, self.latent_dim_).to(device)
+        optimiser = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
+        loss_fn = torch.nn.MSELoss()
+
+        patience = 3
+        stalled = 0
+        best_loss = float("inf")
+
+        for _epoch in range(self.max_epochs):
+            epoch_loss = 0.0
+            total = 0
+            for (batch,) in loader:
+                batch = batch.to(device)
+                optimiser.zero_grad()
+                latent, recon = model(batch)
+                loss = loss_fn(recon, batch)
+                loss.backward()
+                optimiser.step()
+                batch_loss = float(loss.item())
+                epoch_loss += batch_loss * batch.shape[0]
+                total += batch.shape[0]
+
+            if total:
+                epoch_loss /= float(total)
+            if epoch_loss < best_loss - 1e-6:
+                best_loss = epoch_loss
+                stalled = 0
+            else:
+                stalled += 1
+                if stalled >= patience:
+                    break
+
+        with torch.no_grad():
+            encoder = model.encoder[0]
+            decoder = model.decoder[0]
+            self.encoder_weights_ = encoder.weight.detach().cpu().numpy().T
+            self.encoder_bias_ = encoder.bias.detach().cpu().numpy()
+            self.decoder_weights_ = decoder.weight.detach().cpu().numpy().T
+            self.decoder_bias_ = decoder.bias.detach().cpu().numpy()
+
+        return float(best_loss)
+
+    def get_feature_names_out(self, input_features=None):
+        if input_features is None:
+            input_features = [f"f{i}" for i in range(self.input_dim_ or 0)]
+        base = list(input_features)
+        latent_dim = self.latent_dim_ or 0
+        base.extend([f"deep_latent_{i}" for i in range(latent_dim)])
+        base.append("deep_recon_error")
+        return np.array(base, dtype=object)
