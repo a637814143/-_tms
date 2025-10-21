@@ -30,7 +30,7 @@ from joblib import dump
 
 from src.functions.feature_extractor import extract_features, extract_features_dir
 from src.functions.anomaly_detector import EnsembleAnomalyDetector
-from src.functions.logging_utils import get_logger
+from src.functions.logging_utils import get_logger, log_training_run
 from src.functions.transformers import (
     FeatureAligner,
     FeatureWeighter,
@@ -173,6 +173,47 @@ def _build_token_variants(tokens: set[str]) -> set[str]:
 
 NORMAL_TOKEN_VARIANTS = _build_token_variants(NORMAL_TOKENS)
 ANOMALY_TOKEN_VARIANTS = _build_token_variants(ANOMALY_TOKENS)
+
+
+def compute_risk_components(
+    scores: np.ndarray,
+    vote_ratio: np.ndarray,
+    threshold: float,
+    vote_threshold: float,
+    score_std: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute fused risk scores and intermediate components.
+
+    This helper is shared between the training pipeline and the CLI/REST
+    prediction utilities to keep the anomaly risk calibration consistent
+    across entry-points.
+    """
+
+    scores_arr = np.asarray(scores, dtype=float)
+    votes_arr = np.asarray(vote_ratio, dtype=float)
+    if votes_arr.shape != scores_arr.shape:
+        votes_arr = np.broadcast_to(votes_arr, scores_arr.shape)
+
+    safe_threshold = float(threshold)
+    safe_vote_threshold = float(np.clip(vote_threshold, 0.0, 1.0))
+    try:
+        safe_std = float(score_std)
+    except (TypeError, ValueError):
+        safe_std = 1.0
+    if not np.isfinite(safe_std) or abs(safe_std) < 1e-9:
+        safe_std = 1.0
+
+    conf_from_score = 1.0 / (
+        1.0 + np.exp((scores_arr - safe_threshold) / (safe_std + 1e-6))
+    )
+    vote_component = np.clip(
+        (votes_arr - safe_vote_threshold) / max(1e-6, (1.0 - safe_vote_threshold)),
+        0.0,
+        1.0,
+    )
+    risk_score = np.clip(0.6 * conf_from_score + 0.4 * vote_component, 0.0, 1.0)
+
+    return risk_score, conf_from_score, vote_component
 
 
 def _is_npz(path: str) -> bool:
@@ -573,6 +614,7 @@ def _train_from_dataframe(
     fusion_alpha: float = 0.5,
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
+    pipeline_components: Optional[Dict[str, bool]] = None,
 ) -> dict:
     if df.empty:
         raise RuntimeError("训练数据为空。")
@@ -751,6 +793,23 @@ def _train_from_dataframe(
         fusion_enabled = True
     fusion_source: Optional[str] = None
 
+    pipeline_components_config: Dict[str, bool] = {
+        "aligner": True,
+        "preprocessor": True,
+        "feature_weighter": True,
+        "variance_filter": True,
+        "scaler": True,
+        "deep_features": True,
+        "gaussianizer": True,
+        "rbf_expander": True,
+    }
+    if pipeline_components:
+        for key, enabled in pipeline_components.items():
+            if key in pipeline_components_config:
+                pipeline_components_config[key] = bool(enabled)
+    pipeline_components_config["aligner"] = True
+    pipeline_components_config["preprocessor"] = True
+
     feature_weighter = FeatureWeighter(feature_weights or {})
     deep_latent_dim = int(np.clip(len(feature_columns) // 2, 8, 128))
     deep_extractor = DeepFeatureExtractor(
@@ -760,36 +819,57 @@ def _train_from_dataframe(
         batch_size=256,
     )
 
+    variance_step = (
+        VarianceThreshold(threshold=1e-6)
+        if pipeline_components_config["variance_filter"]
+        else None
+    )
+    scaler_step = StandardScaler() if pipeline_components_config["scaler"] else None
+    gaussianizer_step = (
+        QuantileTransformer(
+            output_distribution="normal",
+            subsample=200000,
+            random_state=42,
+        )
+        if pipeline_components_config["gaussianizer"]
+        else None
+    )
+    feature_expander_step = (
+        RBFSampler(n_components=used_components, gamma=used_gamma, random_state=42)
+        if pipeline_components_config["rbf_expander"] and used_components > 0
+        else None
+    )
+    if feature_expander_step is None:
+        used_components = 0
+        used_gamma = 0.0
+
     pipeline_steps = [
         ("aligner", aligner),
         ("preprocessor", preprocessor),
-        ("feature_weighter", feature_weighter),
-        ("variance_filter", VarianceThreshold(threshold=1e-6)),
-        ("scaler", StandardScaler()),
-        ("deep_features", deep_extractor),
-        (
-            "gaussianizer",
-            QuantileTransformer(
-                output_distribution="normal",
-                subsample=200000,
-                random_state=42,
-            ),
-        ),
-        (
-            "feature_expander",
-            RBFSampler(
-                n_components=used_components,
-                gamma=used_gamma,
-                random_state=42,
-            ),
-        ),
-        ("detector", detector),
     ]
+    if pipeline_components_config["feature_weighter"]:
+        pipeline_steps.append(("feature_weighter", feature_weighter))
+    if variance_step is not None:
+        pipeline_steps.append(("variance_filter", variance_step))
+    if scaler_step is not None:
+        pipeline_steps.append(("scaler", scaler_step))
+    if pipeline_components_config["deep_features"]:
+        pipeline_steps.append(("deep_features", deep_extractor))
+    if gaussianizer_step is not None:
+        pipeline_steps.append(("gaussianizer", gaussianizer_step))
+    if feature_expander_step is not None:
+        pipeline_steps.append(("feature_expander", feature_expander_step))
+    pipeline_steps.append(("detector", detector))
 
     pipeline = Pipeline(pipeline_steps)
 
+    enabled_optional_steps = [
+        name
+        for name, enabled in pipeline_components_config.items()
+        if enabled and name not in {"aligner", "preprocessor"}
+    ]
     logger.info(
-        "Starting unsupervised training: rows=%d features=%d contamination=%.4f (adaptive=%.4f) rbf_components=%d rbf_gamma=%.3f [%s]",
+        "Starting unsupervised training: rows=%d features=%d contamination=%.4f (adaptive=%.4f) rbf_components=%d rbf_gamma=%.3f [%s] pipeline_steps=%s",
         len(feature_df_numeric),
         len(feature_columns),
         contamination,
@@ -797,6 +877,7 @@ def _train_from_dataframe(
         used_components,
         used_gamma,
         gamma_source,
+        ",".join(enabled_optional_steps) if enabled_optional_steps else "aligner,preprocessor",
     )
 
     if progress_cb:
@@ -827,11 +908,28 @@ def _train_from_dataframe(
         deep_feature_info["training_loss"] = float(
             getattr(deep_step, "training_loss_", 0.0) or 0.0
         )
+        deep_feature_info["device"] = str(getattr(deep_step, "device_", "cpu"))
+        deep_feature_info["backend"] = str(
+            getattr(deep_step, "training_backend_", "numpy")
+        )
+        deep_feature_info["batch_size"] = int(
+            getattr(deep_step, "actual_batch_size_", getattr(deep_step, "batch_size", 0))
+            or getattr(deep_step, "batch_size", 0)
+        )
         try:
+            detector_idx = max(0, len(pipeline.steps) - 1)
             gaussianizer_idx = next(
-                i for i, (name, _) in enumerate(pipeline.steps) if name == "gaussianizer"
+                (
+                    i
+                    for i, (name, _) in enumerate(pipeline.steps)
+                    if name == "gaussianizer"
+                ),
+                detector_idx,
             )
-            pre_gaussianizer = Pipeline(pipeline.steps[:gaussianizer_idx])
+            if gaussianizer_idx == detector_idx:
+                pre_gaussianizer = Pipeline(pipeline.steps[:detector_idx])
+            else:
+                pre_gaussianizer = Pipeline(pipeline.steps[:gaussianizer_idx])
             deep_output = pre_gaussianizer.transform(feature_df_numeric)
             if isinstance(deep_output, np.ndarray) and deep_output.ndim == 2:
                 representation_shapes["deep_augmented"] = [
@@ -1059,9 +1157,13 @@ def _train_from_dataframe(
     )
 
     score_std = float(np.std(scores) or 1.0)
-    conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
-    vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
-    risk_score = np.clip(0.6 * conf_from_score + 0.4 * vote_component, 0.0, 1.0)
+    risk_score, conf_from_score, vote_component = compute_risk_components(
+        scores,
+        vote_ratio,
+        threshold,
+        vote_threshold,
+        score_std,
+    )
 
     if deep_errors is not None and deep_errors.size == risk_score.size:
         ae_min = float(np.min(deep_errors))
@@ -1168,10 +1270,17 @@ def _train_from_dataframe(
     except Exception:
         dump(preprocessor, latest_preprocessor_path)
 
-    scaler_path = os.path.join(models_dir, "scaler.joblib")
-    dump(pipeline.named_steps["scaler"], scaler_path)
-    gaussianizer_path = os.path.join(models_dir, "gaussianizer.joblib")
-    dump(pipeline.named_steps["gaussianizer"], gaussianizer_path)
+    scaler_path = None
+    scaler_step_inst = pipeline.named_steps.get("scaler")
+    if scaler_step_inst is not None:
+        scaler_path = os.path.join(models_dir, "scaler.joblib")
+        dump(scaler_step_inst, scaler_path)
+
+    gaussianizer_path = None
+    gaussianizer_step_inst = pipeline.named_steps.get("gaussianizer")
+    if gaussianizer_step_inst is not None:
+        gaussianizer_path = os.path.join(models_dir, "gaussianizer.joblib")
+        dump(gaussianizer_step_inst, gaussianizer_path)
     model_path = os.path.join(models_dir, "isoforest.joblib")
     base_iforest = detector.detectors_.get("iforest")
     if base_iforest:
@@ -1250,6 +1359,7 @@ def _train_from_dataframe(
         "summary_csv": summary_csv,
         "active_learning_csv": active_learning_csv,
         "gaussianizer_path": gaussianizer_path,
+        "scaler_path": scaler_path,
         "projection_dim": int(detector.projected_dim_) if detector.projected_dim_ is not None else None,
         "projected_dim": int(detector.projected_dim_) if detector.projected_dim_ is not None else None,
         "preprocessor": preprocessor_metadata,
@@ -1269,6 +1379,7 @@ def _train_from_dataframe(
         "representation_shapes": representation_shapes,
         "svd_info": svd_info,
         "data_quality": data_quality_report,
+        "pipeline_components": pipeline_components_config,
         "preprocessor_path": preprocessor_path,
         "preprocessor_latest": latest_preprocessor_path,
         "pipeline_path": pipeline_path,
@@ -1286,6 +1397,8 @@ def _train_from_dataframe(
 
     if deep_feature_info:
         metadata["deep_features"] = deep_feature_info
+        metadata.setdefault("compute_device", deep_feature_info.get("device"))
+        metadata.setdefault("deep_backend", deep_feature_info.get("backend"))
 
     if pseudo_summary:
         metadata["pseudo_labels"] = pseudo_summary
@@ -1334,6 +1447,25 @@ def _train_from_dataframe(
     latest_meta_path = os.path.join(models_dir, "latest_iforest_metadata.json")
     with open(latest_meta_path, "w", encoding="utf-8") as fh:
         json.dump(metadata, fh, ensure_ascii=False, indent=2)
+
+    try:
+        log_training_run(
+            {
+                "timestamp": timestamp,
+                "schema_version": MODEL_SCHEMA_VERSION,
+                "rows": len(working_df),
+                "features": len(feature_columns),
+                "model_path": pipeline_path,
+                "metadata_path": metadata_path,
+                "pipeline_components": pipeline_components_config,
+                "compute_device": metadata.get("compute_device", "cpu"),
+                "deep_backend": metadata.get("deep_backend"),
+                "contamination": effective_contamination,
+                "rbf_components": used_components,
+            }
+        )
+    except Exception:
+        logger.debug("Failed to persist training run metadata", exc_info=True)
 
     logger.info(
         "Training finished: threshold=%.6f vote_threshold=%.3f anomalies=%d/%d",
@@ -1387,6 +1519,8 @@ def _train_from_dataframe(
         "representation_shapes": representation_shapes,
         "svd_info": svd_info,
         "data_quality": data_quality_report,
+        "pipeline_components": pipeline_components_config,
+        "compute_device": metadata.get("compute_device", "cpu"),
         "active_learning_csv": active_learning_csv,
         "score_histogram": score_histogram,
     }
@@ -1426,6 +1560,7 @@ def _train_from_preprocessed_csv(
     fusion_alpha: float = 0.5,
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
+    pipeline_components: Optional[Dict[str, bool]] = None,
 ) -> dict:
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"预处理数据集不存在: {dataset_path}")
@@ -1501,7 +1636,9 @@ def _train_from_preprocessed_csv(
         fusion_alpha=fusion_alpha,
         enable_supervised_fusion=enable_supervised_fusion,
         feature_selection_ratio=feature_selection_ratio,
+        pipeline_components=pipeline_components,
     )
+
 
 
 def _train_from_npz(
@@ -1517,6 +1654,7 @@ def _train_from_npz(
     fusion_alpha: float = 0.5,
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
+    pipeline_components: Optional[Dict[str, bool]] = None,
 ) -> dict:
     X, columns = _load_npz_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -1578,6 +1716,7 @@ def _train_from_npz(
         fusion_alpha=fusion_alpha,
         enable_supervised_fusion=enable_supervised_fusion,
         feature_selection_ratio=feature_selection_ratio,
+        pipeline_components=pipeline_components,
     )
 
 
@@ -1594,6 +1733,7 @@ def _train_from_npy(
     fusion_alpha: float = 0.5,
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
+    pipeline_components: Optional[Dict[str, bool]] = None,
 ) -> dict:
     X, columns, meta_data = _load_npy_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -1671,6 +1811,7 @@ def _train_from_npy(
         fusion_alpha=fusion_alpha,
         enable_supervised_fusion=enable_supervised_fusion,
         feature_selection_ratio=feature_selection_ratio,
+        pipeline_components=pipeline_components,
     )
 
 
@@ -1687,6 +1828,7 @@ def train_unsupervised_on_split(
     fusion_alpha: float = 0.5,
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
+    pipeline_components: Optional[Dict[str, bool]] = None,
 ):
     """
     无监督训练：
@@ -1750,6 +1892,7 @@ def train_unsupervised_on_split(
                 fusion_alpha=fusion_alpha,
                 enable_supervised_fusion=enable_supervised_fusion,
                 feature_selection_ratio=feature_selection_ratio,
+                pipeline_components=pipeline_components,
             )
         if ext == ".npy":
             return _train_from_npy(
@@ -1764,6 +1907,7 @@ def train_unsupervised_on_split(
                 fusion_alpha=fusion_alpha,
                 enable_supervised_fusion=enable_supervised_fusion,
                 feature_selection_ratio=feature_selection_ratio,
+                pipeline_components=pipeline_components,
             )
         if ext == ".npz":
             return _train_from_npz(
@@ -1778,6 +1922,7 @@ def train_unsupervised_on_split(
                 fusion_alpha=fusion_alpha,
                 enable_supervised_fusion=enable_supervised_fusion,
                 feature_selection_ratio=feature_selection_ratio,
+                pipeline_components=pipeline_components,
             )
         raise FileNotFoundError(f"不支持的数据集格式: {dataset_path}")
 
@@ -1835,4 +1980,5 @@ def train_unsupervised_on_split(
         fusion_alpha=fusion_alpha,
         enable_supervised_fusion=enable_supervised_fusion,
         feature_selection_ratio=feature_selection_ratio,
+        pipeline_components=pipeline_components,
     )
