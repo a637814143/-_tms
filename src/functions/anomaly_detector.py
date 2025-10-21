@@ -99,6 +99,10 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.projection_model_: Optional[TruncatedSVD] = None
         self.projected_dim_: Optional[int] = None
         self.training_anomaly_ratio_: Optional[float] = None
+        self.pseudo_labels_: Optional[np.ndarray] = None
+        self.pseudo_label_origins_: Optional[np.ndarray] = None
+        self.pseudo_label_summary_: Optional[Dict[str, object]] = None
+        self.ocsvm_bias_: float = 0.0
 
     # sklearn API -----------------------------------------------------
     def fit(self, X: np.ndarray, y=None):  # noqa: D401  (sklearn 兼容签名)
@@ -129,6 +133,10 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.projection_model_ = None
         self.projected_dim_ = None
         self.training_anomaly_ratio_ = None
+        self.pseudo_labels_ = None
+        self.pseudo_label_origins_ = None
+        self.pseudo_label_summary_ = None
+        self.ocsvm_bias_ = 0.0
 
         projected_X = X
         use_projection = X.shape[1] > 512
@@ -296,21 +304,20 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         else:
             self.vote_threshold_ = float(np.clip(np.mean(vote_ratio) if vote_ratio.size else 0.5, 0.1, 1.0))
 
+        y_binary: Optional[np.ndarray] = None
+        labeled_mask: Optional[np.ndarray] = None
         if y is not None:
             y_arr = np.asarray(y).ravel()
             if y_arr.size == n_samples:
-                y_binary: Optional[np.ndarray]
-                labeled_mask: Optional[np.ndarray]
                 try:
                     y_numeric = np.asarray(y_arr, dtype=float)
                     labeled_mask = np.isfinite(y_numeric) & (y_numeric >= 0)
-                    y_binary = np.zeros_like(y_numeric, dtype=int)
                     if labeled_mask.any():
+                        y_binary = np.zeros_like(y_numeric, dtype=int)
                         y_binary[labeled_mask] = np.where(y_numeric[labeled_mask] > 0, 1, 0)
                 except Exception:
                     labeled_mask = None
                     y_binary = None
-
                 if y_binary is None or labeled_mask is None:
                     y_str = np.asarray(y_arr, dtype=object).astype(str)
                     normalized = np.char.strip(np.char.lower(y_str))
@@ -319,49 +326,101 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                     if labeled_mask.any():
                         y_binary[labeled_mask] = np.where(normalized[labeled_mask] != "0", 1, 0)
 
-                if labeled_mask is not None and labeled_mask.any():
-                    y_labeled = y_binary[labeled_mask]
-                    if np.unique(y_labeled).size >= 2:
-                        features_all = self._build_calibration_features(
-                            combined, vote_ratio, stacked, raw_input
-                        )
-                        features = features_all[labeled_mask]
-                        self.calibrator_ = LogisticRegression(
-                            max_iter=1000, class_weight="balanced", solver="lbfgs"
-                        )
-                        self.calibrator_.fit(features, y_labeled)
-                        proba_all = self.calibrator_.predict_proba(features_all)[:, 1]
-                        thr_candidates = np.linspace(0.1, 0.9, 41)
-                        best_thr = 0.5
-                        best_f1 = -1.0
-                        best_f05 = -1.0
-                        best_metrics = None
-                        labeled_proba = proba_all[labeled_mask]
-                        for thr in thr_candidates:
-                            preds = (labeled_proba >= thr).astype(int)
-                            precision = precision_score(
-                                y_labeled, preds, zero_division=0
-                            )
-                            recall = recall_score(y_labeled, preds, zero_division=0)
-                            f1 = f1_score(y_labeled, preds, zero_division=0)
-                            f05 = fbeta_score(
-                                y_labeled, preds, beta=0.5, zero_division=0
-                            )
-                            if (f05 > best_f05 + 1e-12) or (
-                                abs(f05 - best_f05) <= 1e-12 and f1 > best_f1
-                            ):
-                                best_f1 = f1
-                                best_f05 = f05
-                                best_thr = thr
-                                best_metrics = {
-                                    "precision": float(precision),
-                                    "recall": float(recall),
-                                    "f1": float(f1),
-                                    "f0.5": float(f05),
-                                }
-                        self.calibration_threshold_ = float(best_thr)
-                        self.calibration_report_ = best_metrics
-                        self.last_calibrated_scores_ = proba_all.astype(float)
+        base_mask = np.zeros(n_samples, dtype=bool)
+        if labeled_mask is not None and labeled_mask.size == n_samples:
+            base_mask = labeled_mask.astype(bool)
+
+        pseudo_labels = np.full(n_samples, np.nan, dtype=float)
+        pseudo_origins = np.full(n_samples, "unlabeled", dtype=object)
+        if y_binary is not None and base_mask.any():
+            pseudo_labels[base_mask] = y_binary[base_mask]
+            pseudo_origins[base_mask] = "human"
+
+        if self.threshold_ is not None:
+            score_std = float(np.std(combined) or 1.0)
+            margin = max(1e-3, score_std * 0.5)
+            vote_thr = float(
+                np.clip(
+                    self.vote_threshold_ if self.vote_threshold_ is not None else np.mean(vote_ratio),
+                    0.0,
+                    1.0,
+                )
+            )
+            anomaly_candidates = combined <= (float(self.threshold_) - margin)
+            anomaly_candidates &= vote_ratio >= vote_thr
+            normal_vote_cut = max(0.05, vote_thr - 0.1)
+            normal_candidates = combined >= (float(self.threshold_) + margin)
+            normal_candidates &= vote_ratio <= normal_vote_cut
+            unlabeled_mask = ~base_mask
+            if unlabeled_mask.any():
+                pseudo_labels[unlabeled_mask & anomaly_candidates] = 1.0
+                pseudo_origins[unlabeled_mask & anomaly_candidates] = "pseudo_anomaly"
+                pseudo_labels[unlabeled_mask & normal_candidates] = 0.0
+                pseudo_origins[unlabeled_mask & normal_candidates] = "pseudo_normal"
+
+        semi_mask = np.isfinite(pseudo_labels)
+        semi_labels = np.zeros(n_samples, dtype=int)
+        if semi_mask.any():
+            semi_labels[semi_mask] = np.where(pseudo_labels[semi_mask] >= 0.5, 1, 0)
+
+        self.pseudo_labels_ = pseudo_labels
+        self.pseudo_label_origins_ = pseudo_origins
+        self.pseudo_label_summary_ = {
+            "total": int(np.sum(semi_mask)),
+            "human": int(np.sum(base_mask)),
+            "pseudo_anomaly": int(np.sum(pseudo_origins == "pseudo_anomaly")),
+            "pseudo_normal": int(np.sum(pseudo_origins == "pseudo_normal")),
+        }
+
+        if semi_mask.any() and np.unique(semi_labels[semi_mask]).size >= 2:
+            features_all = self._build_calibration_features(
+                combined, vote_ratio, stacked, raw_input
+            )
+            features = features_all[semi_mask]
+            self.calibrator_ = LogisticRegression(
+                max_iter=1000, class_weight="balanced", solver="lbfgs"
+            )
+            self.calibrator_.fit(features, semi_labels[semi_mask])
+            proba_all = self.calibrator_.predict_proba(features_all)[:, 1]
+            thr_candidates = np.linspace(0.1, 0.9, 41)
+            best_thr = 0.5
+            best_f1 = -1.0
+            best_f05 = -1.0
+            best_metrics = None
+            if base_mask.any():
+                labeled_proba = proba_all[base_mask]
+                labeled_truth = semi_labels[base_mask]
+                for thr in thr_candidates:
+                    preds = (labeled_proba >= thr).astype(int)
+                    precision = precision_score(labeled_truth, preds, zero_division=0)
+                    recall = recall_score(labeled_truth, preds, zero_division=0)
+                    f1 = f1_score(labeled_truth, preds, zero_division=0)
+                    f05 = fbeta_score(labeled_truth, preds, beta=0.5, zero_division=0)
+                    if (f05 > best_f05 + 1e-12) or (
+                        abs(f05 - best_f05) <= 1e-12 and f1 > best_f1
+                    ):
+                        best_f1 = f1
+                        best_f05 = f05
+                        best_thr = thr
+                        best_metrics = {
+                            "precision": float(precision),
+                            "recall": float(recall),
+                            "f1": float(f1),
+                            "f0.5": float(f05),
+                        }
+            self.calibration_threshold_ = float(best_thr)
+            self.calibration_report_ = best_metrics
+            self.last_calibrated_scores_ = proba_all.astype(float)
+        if "ocsvm" in self.fit_raw_scores_ and semi_mask.any():
+            ocsvm_scores = np.asarray(self.fit_raw_scores_.get("ocsvm"), dtype=float)
+            if ocsvm_scores.size == n_samples:
+                anomaly_scores = ocsvm_scores[semi_mask & (semi_labels == 1)]
+                normal_scores = ocsvm_scores[semi_mask & (semi_labels == 0)]
+                if anomaly_scores.size and normal_scores.size:
+                    normal_quant = float(np.quantile(normal_scores, 0.1))
+                    anomaly_quant = float(np.quantile(anomaly_scores, 0.9))
+                    self.ocsvm_bias_ = float(0.5 * (normal_quant + anomaly_quant))
+
         self._apply_false_positive_guard(combined, vote_ratio)
         return self
 
@@ -427,6 +486,8 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                 ref_mean = 0.0
                 ref_std = 1.0
             arr = np.asarray(dec, dtype=float)
+            if name == "ocsvm" and getattr(self, "ocsvm_bias_", 0.0):
+                arr = arr - float(self.ocsvm_bias_)
             normalized = (arr - ref_mean) / ref_std
             decision_stack.append(normalized)
             weights.append(float(info.weight))
