@@ -1,18 +1,23 @@
 """PCAP 特征提取模块，输出高维流量特征。"""
 
 import glob
+import importlib.util
+import inspect
 import os
 import socket
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import dpkt
 import numpy as np
 import pandas as pd
 
+from src.configuration import load_config
 from src.functions.logging_utils import get_logger
+from src.functions.annotations import configured_plugin_dirs
 
 Packet = Tuple[float, bytes]
 ProgressCallback = Optional[Callable[[int], None]]
@@ -28,11 +33,177 @@ TCP_FLAG_MAP = {
 
 logger = get_logger(__name__)
 
+PluginExtractor = Callable[["FlowAccumulator", Dict[str, float]], Dict[str, float]]
+
 LENGTH_BINS = np.linspace(0, 8192, 257)
 INTERVAL_BINS = np.linspace(0.0, 5.0, 257)
 MAX_PKTS_PER_FLOW = 10_000
 FAST_PACKET_THRESHOLD = 1_000_000
 FAST_SAMPLE_RATE = 10
+
+PLUGIN_EXTRACTORS: List[PluginExtractor] = []
+PLUGIN_INFO: List[Dict[str, object]] = []
+_PLUGINS_INITIALIZED = False
+
+
+def _wrap_plugin_function(func: Callable, module_name: str, display_name: str) -> PluginExtractor:
+    def wrapper(flow: "FlowAccumulator", base_features: Dict[str, float]) -> Dict[str, float]:
+        try:
+            try:
+                result = func(flow, base_features)
+            except TypeError:
+                result = func(flow)
+        except Exception as exc:  # pragma: no cover - best effort logging
+            logger.warning("Feature plugin %s.%s failed: %s", module_name, display_name, exc)
+            return {}
+
+        if result is None:
+            return {}
+        if not isinstance(result, dict):
+            logger.debug(
+                "Plugin %s.%s returned %s instead of dict; ignored",
+                module_name,
+                display_name,
+                type(result).__name__,
+            )
+            return {}
+
+        sanitized: Dict[str, float] = {}
+        for key, value in result.items():
+            if value is None:
+                continue
+            new_key = str(key)
+            try:
+                sanitized[new_key] = float(value)
+            except Exception:
+                try:
+                    sanitized[new_key] = float(np.asarray(value).astype(float))
+                except Exception:
+                    logger.debug(
+                        "Plugin %s.%s feature %s is non-numeric; skipped",
+                        module_name,
+                        display_name,
+                        new_key,
+                    )
+        return sanitized
+
+    wrapper.__name__ = f"{module_name}:{display_name}"
+    return wrapper
+
+
+def load_feature_plugins(force_reload: bool = False) -> List[PluginExtractor]:
+    global PLUGIN_EXTRACTORS, PLUGIN_INFO, _PLUGINS_INITIALIZED
+
+    config = load_config()
+    plugins_cfg = config.get("plugins") if isinstance(config, dict) else {}
+    autoload = True
+    reload_on_start = False
+    if isinstance(plugins_cfg, dict):
+        autoload = bool(plugins_cfg.get("autoload", True))
+        reload_on_start = bool(plugins_cfg.get("reload_on_start", False))
+
+    if not autoload and not force_reload:
+        _PLUGINS_INITIALIZED = True
+        PLUGIN_EXTRACTORS = []
+        PLUGIN_INFO = []
+        return PLUGIN_EXTRACTORS
+
+    if force_reload or reload_on_start:
+        PLUGIN_EXTRACTORS = []
+        PLUGIN_INFO = []
+
+    if PLUGIN_EXTRACTORS and not force_reload:
+        _PLUGINS_INITIALIZED = True
+        return PLUGIN_EXTRACTORS
+
+    seen_modules = set()
+    for directory in configured_plugin_dirs():
+        if not directory.exists() or not directory.is_dir():
+            continue
+        for path in sorted(directory.glob("*.py")):
+            if path.name.startswith("__"):
+                continue
+            module_name = f"feature_plugin_{path.stem}"
+            if module_name in seen_modules and not force_reload:
+                continue
+            spec = importlib.util.spec_from_file_location(module_name, str(path))
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(module)  # type: ignore[attr-defined]
+            except Exception as exc:  # pragma: no cover - best effort logging
+                logger.warning("加载特征插件 %s 失败: %s", path, exc)
+                continue
+
+            extractors: List[Callable] = []
+            registrar = getattr(module, "register_feature_extractors", None)
+            if callable(registrar):
+                try:
+                    registered = registrar()
+                    if registered:
+                        extractors.extend(list(registered))
+                except Exception as exc:
+                    logger.warning("插件 %s register_feature_extractors 执行失败: %s", path, exc)
+
+            feature_attr = getattr(module, "FEATURE_EXTRACTORS", None)
+            if feature_attr:
+                try:
+                    if isinstance(feature_attr, (list, tuple, set)):
+                        extractors.extend(list(feature_attr))
+                    elif callable(feature_attr):
+                        generated = feature_attr()
+                        if generated:
+                            extractors.extend(list(generated))
+                except Exception as exc:
+                    logger.warning("插件 %s FEATURE_EXTRACTORS 解析失败: %s", path, exc)
+
+            wrappers: List[PluginExtractor] = []
+            names: List[str] = []
+            for entry in extractors:
+                func = None
+                display = None
+                if callable(entry):
+                    func = entry
+                    display = getattr(entry, "__name__", path.stem)
+                elif isinstance(entry, dict):
+                    candidate = (
+                        entry.get("callable")
+                        or entry.get("func")
+                        or entry.get("function")
+                        or entry.get("handler")
+                    )
+                    if callable(candidate):
+                        func = candidate
+                        display = str(entry.get("name", getattr(candidate, "__name__", path.stem)))
+                if func is None:
+                    continue
+                wrappers.append(_wrap_plugin_function(func, module.__name__, display or path.stem))
+                names.append(display or getattr(func, "__name__", path.stem))
+
+            if wrappers:
+                PLUGIN_EXTRACTORS.extend(wrappers)
+                PLUGIN_INFO.append(
+                    {
+                        "module": module.__name__,
+                        "path": str(path),
+                        "extractors": names,
+                    }
+                )
+                seen_modules.add(module_name)
+
+    _PLUGINS_INITIALIZED = True
+    return PLUGIN_EXTRACTORS
+
+
+def get_loaded_plugin_info() -> List[Dict[str, object]]:
+    """Return metadata about currently loaded feature plugins."""
+
+    load_feature_plugins()
+    return list(PLUGIN_INFO)
+
+
+load_feature_plugins()
 
 
 def _ip_to_str(raw: bytes) -> str:
@@ -515,6 +686,34 @@ class FlowAccumulator:
         ) if base_mean else 0.0
 
         features["flow_truncated"] = int(self.truncated)
+
+        if PLUGIN_EXTRACTORS:
+            base_snapshot = dict(features)
+            for extractor in PLUGIN_EXTRACTORS:
+                try:
+                    extra = extractor(self, base_snapshot)
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    logger.warning("特征插件执行失败 %s: %s", getattr(extractor, "__name__", extractor), exc)
+                    continue
+                if not extra:
+                    continue
+                for key, value in extra.items():
+                    if value is None:
+                        continue
+                    target_key = str(key)
+                    if target_key in features:
+                        suffix = 1
+                        while f"{target_key}_plugin{suffix}" in features:
+                            suffix += 1
+                        target_key = f"{target_key}_plugin{suffix}"
+                    try:
+                        features[target_key] = float(value)
+                    except Exception:
+                        logger.debug(
+                            "插件特征 %s 返回值 %r 无法转换为 float，已忽略",
+                            target_key,
+                            value,
+                        )
 
         return features
 

@@ -31,6 +31,7 @@ from joblib import dump
 from src.functions.feature_extractor import extract_features, extract_features_dir
 from src.functions.anomaly_detector import EnsembleAnomalyDetector
 from src.functions.logging_utils import get_logger, log_training_run
+from src.functions.annotations import apply_annotations_to_frame, annotation_summary
 from src.functions.transformers import (
     FeatureAligner,
     FeatureWeighter,
@@ -636,6 +637,47 @@ def _train_from_dataframe(
             ground_truth_mask = labeled_mask.astype(bool)
             ground_truth_labels = labeled_values.astype(int)
 
+    manual_label_summary: Optional[Dict[str, object]] = None
+    manual_label_mask: Optional[np.ndarray] = None
+    manual_series = apply_annotations_to_frame(working_df)
+    if manual_series is not None:
+        manual_arr = np.asarray(manual_series, dtype=float)
+        manual_mask = np.isfinite(manual_arr)
+        if manual_mask.any():
+            manual_binary = np.full_like(manual_arr, np.nan, dtype=float)
+            manual_binary[manual_mask] = np.where(manual_arr[manual_mask] > 0.5, 1.0, 0.0)
+            working_df["manual_label"] = manual_binary
+            manual_label_mask = manual_mask.astype(bool)
+            manual_label_summary = {
+                "total": int(manual_mask.sum()),
+                "anomaly_ratio": float(
+                    np.mean(manual_binary[manual_mask]) if manual_mask.any() else 0.0
+                ),
+            }
+            if ground_truth is None:
+                ground_truth = manual_binary.copy()
+            else:
+                combined = np.asarray(ground_truth, dtype=float)
+                if combined.shape != manual_binary.shape:
+                    combined = np.full(manual_binary.shape, np.nan, dtype=float)
+                combined[manual_mask] = manual_binary[manual_mask]
+                ground_truth = combined
+            if ground_truth_mask is None or ground_truth_mask.shape != manual_mask.shape:
+                ground_truth_mask = np.zeros_like(manual_mask, dtype=bool)
+            ground_truth_mask = ground_truth_mask | manual_mask
+
+    if ground_truth is not None:
+        arr = np.asarray(ground_truth, dtype=float)
+        mask = np.isfinite(arr)
+        if mask.any():
+            ground_truth_mask = mask
+            ground_truth_labels = np.where(arr[mask] > 0.5, 1, 0).astype(int)
+            ground_truth = arr
+        else:
+            ground_truth = None
+            ground_truth_mask = None
+            ground_truth_labels = None
+
     feature_df, feature_columns = _prepare_feature_frame(
         working_df, feature_columns_hint=feature_columns_hint
     )
@@ -778,18 +820,17 @@ def _train_from_dataframe(
     fusion_requested = bool(enable_supervised_fusion)
     fusion_enabled = fusion_requested
     fusion_auto_enabled = False
-    if (
-        ground_truth_mask is not None
-        and ground_truth_mask.any()
-        and not fusion_requested
-    ):
+    has_ground_truth = ground_truth_mask is not None and ground_truth_mask.any()
+    has_manual = manual_label_mask is not None and manual_label_mask.any()
+    if (has_ground_truth or has_manual) and not fusion_requested:
         fusion_auto_enabled = True
         fusion_enabled = True
+        trigger_source = ground_truth_column or ("manual_annotations" if has_manual else "unknown")
         logger.info(
-            "Detected ground truth column '%s', automatically enabling semi-supervised fusion.",
-            ground_truth_column or "unknown",
+            "Detected supervised labels (%s), automatically enabling semi-supervised fusion.",
+            trigger_source,
         )
-    elif ground_truth_mask is not None and ground_truth_mask.any():
+    elif has_ground_truth or has_manual:
         fusion_enabled = True
     fusion_source: Optional[str] = None
 
@@ -1390,6 +1431,13 @@ def _train_from_dataframe(
         "feature_list_latest": latest_feature_list_path,
     }
 
+    if manual_label_summary:
+        metadata["manual_annotations"] = manual_label_summary
+        try:
+            metadata["annotation_store"] = annotation_summary()
+        except Exception:
+            metadata["annotation_store"] = {"error": "unavailable"}
+
     if feature_weight_info and feature_weights:
         weight_payload = dict(feature_weight_info)
         weight_payload["weights"] = feature_weights
@@ -1524,6 +1572,9 @@ def _train_from_dataframe(
         "active_learning_csv": active_learning_csv,
         "score_histogram": score_histogram,
     }
+
+    if manual_label_summary:
+        result_payload["manual_annotations"] = manual_label_summary
 
     if feature_weight_info and feature_weights:
         weight_payload = dict(feature_weight_info)

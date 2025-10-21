@@ -1,0 +1,28 @@
+paths:
+  data_dir: data
+  split_dir: data/split
+  csv_info_dir: data/CSV/info
+  csv_feature_dir: data/CSV/feature
+  csv_preprocess_dir: data/CSV/DP
+  models_dir: data/models
+  results_dir: data/results
+  logs_dir: data/logs
+plugins:
+  feature_dirs:
+    - plugins/features
+  autoload: true
+  reload_on_start: false
+ui:
+  risk_trend_window: 200
+  online_detection_poll_seconds: 5
+  default_model_tag: latest
+training:
+  fusion_alpha: 0.5
+  enable_semi_supervised: true
+  max_active_learning_samples: 200
+  pseudo_label_confidence: 0.9
+online_detection:
+  watch_dir: data/live
+  output_dir: data/live_results
+  auto_preprocess: true
+  batch_size: 1
