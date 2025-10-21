@@ -2,8 +2,9 @@
 from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil, json
 from pathlib import Path
+from weakref import WeakSet, ref
 import numpy as np
-from typing import List, Optional, Set
+from typing import Dict, List, Optional, Set
 from datetime import datetime
 
 # ---- 业务函数（保持导入路径）----
@@ -328,76 +329,35 @@ class PreprocessWorker(QtCore.QThread):
             self.error.emit(str(e))
 
 
-class TrainWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(dict)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-    def __init__(
-        self,
-        input_path,
-        results_dir,
-        models_dir,
-        rbf_components=None,
-        rbf_gamma=None,
-        fusion_enabled=True,
-        fusion_alpha=0.5,
-        feature_ratio=None,
-    ):
-        super().__init__()
-        self.input_path = input_path
-        self.results_dir = results_dir
-        self.models_dir = models_dir
-        self.rbf_components = rbf_components
-        self.rbf_gamma = rbf_gamma
-        self.fusion_enabled = fusion_enabled
-        self.fusion_alpha = fusion_alpha
-        self.feature_ratio = feature_ratio
-
-    def run(self):
-        try:
-            res = run_train(
-                self.input_path,
-                self.results_dir,
-                self.models_dir,
-                progress_cb=self.progress.emit,
-                rbf_components=self.rbf_components,
-                rbf_gamma=self.rbf_gamma,
-                enable_supervised_fusion=self.fusion_enabled,
-                fusion_alpha=float(self.fusion_alpha),
-                feature_selection_ratio=self.feature_ratio,
-            )
-            self.finished.emit(res)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class AnalysisWorker(QtCore.QThread):
+class BackgroundTask(QtCore.QObject, QtCore.QRunnable):
     finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
-    def __init__(self, results_csv, out_dir, metadata_path=None):
-        super().__init__()
-        self.results_csv = results_csv
-        self.out_dir = out_dir
-        self.metadata_path = metadata_path
+    def __init__(self, fn, *args, **kwargs):
+        QtCore.QObject.__init__(self)
+        QtCore.QRunnable.__init__(self)
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+        self.setAutoDelete(True)
 
     def run(self):
+        kwargs = dict(self._kwargs)
+
+        def _emit_progress(value):
+            try:
+                value_int = int(float(value))
+            except Exception:
+                value_int = 0
+            self.progress.emit(max(0, min(100, value_int)))
+
+        kwargs["progress_cb"] = _emit_progress
         try:
-            result = run_analysis(
-                self.results_csv,
-                self.out_dir,
-                metadata_path=self.metadata_path,
-                progress_cb=self.progress.emit,
-            )
-            if not isinstance(result, dict):
-                result = {"out_dir": self.out_dir}
-            elif "out_dir" not in result:
-                result["out_dir"] = self.out_dir
+            result = self._fn(*self._args, **kwargs)
             self.finished.emit(result)
-        except Exception as e:
-            self.error.emit(str(e))
+        except Exception as exc:
+            self.error.emit(str(exc))
 
 # ======= 交互式列选择（用于 scaler+model 场景）=======
 class FeaturePickDialog(QtWidgets.QDialog):
@@ -528,10 +488,13 @@ class Ui_MainWindow(object):
         # worker
         self.worker: Optional[InfoWorker] = None
         self.preprocess_worker: Optional[PreprocessWorker] = None
+        self.thread_pool = QtCore.QThreadPool.globalInstance()
+        self._running_tasks: WeakSet[BackgroundTask] = WeakSet()
 
         # 用户偏好
         self._settings = AppSettings(SETTINGS_PATH)
         self._loading_settings = False
+        self._settings_ready = False
         self._apply_saved_preferences()
 
         self.retranslateUi(MainWindow)
@@ -706,6 +669,50 @@ class Ui_MainWindow(object):
         for btn in self._action_buttons():
             btn.setEnabled(enabled)
 
+    def _start_background_task(
+        self,
+        task: BackgroundTask,
+        finished_cb,
+        error_cb,
+        progress_cb=None,
+    ) -> None:
+        self._running_tasks.add(task)
+        if finished_cb:
+            task.finished.connect(finished_cb)
+        if error_cb:
+            task.error.connect(error_cb)
+        if progress_cb:
+            task.progress.connect(progress_cb)
+
+        task_ref = ref(task)
+
+        def _cleanup(*_args):
+            obj = task_ref()
+            if obj is not None:
+                self._running_tasks.discard(obj)
+
+        task.finished.connect(_cleanup)
+        task.error.connect(_cleanup)
+        task.destroyed.connect(_cleanup)
+        self.thread_pool.start(task)
+
+    def _collect_pipeline_config(self) -> Dict[str, bool]:
+        if not hasattr(self, "pipeline_checks"):
+            return {}
+        return {key: checkbox.isChecked() for key, checkbox in self.pipeline_checks.items()}
+
+    def _on_pipeline_option_toggled(self) -> None:
+        if getattr(self, "_loading_settings", False):
+            return
+        if not getattr(self, "_settings_ready", False):
+            return
+        if not hasattr(self, "_settings"):
+            return
+        try:
+            self._settings.set("pipeline_components", self._collect_pipeline_config())
+        except Exception:
+            pass
+
     def _update_status_message(self, message: Optional[str] = None) -> None:
         base = f"数据目录: {DATA_BASE}"
         if message:
@@ -762,6 +769,29 @@ class Ui_MainWindow(object):
         self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
         self._on_feature_slider_changed(self.feature_slider.value())
         self.right_layout.addWidget(self.advanced_group)
+
+        pipeline_options = [
+            ("feature_weighter", "特征加权"),
+            ("variance_filter", "低方差过滤"),
+            ("scaler", "标准化"),
+            ("deep_features", "深度表征 (AutoEncoder)"),
+            ("gaussianizer", "分位数正态化"),
+            ("rbf_expander", "RBF 特征扩展"),
+        ]
+        self.pipeline_labels = {key: label for key, label in pipeline_options}
+        self.pipeline_group = QtWidgets.QGroupBox("Pipeline 组件")
+        pipeline_layout = QtWidgets.QVBoxLayout(self.pipeline_group)
+        pipeline_layout.setContentsMargins(10, 8, 10, 8)
+        pipeline_layout.setSpacing(4)
+        self.pipeline_checks = {}
+        for key, label in pipeline_options:
+            checkbox = QtWidgets.QCheckBox(label)
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(self._on_pipeline_option_toggled)
+            self.pipeline_checks[key] = checkbox
+            pipeline_layout.addWidget(checkbox)
+        pipeline_layout.addStretch(1)
+        self.right_layout.addWidget(self.pipeline_group)
 
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
         self.btn_fe = QtWidgets.QPushButton("提取特征")
@@ -1571,26 +1601,33 @@ class Ui_MainWindow(object):
         fusion_alpha = self.fusion_alpha_spin.value()
         feature_ratio = self.feature_slider.value()
         feature_ratio = (float(feature_ratio) / 100.0) if feature_ratio > 0 else None
-        self.train_worker = TrainWorker(
+        pipeline_config = self._collect_pipeline_config()
+        train_task = BackgroundTask(
+            run_train,
             path,
             res_dir,
             mdl_dir,
             rbf_components=int(comp) if comp > 0 else None,
             rbf_gamma=float(gamma) if gamma > 0 else None,
-            fusion_enabled=bool(fusion_enabled),
+            enable_supervised_fusion=bool(fusion_enabled),
             fusion_alpha=float(fusion_alpha),
-            feature_ratio=feature_ratio,
+            feature_selection_ratio=feature_ratio,
+            pipeline_components=pipeline_config,
         )
-        self.train_worker.progress.connect(lambda p: self.set_button_progress(self.btn_train, p))
-        self.train_worker.finished.connect(self._on_train_finished)
-        self.train_worker.error.connect(self._on_train_error)
-        self.train_worker.start()
+        self._start_background_task(
+            train_task,
+            self._on_train_finished,
+            self._on_train_error,
+            lambda p: self.set_button_progress(self.btn_train, p),
+        )
 
     def _on_train_finished(self, res):
         self.btn_train.setEnabled(True)
         self.set_button_progress(self.btn_train, 100)
         QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_train))
         self._set_action_buttons_enabled(True)
+        if not isinstance(res, dict):
+            res = {} if res is None else {"result": res}
         threshold = res.get("threshold")
         vote_thr = res.get("vote_threshold")
         thr_parts = []
@@ -1726,6 +1763,34 @@ class Ui_MainWindow(object):
                     pseudo_normal=int(pseudo_info.get("pseudo_normal", 0)),
                 )
             )
+        pipeline_cfg = res.get("pipeline_components") or {}
+        if isinstance(pipeline_cfg, dict) and pipeline_cfg:
+            enabled_labels = [
+                self.pipeline_labels.get(key, key)
+                for key, flag in pipeline_cfg.items()
+                if flag and key in self.pipeline_labels
+            ]
+            disabled_labels = [
+                self.pipeline_labels.get(key, key)
+                for key, flag in pipeline_cfg.items()
+                if not flag and key in self.pipeline_labels
+            ]
+            if enabled_labels:
+                msg_lines.append("启用组件: " + ", ".join(enabled_labels))
+            if disabled_labels:
+                msg_lines.append("停用组件: " + ", ".join(disabled_labels))
+        compute_device = res.get("compute_device") or res.get("deep_features", {}).get("device")
+        backend_name = None
+        deep_info = res.get("deep_features") or {}
+        if isinstance(deep_info, dict):
+            backend_name = deep_info.get("backend") or res.get("deep_backend")
+            loss_val = deep_info.get("training_loss")
+            if loss_val is not None:
+                msg_lines.append(f"自编码器训练误差≈{float(loss_val):.4f}")
+        if compute_device or backend_name:
+            msg_lines.append(
+                f"深度特征运行于 {backend_name or 'numpy'} @ {compute_device or 'CPU'}"
+            )
         feature_importances = res.get("feature_importances_topk") or []
         if feature_importances:
             preview_items = []
@@ -1775,11 +1840,26 @@ class Ui_MainWindow(object):
         self._set_action_buttons_enabled(False)
         self.btn_analysis.setEnabled(False); self.set_button_progress(self.btn_analysis, 1)
         _, meta_path = self._latest_pipeline_bundle()
-        self.analysis_worker = AnalysisWorker(csv, out_dir, metadata_path=meta_path)
-        self.analysis_worker.progress.connect(lambda p: self.set_button_progress(self.btn_analysis, p))
-        self.analysis_worker.finished.connect(self._on_analysis_finished)
-        self.analysis_worker.error.connect(self._on_analysis_error)
-        self.analysis_worker.start()
+        def _analysis_finished(result):
+            payload = result
+            if not isinstance(payload, dict):
+                payload = {"out_dir": out_dir}
+            else:
+                payload.setdefault("out_dir", out_dir)
+            self._on_analysis_finished(payload)
+
+        analysis_task = BackgroundTask(
+            run_analysis,
+            csv,
+            out_dir,
+            metadata_path=meta_path,
+        )
+        self._start_background_task(
+            analysis_task,
+            _analysis_finished,
+            self._on_analysis_error,
+            lambda p: self.set_button_progress(self.btn_analysis, p),
+        )
 
     def _on_analysis_finished(self, result):
         self.btn_analysis.setEnabled(True)
@@ -1806,6 +1886,7 @@ class Ui_MainWindow(object):
             summary_text = result.get("summary_text") if isinstance(result.get("summary_text"), str) else None
             summary_json = result.get("summary_json") if isinstance(result.get("summary_json"), str) else None
             metrics_csv = result.get("metrics_csv") if isinstance(result.get("metrics_csv"), str) else None
+            metrics_info = result.get("metrics") if isinstance(result.get("metrics"), dict) else {}
         else:
             out_dir = str(result) if result is not None else None
 
@@ -1817,6 +1898,19 @@ class Ui_MainWindow(object):
             self.display_result(f"{base_msg}\n{summary_text}")
         else:
             self.display_result(base_msg)
+
+        if "metrics_info" not in locals():
+            metrics_info = {}
+        if isinstance(metrics_info, dict) and metrics_info.get("drift_retrain"):
+            reasons = metrics_info.get("drift_retrain_reasons") or []
+            reason_text = "; ".join(str(item) for item in reasons if item)
+            if not reason_text:
+                reason_text = "分布漂移指标超出阈值"
+            QtWidgets.QMessageBox.warning(
+                None,
+                "建议重新训练",
+                f"检测到显著数据漂移：{reason_text}\n建议重新训练模型以适应最新数据。",
+            )
 
         added_paths: Set[str] = set()
 
@@ -2177,6 +2271,8 @@ class Ui_MainWindow(object):
     def _on_rbf_settings_changed(self):
         if getattr(self, "_loading_settings", False):
             return
+        if not getattr(self, "_settings_ready", False):
+            return
         if not hasattr(self, "_settings"):
             return
         try:
@@ -2189,6 +2285,7 @@ class Ui_MainWindow(object):
 
     def _apply_saved_preferences(self):
         if not hasattr(self, "_settings"):
+            self._settings_ready = True
             return
         self._loading_settings = True
         try:
@@ -2213,8 +2310,17 @@ class Ui_MainWindow(object):
             except Exception:
                 self.fusion_alpha_spin.setValue(0.5)
             self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
+            saved_pipeline = self._settings.get("pipeline_components", {})
+            if isinstance(saved_pipeline, dict) and hasattr(self, "pipeline_checks"):
+                for key, checkbox in self.pipeline_checks.items():
+                    if key in saved_pipeline:
+                        try:
+                            checkbox.setChecked(bool(saved_pipeline[key]))
+                        except Exception:
+                            pass
         finally:
             self._loading_settings = False
+            self._settings_ready = True
 
     # --------- 清空 ----------
     def _on_clear(self):

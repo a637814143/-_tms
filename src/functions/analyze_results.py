@@ -1,3 +1,4 @@
+
 # src/functions/analyze_results.py
 
 import json
@@ -566,7 +567,28 @@ def analyze_results(
             try:
                 current_counts, _ = np.histogram(score_series, bins=bins_arr)
                 psi_value = _population_stability_index(counts_arr, current_counts)
+                psi_entry = {
+                    "value": float(psi_value),
+                    "level": "low",
+                }
+                if psi_value >= 0.25:
+                    psi_entry["level"] = "severe"
+                    drift_retrain_reasons.append(f"PSI={psi_value:.3f}")
+                elif psi_value >= 0.1:
+                    psi_entry["level"] = "moderate"
+                drift_details["psi"] = psi_entry
+
                 kl_divergence_val = _kl_divergence(counts_arr, current_counts)
+                kl_entry = {
+                    "value": float(kl_divergence_val),
+                    "level": "low",
+                }
+                if kl_divergence_val >= 0.5:
+                    kl_entry["level"] = "severe"
+                    drift_retrain_reasons.append(f"KL={kl_divergence_val:.3f}")
+                elif kl_divergence_val >= 0.2:
+                    kl_entry["level"] = "moderate"
+                drift_details["kl_divergence"] = kl_entry
                 plt.figure(figsize=(8, 5))
                 width = np.diff(bins_arr)
                 base_prob = _normalize_hist(counts_arr)
@@ -911,9 +933,19 @@ def analyze_results(
     # -------- 补充信息 --------
     raw_quantiles = score_series.quantile([0.01, 0.05, 0.1, 0.5, 0.9]).to_dict()
     anomaly_score_quantiles = {str(k): _clean_number(v) for k, v in raw_quantiles.items()}
-    drift_alerts = _drift_alert(train_score_quantiles, score_series)
+    drift_quantiles = _drift_alert(train_score_quantiles, score_series)
+    drift_details: Dict[str, object] = {}
+    drift_retrain_reasons: List[str] = []
+    if drift_quantiles:
+        drift_details["quantiles"] = drift_quantiles
+        max_shift = max(float(v) for v in drift_quantiles.values()) if drift_quantiles else 0.0
+        if max_shift > 0.3:
+            drift_retrain_reasons.append(f"分位数偏移 {max_shift:.2f}")
+    drift_alerts = drift_details or None
+    drift_retrain = bool(drift_retrain_reasons)
     if drift_alerts:
-        logger.warning("Anomaly score drift detected: %%s", drift_alerts)
+        logger.warning("Anomaly score drift detected: %s", drift_alerts)
+
     score_threshold = train_threshold if train_threshold is not None else anomaly_score_quantiles.get("0.05")
     if score_threshold is None:
         fallback = _clean_number(score_series.min()) if len(score_series) else None
@@ -1091,7 +1123,12 @@ def analyze_results(
         f"文件级判定阈值：恶意占比 ≥ {ratio_threshold:.2%}",
     ]
     if drift_alerts:
-        summary_lines.append(f"⚠ 分布漂移告警：{drift_alerts}")
+        summary_lines.append(
+            "⚠ 分布漂移告警：" + json.dumps(drift_alerts, ensure_ascii=False)
+        )
+    if drift_retrain:
+        reason_text = "; ".join(drift_retrain_reasons) if drift_retrain_reasons else "分布漂移超过阈值"
+        summary_lines.append(f"建议：检测到显著分布漂移（{reason_text}），请重新训练模型。")
     if psi_value is not None:
         summary_lines.append(f"PSI：{psi_value:.4f}")
     if kl_divergence_val is not None:
@@ -1165,6 +1202,8 @@ def analyze_results(
             "psi": float(psi_value) if psi_value is not None else None,
             "kl_divergence": float(kl_divergence_val) if kl_divergence_val is not None else None,
         },
+        "drift_retrain": drift_retrain,
+        "drift_retrain_reasons": drift_retrain_reasons,
         "score_hist_compare_plot": hist_overlay_path,
         "roc_auc": roc_auc_val,
         "pr_auc": pr_auc_val,
@@ -1247,6 +1286,9 @@ def analyze_results(
         "summary_json": summary_json_path,
         "summary_text": summary_text,
         "metrics": details_payload,
+        "drift_alerts": drift_alerts,
+        "drift_retrain": drift_retrain,
+        "drift_retrain_reasons": drift_retrain_reasons,
         "export_payload": export_payload,
         "metrics_csv": metrics_csv_path,
         "metrics_json": metrics_json_path,
