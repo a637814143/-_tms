@@ -719,14 +719,16 @@ def analyze_results(
             loaded_metadata.get("pipeline_path")
             or loaded_metadata.get("pipeline_latest")
         )
-    if (
-        shap is not None
-        and feature_columns_meta
-        and isinstance(feature_columns_meta, list)
-        and pipeline_path_meta
-        and isinstance(pipeline_path_meta, str)
-        and os.path.exists(pipeline_path_meta)
-    ):
+
+    if shap is None:
+        shap_status = "missing_dependency"
+    elif not feature_columns_meta or not isinstance(feature_columns_meta, list):
+        shap_status = "missing_feature_columns"
+    elif not pipeline_path_meta or not isinstance(pipeline_path_meta, str):
+        shap_status = "pipeline_missing"
+    elif not os.path.exists(pipeline_path_meta):
+        shap_status = "pipeline_missing"
+    else:
         align_columns = [col for col in feature_columns_meta if col in df.columns]
         if len(align_columns) < 3:
             shap_status = "insufficient_features"
