@@ -2,7 +2,6 @@
 from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap
 from pathlib import Path
-from weakref import WeakSet, ref
 import numpy as np
 from typing import Dict, List, Optional, Set
 from datetime import datetime
@@ -342,18 +341,31 @@ class PreprocessWorker(QtCore.QThread):
             self.error.emit(str(e))
 
 
-class BackgroundTask(QtCore.QObject, QtCore.QRunnable):
+class WorkerSignals(QtCore.QObject):
     finished = QtCore.pyqtSignal(object)
     error = QtCore.pyqtSignal(str)
     progress = QtCore.pyqtSignal(int)
 
+
+class BackgroundTask(QtCore.QRunnable):
     def __init__(self, fn, *args, **kwargs):
-        QtCore.QObject.__init__(self)
-        QtCore.QRunnable.__init__(self)
+        super().__init__()
         self._fn = fn
         self._args = args
         self._kwargs = kwargs
-        self.setAutoDelete(True)
+        self.signals = WorkerSignals()
+
+    @property
+    def finished(self):
+        return self.signals.finished
+
+    @property
+    def error(self):
+        return self.signals.error
+
+    @property
+    def progress(self):
+        return self.signals.progress
 
     def run(self):
         kwargs = dict(self._kwargs)
@@ -363,14 +375,16 @@ class BackgroundTask(QtCore.QObject, QtCore.QRunnable):
                 value_int = int(float(value))
             except Exception:
                 value_int = 0
-            self.progress.emit(max(0, min(100, value_int)))
+            self.signals.progress.emit(max(0, min(100, value_int)))
 
         kwargs["progress_cb"] = _emit_progress
         try:
             result = self._fn(*self._args, **kwargs)
-            self.finished.emit(result)
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.signals.error.emit(str(exc))
+            return
+
+        self.signals.finished.emit(result)
 
 # ======= 交互式列选择（用于 scaler+model 场景）=======
 class FeaturePickDialog(QtWidgets.QDialog):
@@ -754,7 +768,7 @@ class Ui_MainWindow(object):
         self.worker: Optional[InfoWorker] = None
         self.preprocess_worker: Optional[PreprocessWorker] = None
         self.thread_pool = QtCore.QThreadPool.globalInstance()
-        self._running_tasks: WeakSet[BackgroundTask] = WeakSet()
+        self._running_tasks: Set[BackgroundTask] = set()
 
         # 用户偏好
         self._settings = AppSettings(SETTINGS_PATH)
@@ -961,16 +975,11 @@ class Ui_MainWindow(object):
         if progress_cb:
             task.progress.connect(progress_cb)
 
-        task_ref = ref(task)
-
         def _cleanup(*_args):
-            obj = task_ref()
-            if obj is not None:
-                self._running_tasks.discard(obj)
+            self._running_tasks.discard(task)
 
         task.finished.connect(_cleanup)
         task.error.connect(_cleanup)
-        task.destroyed.connect(_cleanup)
         self.thread_pool.start(task)
 
     def _collect_pipeline_config(self) -> Dict[str, bool]:
