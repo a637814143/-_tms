@@ -4,7 +4,7 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence
 
 import matplotlib
 
@@ -15,15 +15,24 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
 from pandas.api.types import is_numeric_dtype
+from joblib import load
+from sklearn.cluster import MiniBatchKMeans
+from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics import (
     auc,
     average_precision_score,
     precision_recall_curve,
     roc_curve,
 )
+from sklearn.preprocessing import StandardScaler
 
 from src.configuration import get_path
 from src.functions.logging_utils import get_logger
+
+try:  # optional dependency
+    import shap  # type: ignore
+except Exception:  # pragma: no cover - optional import guard
+    shap = None
 
 logger = get_logger(__name__)
 
@@ -39,6 +48,20 @@ EXPLANATION_EXCLUDE_COLUMNS = {
     "__source_path__",
     "flow_id",
 }
+
+TIME_COLUMN_CANDIDATES = (
+    "timestamp",
+    "time",
+    "frame_time",
+    "frame.time",
+    "capture_time",
+    "flow_start",
+    "flow_time",
+    "start_time",
+    "end_time",
+    "ts",
+    "epoch",
+)
 
 
 def _resolve_data_base() -> str:
@@ -173,6 +196,100 @@ def _build_token_variants(tokens: set[str]) -> set[str]:
 
 NORMAL_TOKEN_VARIANTS = _build_token_variants(NORMAL_TOKENS)
 ANOMALY_TOKEN_VARIANTS = _build_token_variants(ANOMALY_TOKENS)
+
+
+def _normalize_hist(counts: np.ndarray) -> np.ndarray:
+    counts = np.asarray(counts, dtype=float)
+    total = float(np.sum(counts))
+    if total <= 0:
+        return np.zeros_like(counts, dtype=float)
+    return counts / total
+
+
+def _population_stability_index(base: np.ndarray, current: np.ndarray) -> float:
+    base_prob = _normalize_hist(base)
+    curr_prob = _normalize_hist(current)
+    mask = (base_prob > 0) & (curr_prob > 0)
+    if not np.any(mask):
+        return 0.0
+    psi = np.sum((curr_prob[mask] - base_prob[mask]) * np.log(curr_prob[mask] / base_prob[mask]))
+    return float(psi)
+
+
+def _kl_divergence(base: np.ndarray, current: np.ndarray) -> float:
+    base_prob = _normalize_hist(base)
+    curr_prob = _normalize_hist(current)
+    mask = (base_prob > 0) & (curr_prob > 0)
+    if not np.any(mask):
+        return 0.0
+    kl = np.sum(curr_prob[mask] * np.log(curr_prob[mask] / base_prob[mask]))
+    return float(kl)
+
+
+def _extract_time_series(df: pd.DataFrame) -> Optional[pd.Series]:
+    for column in TIME_COLUMN_CANDIDATES:
+        if column not in df.columns:
+            continue
+        series = df[column]
+        if series.isnull().all():
+            continue
+        if np.issubdtype(series.dtype, np.datetime64):
+            return pd.to_datetime(series, errors="coerce")
+        try:
+            numeric = pd.to_numeric(series, errors="coerce")
+            if numeric.notna().any():
+                if numeric.abs().max() > 1e11:
+                    converted = pd.to_datetime(numeric, unit="ns", errors="coerce")
+                elif numeric.abs().max() > 1e9:
+                    converted = pd.to_datetime(numeric, unit="s", errors="coerce")
+                else:
+                    converted = pd.to_datetime(numeric, unit="s", origin="unix", errors="coerce")
+                if converted.notna().any():
+                    return converted
+        except Exception:
+            pass
+        try:
+            parsed = pd.to_datetime(series, errors="coerce")
+            if parsed.notna().any():
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _select_numeric_columns(df: pd.DataFrame, exclude: Sequence[str]) -> List[str]:
+    columns: List[str] = []
+    exclude_set = {str(col) for col in exclude}
+    for col in df.columns:
+        if col in exclude_set:
+            continue
+        series = df[col]
+        if is_numeric_dtype(series):
+            columns.append(col)
+            continue
+        try:
+            numeric = pd.to_numeric(series, errors="coerce")
+            if numeric.notna().any():
+                columns.append(col)
+        except Exception:
+            continue
+    return columns
+
+
+def _prepare_numeric_matrix(df: pd.DataFrame, columns: Sequence[str]) -> Optional[np.ndarray]:
+    if not columns:
+        return None
+    try:
+        subset = df.loc[:, columns]
+    except Exception:
+        return None
+    try:
+        numeric = subset.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    except Exception:
+        return None
+    if numeric.empty:
+        return None
+    return numeric.to_numpy(dtype=float, copy=False)
 
 
 def _drift_alert(
@@ -322,6 +439,11 @@ def analyze_results(
         if isinstance(loaded_metadata, dict)
         else None
     )
+    train_score_histogram = (
+        loaded_metadata.get("score_histogram")
+        if isinstance(loaded_metadata, dict)
+        else None
+    )
 
     if progress_cb: progress_cb(30)
 
@@ -427,6 +549,54 @@ def analyze_results(
     out2 = os.path.join(out_dir, "anomaly_score_distribution.png")
     plt.savefig(out2)
     plt.close()
+
+    psi_value: Optional[float] = None
+    kl_divergence_val: Optional[float] = None
+    hist_overlay_path: Optional[str] = None
+    if isinstance(train_score_histogram, dict):
+        bins_raw = train_score_histogram.get("bins")
+        counts_raw = train_score_histogram.get("counts")
+        try:
+            bins_arr = np.asarray(bins_raw, dtype=float)
+            counts_arr = np.asarray(counts_raw, dtype=float)
+        except Exception:
+            bins_arr = np.empty(0)
+            counts_arr = np.empty(0)
+        if bins_arr.size >= 2 and counts_arr.size == bins_arr.size - 1:
+            try:
+                current_counts, _ = np.histogram(score_series, bins=bins_arr)
+                psi_value = _population_stability_index(counts_arr, current_counts)
+                kl_divergence_val = _kl_divergence(counts_arr, current_counts)
+                plt.figure(figsize=(8, 5))
+                width = np.diff(bins_arr)
+                base_prob = _normalize_hist(counts_arr)
+                curr_prob = _normalize_hist(current_counts)
+                plt.bar(
+                    bins_arr[:-1],
+                    base_prob,
+                    width=width,
+                    alpha=0.4,
+                    align="edge",
+                    label="Train",
+                )
+                plt.bar(
+                    bins_arr[:-1],
+                    curr_prob,
+                    width=width,
+                    alpha=0.4,
+                    align="edge",
+                    label="Current",
+                )
+                plt.xlabel("Anomaly Score")
+                plt.ylabel("Probability")
+                plt.title("Score Distribution Drift Comparison")
+                plt.legend()
+                plt.tight_layout()
+                hist_overlay_path = os.path.join(out_dir, "anomaly_score_hist_compare.png")
+                plt.savefig(hist_overlay_path)
+                plt.close()
+            except Exception as exc:
+                logger.warning("Failed to compute PSI/KL drift metrics: %s", exc)
 
     # 3) Top20 异常包（分数越小越异常）
     explanation_numeric_cols = [
@@ -535,6 +705,206 @@ def analyze_results(
             df.to_csv(risk_results_path, index=False, encoding="utf-8")
         except Exception as exc:
             logger.warning("Failed to export risk bucket results: %s", exc)
+
+    shap_plot_path: Optional[str] = None
+    shap_summary_csv: Optional[str] = None
+    shap_summary: Optional[List[Dict[str, float]]] = None
+    shap_status: Optional[str] = None
+    feature_columns_meta = None
+    if isinstance(loaded_metadata, dict):
+        feature_columns_meta = loaded_metadata.get("feature_columns")
+    pipeline_path_meta = None
+    if isinstance(loaded_metadata, dict):
+        pipeline_path_meta = (
+            loaded_metadata.get("pipeline_path")
+            or loaded_metadata.get("pipeline_latest")
+        )
+    if (
+        shap is not None
+        and feature_columns_meta
+        and isinstance(feature_columns_meta, list)
+        and pipeline_path_meta
+        and isinstance(pipeline_path_meta, str)
+        and os.path.exists(pipeline_path_meta)
+    ):
+        align_columns = [col for col in feature_columns_meta if col in df.columns]
+        if len(align_columns) < 3:
+            shap_status = "insufficient_features"
+        elif len(align_columns) > 120:
+            shap_status = "too_many_features"
+        else:
+            try:
+                pipeline = load(pipeline_path_meta)
+                feature_frame = (
+                    df.loc[:, align_columns]
+                    .apply(pd.to_numeric, errors="coerce")
+                    .fillna(0.0)
+                )
+                if feature_frame.empty:
+                    shap_status = "empty_features"
+                else:
+                    background_size = min(80, len(feature_frame))
+                    sample_size = min(40, len(feature_frame))
+                    if background_size < 5 or sample_size < 5:
+                        shap_status = "insufficient_samples"
+                    else:
+                        background = feature_frame.sample(
+                            n=background_size, random_state=0, replace=False
+                        )
+                        focus_df = (
+                            df.sort_values("anomaly_score")
+                            .head(sample_size)
+                            .loc[:, align_columns]
+                            .apply(pd.to_numeric, errors="coerce")
+                            .fillna(0.0)
+                        )
+
+                        def _score_fn(values: np.ndarray) -> np.ndarray:
+                            data = pd.DataFrame(values, columns=align_columns)
+                            return np.asarray(pipeline.decision_function(data), dtype=float)
+
+                        explainer = shap.KernelExplainer(
+                            _score_fn,
+                            background.to_numpy(dtype=float, copy=False),
+                        )
+                        nsamples = min(256, max(len(align_columns) * 2, 64))
+                        shap_values = explainer.shap_values(
+                            focus_df.to_numpy(dtype=float, copy=False),
+                            nsamples=nsamples,
+                        )
+                        if isinstance(shap_values, list):
+                            shap_values = shap_values[0]
+                        shap_abs = np.mean(np.abs(shap_values), axis=0)
+                        shap_summary_df = pd.DataFrame(
+                            {
+                                "feature": align_columns,
+                                "mean_abs_shap": shap_abs,
+                            }
+                        ).sort_values("mean_abs_shap", ascending=False)
+                        shap_summary = [
+                            {
+                                "feature": str(row["feature"]),
+                                "mean_abs_shap": float(row["mean_abs_shap"]),
+                            }
+                            for _, row in shap_summary_df.head(40).iterrows()
+                        ]
+                        shap_summary_csv = os.path.join(out_dir, "shap_summary.csv")
+                        shap_summary_df.to_csv(
+                            shap_summary_csv, index=False, encoding="utf-8"
+                        )
+                        try:
+                            shap.summary_plot(
+                                shap_values,
+                                focus_df.to_numpy(dtype=float, copy=False),
+                                feature_names=align_columns,
+                                show=False,
+                                plot_size=(10, max(4, len(align_columns) * 0.15)),
+                            )
+                            shap_plot_path = os.path.join(out_dir, "shap_beeswarm.png")
+                            plt.tight_layout()
+                            plt.savefig(shap_plot_path, bbox_inches="tight")
+                            plt.close()
+                            shap_status = "ok"
+                        except Exception as exc:
+                            shap_status = f"plot_failed:{exc}"
+            except Exception as exc:
+                shap_status = f"error:{exc}"
+
+    cluster_plot_path: Optional[str] = None
+    cluster_summary: Optional[List[Dict[str, object]]] = None
+    numeric_columns = _select_numeric_columns(df, EXPLANATION_EXCLUDE_COLUMNS)
+    numeric_matrix = _prepare_numeric_matrix(df, numeric_columns)
+    if numeric_matrix is not None and numeric_matrix.shape[0] >= 20 and numeric_matrix.shape[1] >= 2:
+        try:
+            scaler = StandardScaler()
+            scaled = scaler.fit_transform(numeric_matrix)
+            reducer = TruncatedSVD(n_components=2, random_state=42)
+            reduced = reducer.fit_transform(scaled)
+            cluster_count = min(8, max(2, reduced.shape[0] // 500 + 2))
+            kmeans = MiniBatchKMeans(
+                n_clusters=cluster_count,
+                random_state=42,
+                n_init=10,
+            )
+            labels = kmeans.fit_predict(reduced)
+            anomaly_mask = df["is_malicious"].astype(int, copy=False) > 0
+            plt.figure(figsize=(8, 6))
+            plt.scatter(
+                reduced[:, 0],
+                reduced[:, 1],
+                c=labels,
+                cmap="tab10",
+                s=16,
+                alpha=0.7,
+            )
+            if anomaly_mask.any():
+                plt.scatter(
+                    reduced[anomaly_mask, 0],
+                    reduced[anomaly_mask, 1],
+                    facecolors="none",
+                    edgecolors="red",
+                    s=40,
+                    linewidths=1.0,
+                    label="Anomaly",
+                )
+                plt.legend()
+            plt.xlabel("Temporal component 1")
+            plt.ylabel("Temporal component 2")
+            plt.title("Flow Cluster Map")
+            plt.tight_layout()
+            cluster_plot_path = os.path.join(out_dir, "flow_cluster_map.png")
+            plt.savefig(cluster_plot_path)
+            plt.close()
+
+            cluster_df = pd.DataFrame({"cluster": labels, "is_malicious": anomaly_mask.astype(int)})
+            cluster_stats = (
+                cluster_df.groupby("cluster")
+                .agg(total=("is_malicious", "count"), anomalies=("is_malicious", "sum"))
+                .reset_index()
+            )
+            cluster_stats["anomaly_ratio"] = cluster_stats["anomalies"] / cluster_stats["total"].clip(lower=1)
+            cluster_summary = cluster_stats.to_dict("records")
+        except Exception as exc:
+            logger.warning("Failed to build cluster map: %s", exc)
+
+    timeline_plot_path: Optional[str] = None
+    timeline_points: Optional[int] = None
+    time_series = _extract_time_series(df)
+    if time_series is not None:
+        try:
+            if risk_source_col is not None:
+                timeline_scores = pd.to_numeric(df[risk_source_col], errors="coerce")
+            else:
+                timeline_scores = -pd.to_numeric(df["anomaly_score"], errors="coerce")
+            timeline_df = pd.DataFrame(
+                {"time": time_series, "score": timeline_scores}
+            ).dropna()
+            timeline_df = timeline_df.sort_values("time")
+            if len(timeline_df) >= 10:
+                timeline_points = int(len(timeline_df))
+                plt.figure(figsize=(10, 4))
+                plt.plot(
+                    timeline_df["time"],
+                    timeline_df["score"].rolling(window=10, min_periods=1).mean(),
+                    label="Rolling mean",
+                )
+                plt.scatter(
+                    timeline_df["time"],
+                    timeline_df["score"],
+                    s=6,
+                    alpha=0.3,
+                    label="Raw score",
+                )
+                plt.xlabel("Time")
+                plt.ylabel("Risk Score" if risk_source_col else "-Anomaly Score")
+                plt.title("Risk Trend Over Time")
+                plt.legend()
+                plt.tight_layout()
+                timeline_plot_path = os.path.join(out_dir, "risk_time_series.png")
+                plt.savefig(timeline_plot_path)
+                plt.close()
+        except Exception as exc:
+            logger.warning("Failed to render timeline chart: %s", exc)
 
     # -------- 补充信息 --------
     raw_quantiles = score_series.quantile([0.01, 0.05, 0.1, 0.5, 0.9]).to_dict()
@@ -720,6 +1090,10 @@ def analyze_results(
     ]
     if drift_alerts:
         summary_lines.append(f"⚠ 分布漂移告警：{drift_alerts}")
+    if psi_value is not None:
+        summary_lines.append(f"PSI：{psi_value:.4f}")
+    if kl_divergence_val is not None:
+        summary_lines.append(f"KL 散度：{kl_divergence_val:.4f}")
     if avg_risk is not None:
         summary_lines.append(f"风险分均值：{avg_risk:.2%}")
     elif avg_confidence is not None:
@@ -785,6 +1159,11 @@ def analyze_results(
         "score_std_train": score_std_train,
         "score_quantiles_train": train_score_quantiles,
         "drift_alerts": drift_alerts,
+        "drift_metrics": {
+            "psi": float(psi_value) if psi_value is not None else None,
+            "kl_divergence": float(kl_divergence_val) if kl_divergence_val is not None else None,
+        },
+        "score_hist_compare_plot": hist_overlay_path,
         "roc_auc": roc_auc_val,
         "pr_auc": pr_auc_val,
         "average_precision": avg_precision_val,
@@ -796,6 +1175,14 @@ def analyze_results(
         "confusion_plot": confusion_plot_path,
         "feature_importance_plot": permutation_plot_path,
         "feature_importance_source": importance_source,
+        "shap_plot": shap_plot_path,
+        "shap_summary_csv": shap_summary_csv,
+        "shap_status": shap_status,
+        "shap_top_features": shap_summary,
+        "cluster_plot": cluster_plot_path,
+        "cluster_summary": cluster_summary,
+        "timeline_plot": timeline_plot_path,
+        "timeline_points": timeline_points,
     }
 
     export_payload = {
@@ -831,12 +1218,28 @@ def analyze_results(
     payload = {
         "plots": [
             p
-            for p in (out1, out2, confusion_plot_path, permutation_plot_path, roc_plot_path, pr_plot_path)
+            for p in (
+                out1,
+                out2,
+                confusion_plot_path,
+                permutation_plot_path,
+                roc_plot_path,
+                pr_plot_path,
+                hist_overlay_path,
+                shap_plot_path,
+                cluster_plot_path,
+                timeline_plot_path,
+            )
             if p
         ],
         "top20_csv": out3,
         "top_dst_csv": top_dst_path,
         "risk_bucket_csv": risk_results_path,
+        "hist_compare_plot": hist_overlay_path,
+        "shap_summary_csv": shap_summary_csv,
+        "shap_plot": shap_plot_path,
+        "cluster_plot": cluster_plot_path,
+        "timeline_plot": timeline_plot_path,
         "out_dir": out_dir,
         "summary_csv": summary_path,
         "summary_json": summary_json_path,
