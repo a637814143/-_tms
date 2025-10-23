@@ -58,6 +58,18 @@ QWidget {
   color: #1F1F1F;
 }
 
+/* 顶部标题栏 */
+#TitleBar {
+  background: #F5F6FA;
+  border-bottom: 1px solid #E5E7EB;
+}
+#pageTitle {
+  font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI";
+  font-size: 18px;
+  font-weight: 700;
+  color: #111827;
+}
+
 /* 卡片/分组 */
 QGroupBox {
   border: 1px solid #E5E7EB;
@@ -101,6 +113,9 @@ QPushButton:disabled { background-color: #C7CDD4; color: #F9FAFB; }
 QPushButton#secondary {
   background: #EEF1F6;
   color: #111827;
+  border-radius: 10px;
+  padding: 8px 16px;
+  min-height: 38px;
 }
 QPushButton#secondary:hover { background: #E5EAF1; }
 QPushButton#secondary:pressed { background: #D9E0EA; }
@@ -820,7 +835,7 @@ class Ui_MainWindow(object):
     # --------- 基本结构 ----------
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
-        MainWindow.resize(1400, 800)
+        MainWindow.resize(1400, 840)
         MainWindow.setStyleSheet(APP_STYLE)
 
         self.centralwidget = QtWidgets.QWidget(MainWindow)
@@ -828,38 +843,37 @@ class Ui_MainWindow(object):
         self.main_layout.setContentsMargins(0, 0, 0, 0)
         self.main_layout.setSpacing(0)
 
-        title_bar = QtWidgets.QWidget(self.centralwidget)
-        title_bar.setStyleSheet(
-            "background-color: #F5F6FA;\n"
-            "border-bottom: 1px solid #E5E7EB;"
+        self.title_bar = QtWidgets.QFrame(self.centralwidget)
+        self.title_bar.setObjectName("TitleBar")
+        self.title_bar.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        self.title_bar.setSizePolicy(
+            QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Fixed
         )
-        title_layout = QtWidgets.QHBoxLayout(title_bar)
+        self.title_bar.setFixedHeight(56)
+        title_layout = QtWidgets.QHBoxLayout(self.title_bar)
         title_layout.setContentsMargins(0, 10, 0, 10)
         title_layout.setSpacing(0)
-        title_label = QtWidgets.QLabel("恶意流量检测系统 — 主功能页面", title_bar)
-        title_label.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
+        self.page_title = QtWidgets.QLabel("恶意流量检测系统 — 主功能页面", self.title_bar)
+        self.page_title.setObjectName("pageTitle")
+        self.page_title.setAlignment(QtCore.Qt.AlignCenter)
+        self.page_title.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
         )
-        title_label.setAlignment(QtCore.Qt.AlignCenter)
-        title_label.setStyleSheet(
-            'font-family: "Microsoft YaHei UI";\n'
-            "font-size: 18px;\n"
-            "font-weight: bold;\n"
-            "color: #111827;"
-        )
-        title_layout.addWidget(title_label)
-        self.main_layout.addWidget(title_bar)
+        title_layout.addWidget(self.page_title)
+        self.main_layout.addWidget(self.title_bar, 0)
 
         self.content_area = QtWidgets.QWidget(self.centralwidget)
         self.content_layout = QtWidgets.QVBoxLayout(self.content_area)
         self.content_layout.setContentsMargins(12, 10, 12, 10)
         self.content_layout.setSpacing(8)
-        self.main_layout.addWidget(self.content_area)
+        self.main_layout.addWidget(self.content_area, 1)
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self.content_area)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(2)
-        self.content_layout.addWidget(self.splitter)
+        self.content_layout.addWidget(self.splitter, 1)
+        self.main_layout.setStretch(0, 0)
+        self.main_layout.setStretch(1, 1)
 
         # 左侧滚动区
         self.left_scroll = QtWidgets.QScrollArea()
@@ -881,6 +895,18 @@ class Ui_MainWindow(object):
 
         # 右侧按钮列
         self._build_right_panel()
+        screen = QtWidgets.QApplication.primaryScreen()
+        screen_width = 0
+        if screen is not None:
+            geometry = screen.availableGeometry()
+            screen_width = geometry.width()
+        if screen_width <= 0:
+            screen_width = max(MainWindow.width(), 1400)
+        left_width = int(screen_width * 0.72)
+        right_width = int(screen_width * 0.28)
+        if left_width <= 0 or right_width <= 0:
+            left_width, right_width = 720, 280
+        self.splitter.setSizes([left_width, right_width])
         self.splitter.setStretchFactor(0, 8)
         self.splitter.setStretchFactor(1, 3)
 
@@ -930,8 +956,8 @@ class Ui_MainWindow(object):
     def _build_path_bar(self):
         self.file_group = QtWidgets.QGroupBox("数据源选择")
         fg = QtWidgets.QVBoxLayout(self.file_group)
-        fg.setContentsMargins(12, 8, 12, 12)
-        fg.setSpacing(8)
+        fg.setContentsMargins(12, 10, 12, 10)
+        fg.setSpacing(10)
 
         hint = QtWidgets.QLabel("选择流量文件或目录 (.pcap/.pcapng 或 split 目录)")
         hint.setWordWrap(True)
@@ -970,10 +996,11 @@ class Ui_MainWindow(object):
     def _build_param_panel(self):
         self.param_group = QtWidgets.QGroupBox("查看流量信息参数")
         pg = QtWidgets.QFormLayout()
-        pg.setContentsMargins(12, 10, 12, 12)
+        pg.setContentsMargins(12, 10, 12, 10)
         pg.setHorizontalSpacing(24)
         pg.setVerticalSpacing(12)
         pg.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        pg.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
 
         self.mode_combo = QtWidgets.QComboBox()
         self._mode_map = {
@@ -1002,9 +1029,23 @@ class Ui_MainWindow(object):
 
         self.fast_check = QtWidgets.QCheckBox("极速模式（UI开关保留）")
         self.fast_check.setChecked(True)
+        self.fast_check.setMinimumHeight(38)
+
+        for widget in (
+            self.mode_combo,
+            self.batch_spin,
+            self.start_spin,
+            self.workers_spin,
+            self.proto_combo,
+            self.whitelist_edit,
+            self.blacklist_edit,
+        ):
+            widget.setMinimumHeight(38)
 
         self.btn_prev = QtWidgets.QPushButton("上一批")
         self.btn_next = QtWidgets.QPushButton("下一批")
+        for btn in (self.btn_prev, self.btn_next):
+            btn.setMinimumWidth(120)
         nav_widget = QtWidgets.QWidget()
         nav_layout = QtWidgets.QHBoxLayout(nav_widget)
         nav_layout.setContentsMargins(0, 0, 0, 0)
@@ -1025,6 +1066,21 @@ class Ui_MainWindow(object):
         pg.addRow("极速模式", self.fast_check)
         pg.addRow(nav_widget)
 
+        for field in (
+            self.mode_combo,
+            self.batch_spin,
+            self.start_spin,
+            self.workers_spin,
+            self.proto_combo,
+            self.whitelist_edit,
+            self.blacklist_edit,
+            self.fast_check,
+        ):
+            label = pg.labelForField(field)
+            if isinstance(label, QtWidgets.QLabel):
+                label.setMinimumWidth(140)
+                label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+
         self.param_group.setLayout(pg)
         self.left_layout.addWidget(self.param_group)
         self.mode_combo.currentIndexChanged.connect(self._update_batch_controls)
@@ -1035,7 +1091,7 @@ class Ui_MainWindow(object):
 
         self.results_widget = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(self.results_widget)
-        rl.setContentsMargins(12, 12, 12, 12)
+        rl.setContentsMargins(12, 10, 12, 10)
         self.results_text = QtWidgets.QTextEdit()
         self.results_text.setReadOnly(True)
         rl.addWidget(self.results_text)
@@ -1043,7 +1099,7 @@ class Ui_MainWindow(object):
 
         self.table_widget = QtWidgets.QWidget()
         tl = QtWidgets.QVBoxLayout(self.table_widget)
-        tl.setContentsMargins(12, 12, 12, 12)
+        tl.setContentsMargins(12, 10, 12, 10)
         self.table_view = QtWidgets.QTableView()
         self.table_view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table_view.horizontalHeader().setStretchLastSection(True)
@@ -1066,6 +1122,7 @@ class Ui_MainWindow(object):
         self.btn_page_next = QtWidgets.QPushButton("下一页")
         self.page_info = QtWidgets.QLabel("第 0/0 页")
         self.page_size_label = QtWidgets.QLabel("每页行数：")
+        self.page_size_label.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight)
         self.page_size_spin = QtWidgets.QSpinBox()
         self.page_size_spin.setRange(20, 200000)
         self.page_size_spin.setSingleStep(10)
@@ -1075,7 +1132,10 @@ class Ui_MainWindow(object):
         for btn in (self.btn_page_prev, self.btn_page_next, self.btn_show_all):
             btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
             btn.setObjectName("secondary")
+            btn.setMinimumWidth(120)
 
+        self.page_size_spin.setMinimumHeight(38)
+        self.page_info.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft)
         hb.addWidget(self.btn_page_prev); hb.addWidget(self.btn_page_next)
         hb.addSpacing(8); hb.addWidget(self.page_info); hb.addStretch(1)
         hb.addWidget(self.page_size_label); hb.addWidget(self.page_size_spin)
@@ -1086,7 +1146,7 @@ class Ui_MainWindow(object):
     def _build_output_list(self):
         self.out_group = QtWidgets.QGroupBox("输出文件（双击打开所在目录，右键复制路径）")
         og = QtWidgets.QVBoxLayout(self.out_group)
-        og.setContentsMargins(12, 8, 12, 12)
+        og.setContentsMargins(12, 10, 12, 10)
         self.output_list = QtWidgets.QListWidget()
         self.output_list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         og.addWidget(self.output_list)
@@ -1169,6 +1229,44 @@ class Ui_MainWindow(object):
         else:
             label.setText(base)
 
+    def _create_collapsible_group(
+        self,
+        title: str,
+        layout_cls=QtWidgets.QVBoxLayout,
+        *,
+        spacing: int = 8,
+    ):
+        group = QtWidgets.QGroupBox(title)
+        group.setCheckable(True)
+        group.setChecked(True)
+
+        content_widget = QtWidgets.QWidget(group)
+        inner_layout = layout_cls()
+        if isinstance(inner_layout, QtWidgets.QFormLayout):
+            inner_layout.setContentsMargins(0, 0, 0, 0)
+            inner_layout.setHorizontalSpacing(24)
+            inner_layout.setVerticalSpacing(spacing)
+            inner_layout.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            inner_layout.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        else:
+            inner_layout.setContentsMargins(0, 0, 0, 0)
+            inner_layout.setSpacing(spacing)
+        content_widget.setLayout(inner_layout)
+
+        wrapper_layout = QtWidgets.QVBoxLayout()
+        wrapper_layout.setContentsMargins(12, 10, 12, 10)
+        wrapper_layout.setSpacing(spacing)
+        wrapper_layout.addWidget(content_widget)
+        group.setLayout(wrapper_layout)
+
+        def _toggle(checked: bool) -> None:
+            content_widget.setVisible(checked)
+            content_widget.setEnabled(checked)
+
+        group.toggled.connect(_toggle)
+        _toggle(True)
+        return group, inner_layout
+
     def _build_right_panel(self):
         self.right_scroll = QtWidgets.QScrollArea(self.centralwidget)
         self.right_scroll.setWidgetResizable(True)
@@ -1181,6 +1279,8 @@ class Ui_MainWindow(object):
         self.right_layout = QtWidgets.QVBoxLayout(self.right_frame)
         self.right_layout.setContentsMargins(8, 8, 8, 8)
         self.right_layout.setSpacing(10)
+
+        self.right_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
 
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
         self.btn_fe = QtWidgets.QPushButton("提取特征")
@@ -1212,37 +1312,28 @@ class Ui_MainWindow(object):
         ):
             btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
 
-        data_group = QtWidgets.QGroupBox("数据阶段")
-        data_layout = QtWidgets.QVBoxLayout(data_group)
-        data_layout.setContentsMargins(12, 8, 12, 12)
-        data_layout.setSpacing(8)
+        data_group, data_layout = self._create_collapsible_group("数据阶段")
         data_layout.addWidget(self.btn_view)
         data_layout.addWidget(self.btn_fe)
         data_layout.addWidget(self.btn_vector)
+        data_layout.addStretch(1)
         self.right_layout.addWidget(data_group)
 
-        model_actions_group = QtWidgets.QGroupBox("模型阶段")
-        model_actions_layout = QtWidgets.QVBoxLayout(model_actions_group)
-        model_actions_layout.setContentsMargins(12, 8, 12, 12)
-        model_actions_layout.setSpacing(8)
-        model_actions_layout.addWidget(self.btn_train)
-        model_actions_layout.addWidget(self.btn_analysis)
-        model_actions_layout.addWidget(self.btn_predict)
-        self.right_layout.addWidget(model_actions_group)
+        model_group, model_layout = self._create_collapsible_group("模型阶段")
+        model_layout.addWidget(self.btn_train)
+        model_layout.addWidget(self.btn_analysis)
+        model_layout.addWidget(self.btn_predict)
+        model_layout.addStretch(1)
+        self.right_layout.addWidget(model_group)
 
-        output_group = QtWidgets.QGroupBox("输出管理")
-        output_layout = QtWidgets.QVBoxLayout(output_group)
-        output_layout.setContentsMargins(12, 8, 12, 12)
-        output_layout.setSpacing(8)
+        output_group, output_layout = self._create_collapsible_group("输出管理")
         output_layout.addWidget(self.btn_export)
         output_layout.addWidget(self.btn_open_results)
         output_layout.addWidget(self.btn_view_logs)
+        output_layout.addStretch(1)
         self.right_layout.addWidget(output_group)
 
-        utility_group = QtWidgets.QGroupBox("系统与维护")
-        utility_layout = QtWidgets.QVBoxLayout(utility_group)
-        utility_layout.setContentsMargins(12, 8, 12, 12)
-        utility_layout.setSpacing(8)
+        utility_group, utility_layout = self._create_collapsible_group("系统与维护")
         utility_layout.addWidget(self.btn_export_report)
         utility_layout.addWidget(self.btn_config_editor)
         utility_layout.addWidget(self.btn_online_toggle)
@@ -1251,10 +1342,13 @@ class Ui_MainWindow(object):
         self.online_status_label.setObjectName("OnlineStatusLabel")
         utility_layout.addWidget(self.online_status_label)
         utility_layout.addWidget(self.btn_clear)
+        utility_layout.addStretch(1)
         self.right_layout.addWidget(utility_group)
 
         self.dashboard = ResultsDashboard()
-        self.right_layout.addWidget(self.dashboard)
+        dashboard_group, dashboard_layout = self._create_collapsible_group("训练监控", spacing=10)
+        dashboard_layout.addWidget(self.dashboard)
+        self.right_layout.addWidget(dashboard_group)
 
         pipeline_options = [
             ("feature_weighter", "特征加权"),
@@ -1265,10 +1359,9 @@ class Ui_MainWindow(object):
             ("rbf_expander", "RBF 特征扩展"),
         ]
         self.pipeline_labels = {key: label for key, label in pipeline_options}
-        self.pipeline_group = QtWidgets.QGroupBox("Pipeline 组件")
-        pipeline_layout = QtWidgets.QVBoxLayout(self.pipeline_group)
-        pipeline_layout.setContentsMargins(12, 8, 12, 12)
-        pipeline_layout.setSpacing(6)
+        self.pipeline_group, pipeline_layout = self._create_collapsible_group(
+            "Pipeline 组件", spacing=6
+        )
         self.pipeline_checks = {}
         for key, label in pipeline_options:
             checkbox = QtWidgets.QCheckBox(label)
@@ -1279,10 +1372,9 @@ class Ui_MainWindow(object):
         pipeline_layout.addStretch(1)
         self.right_layout.addWidget(self.pipeline_group)
 
-        self.advanced_group = QtWidgets.QGroupBox("模型高级设置")
-        ag_layout = QtWidgets.QFormLayout(self.advanced_group)
-        ag_layout.setContentsMargins(12, 8, 12, 12)
-        ag_layout.setSpacing(6)
+        self.advanced_group, ag_layout = self._create_collapsible_group(
+            "模型高级设置", QtWidgets.QFormLayout, spacing=10
+        )
 
         self.rbf_components_spin = QtWidgets.QSpinBox()
         self.rbf_components_spin.setRange(0, 5000)
@@ -1303,6 +1395,18 @@ class Ui_MainWindow(object):
         self.fusion_alpha_spin.setSingleStep(0.05)
         self.fusion_alpha_spin.setValue(0.50)
         self.fusion_alpha_spin.setToolTip("α 越大越偏向无监督风险分数")
+        self.memory_ceiling_combo = QtWidgets.QComboBox()
+        self.memory_ceiling_combo.addItems(
+            [
+                "自动 (物理内存 35%)",
+                "512 MB",
+                "1 GB",
+                "2 GB",
+                "4 GB",
+                "8 GB",
+            ]
+        )
+        self.memory_ceiling_combo.setMinimumHeight(38)
         self.feature_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.feature_slider.setRange(0, 100)
         self.feature_slider.setSingleStep(5)
@@ -1316,22 +1420,46 @@ class Ui_MainWindow(object):
         feature_slider_layout.addWidget(self.feature_slider)
         self.feature_slider_value = QtWidgets.QLabel("全部")
         feature_slider_layout.addWidget(self.feature_slider_value)
+        feature_slider_row.setMinimumHeight(38)
         ag_layout.addRow("RBF 维度：", self.rbf_components_spin)
         ag_layout.addRow("RBF γ：", self.rbf_gamma_spin)
         ag_layout.addRow("半监督融合：", self.fusion_checkbox)
         ag_layout.addRow("融合权重 α：", self.fusion_alpha_spin)
         ag_layout.addRow("特征筛选阈值：", feature_slider_row)
+        ag_layout.addRow("内存上限", self.memory_ceiling_combo)
         self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
         self._on_feature_slider_changed(self.feature_slider.value())
+        for widget in (
+            self.rbf_components_spin,
+            self.rbf_gamma_spin,
+            self.fusion_alpha_spin,
+            self.memory_ceiling_combo,
+        ):
+            widget.setMinimumHeight(38)
+        for field in (
+            self.rbf_components_spin,
+            self.rbf_gamma_spin,
+            self.fusion_checkbox,
+            self.fusion_alpha_spin,
+            self.memory_ceiling_combo,
+            feature_slider_row,
+        ):
+            label = ag_layout.labelForField(field)
+            if isinstance(label, QtWidgets.QLabel):
+                label.setMinimumWidth(140)
+                label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.right_layout.addWidget(self.advanced_group)
 
-        self.model_group = QtWidgets.QGroupBox("模型版本管理")
-        mg_layout = QtWidgets.QVBoxLayout(self.model_group)
-        mg_layout.setContentsMargins(12, 8, 12, 12)
+        self.model_group, mg_layout = self._create_collapsible_group("模型版本管理")
         model_row = QtWidgets.QHBoxLayout()
+        model_row.setContentsMargins(0, 0, 0, 0)
+        model_row.setSpacing(8)
         self.model_combo = QtWidgets.QComboBox()
+        self.model_combo.setMinimumHeight(38)
         self.model_refresh_btn = QtWidgets.QPushButton("刷新")
         self.model_refresh_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.model_refresh_btn.setObjectName("secondary")
+        self.model_refresh_btn.setMinimumWidth(120)
         model_row.addWidget(self.model_combo)
         model_row.addWidget(self.model_refresh_btn)
         mg_layout.addLayout(model_row)
@@ -1340,12 +1468,11 @@ class Ui_MainWindow(object):
         mg_layout.addWidget(self.model_info_label)
         self.right_layout.addWidget(self.model_group)
 
-        self.plugin_group = QtWidgets.QGroupBox("特征插件")
-        pg_layout = QtWidgets.QVBoxLayout(self.plugin_group)
-        pg_layout.setContentsMargins(12, 8, 12, 12)
+        self.plugin_group, plugin_layout = self._create_collapsible_group("特征插件", spacing=6)
         self.plugin_label = QtWidgets.QLabel("未发现插件")
         self.plugin_label.setWordWrap(True)
-        pg_layout.addWidget(self.plugin_label)
+        plugin_layout.addWidget(self.plugin_label)
+        plugin_layout.addStretch(1)
         self.right_layout.addWidget(self.plugin_group)
 
         self.right_layout.addStretch(1)
@@ -3527,8 +3654,32 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__(parent)
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        self._ui_settings = QtCore.QSettings("Maldet", "UI")
+
+        geometry = self._ui_settings.value("geometry")
+        if geometry:
+            try:
+                self.restoreGeometry(geometry)
+            except TypeError:
+                self.restoreGeometry(QtCore.QByteArray(geometry))
+
+        splitter_state = self._ui_settings.value("splitter")
+        if splitter_state:
+            try:
+                self.ui.splitter.restoreState(splitter_state)
+            except TypeError:
+                self.ui.splitter.restoreState(QtCore.QByteArray(splitter_state))
 
     def closeEvent(self, event):
+        settings = getattr(self, "_ui_settings", None)
+        if settings is None:
+            settings = QtCore.QSettings("Maldet", "UI")
+        try:
+            settings.setValue("geometry", self.saveGeometry())
+            settings.setValue("splitter", self.ui.splitter.saveState())
+            settings.sync()
+        except Exception:
+            pass
         try:
             self.ui.shutdown()
         except Exception:
