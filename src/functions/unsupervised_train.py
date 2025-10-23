@@ -156,6 +156,13 @@ ANOMALY_TOKENS = {
 }
 
 
+AUTO_REDUCTION_MAX_COLUMNS = 120_000
+AUTO_REDUCTION_MIN_COLUMNS = 4_096
+AUTO_REDUCTION_MAX_MEMORY = 2_000_000_000  # ~1.86 GiB
+AUTO_REDUCTION_CHUNK_SIZE = 512
+AUTO_DOWNCAST_MEMORY = 1_000_000_000  # ~0.93 GiB
+
+
 def _build_token_variants(tokens: set[str]) -> set[str]:
     variants: set[str] = set()
     strip_chars = "。.,，!！?？；;:"
@@ -174,6 +181,135 @@ def _build_token_variants(tokens: set[str]) -> set[str]:
 
 NORMAL_TOKEN_VARIANTS = _build_token_variants(NORMAL_TOKENS)
 ANOMALY_TOKEN_VARIANTS = _build_token_variants(ANOMALY_TOKENS)
+
+
+def _estimate_dataframe_bytes(df: pd.DataFrame) -> int:
+    try:
+        usage = df.memory_usage(deep=True)
+        if hasattr(usage, "sum"):
+            return int(usage.sum())
+        return int(usage)
+    except Exception:
+        rows, cols = df.shape
+        return int(rows * cols * 8)
+
+
+def _auto_reduce_high_dimensional_data(
+    df: pd.DataFrame,
+    feature_columns: List[str],
+    *,
+    max_columns: int = AUTO_REDUCTION_MAX_COLUMNS,
+    min_columns: int = AUTO_REDUCTION_MIN_COLUMNS,
+    max_memory_bytes: int = AUTO_REDUCTION_MAX_MEMORY,
+    chunk_size: int = AUTO_REDUCTION_CHUNK_SIZE,
+) -> Tuple[pd.DataFrame, List[str], Optional[Dict[str, object]]]:
+    total_columns = len(feature_columns)
+    if total_columns == 0:
+        return df, feature_columns, None
+
+    approx_bytes = _estimate_dataframe_bytes(df)
+    target_columns = min(max_columns, total_columns)
+    reasons: List[str] = []
+
+    if total_columns > max_columns:
+        reasons.append("column_limit")
+
+    rows = max(1, len(df))
+    allowed_by_memory = total_columns
+    if approx_bytes > max_memory_bytes:
+        reasons.append("memory_limit")
+        allowed_by_memory = int(max_memory_bytes / (rows * 4))
+        allowed_by_memory = max(min_columns, min(total_columns, allowed_by_memory))
+    if allowed_by_memory < total_columns:
+        target_columns = min(target_columns, allowed_by_memory)
+
+    target_columns = max(min_columns, target_columns)
+    target_columns = min(total_columns, target_columns)
+
+    if target_columns >= total_columns:
+        info = {
+            "original_features": int(total_columns),
+            "kept_features": int(total_columns),
+            "dropped_features": 0,
+            "estimated_memory_before": int(approx_bytes),
+            "estimated_memory_after": int(approx_bytes),
+            "reasons": reasons or ["no_reduction"],
+        }
+        return df, feature_columns, info if reasons else None
+
+    var_scores: Dict[str, float] = {}
+    coverage_scores: Dict[str, float] = {}
+    nonzero_scores: Dict[str, float] = {}
+    column_order = list(feature_columns)
+
+    for start in range(0, total_columns, chunk_size):
+        stop = min(total_columns, start + chunk_size)
+        chunk_cols = column_order[start:stop]
+        chunk = df.loc[:, chunk_cols]
+        chunk_numeric = chunk.apply(pd.to_numeric, errors="coerce")
+        coverage = chunk_numeric.notna().sum(axis=0)
+        nonzero = (chunk_numeric.abs() > 1e-12).sum(axis=0)
+        variance = chunk_numeric.var(axis=0, skipna=True, ddof=0)
+        for col in chunk_cols:
+            coverage_scores[col] = float(coverage.get(col, 0.0))
+            nonzero_scores[col] = float(nonzero.get(col, 0.0))
+            val = variance.get(col, np.nan)
+            var_scores[col] = float(val) if np.isfinite(val) else 0.0
+
+    ranking: List[Tuple[str, float]] = []
+    for col in column_order:
+        variance = max(var_scores.get(col, 0.0), 0.0)
+        if not np.isfinite(variance):
+            variance = 0.0
+        coverage_ratio = coverage_scores.get(col, 0.0) / rows
+        nonzero_ratio = nonzero_scores.get(col, 0.0) / rows
+        score = variance * (0.2 + 0.5 * coverage_ratio + 0.3 * nonzero_ratio)
+        ranking.append((col, score))
+
+    ranking.sort(key=lambda item: item[1], reverse=True)
+    keep_candidates = [col for col, _ in ranking if np.isfinite(_)]
+    keep_set = set(keep_candidates[:target_columns])
+    ordered_keep = [col for col in column_order if col in keep_set]
+    dropped = total_columns - len(ordered_keep)
+    if not ordered_keep:
+        ordered_keep = column_order[:target_columns]
+        dropped = total_columns - len(ordered_keep)
+
+    reduced_df = df.loc[:, ordered_keep].copy()
+    approx_after = len(reduced_df.columns) * rows * 4
+    info = {
+        "original_features": int(total_columns),
+        "kept_features": int(len(ordered_keep)),
+        "dropped_features": int(dropped),
+        "estimated_memory_before": int(approx_bytes),
+        "estimated_memory_after": int(approx_after),
+        "reasons": reasons or ["column_limit"],
+        "selection_strategy": "variance_coverage",
+    }
+    logger.warning(
+        "High-dimensional feature frame detected: %d columns (~%.2f GiB). Auto-selected %d columns to fit memory budget.",
+        total_columns,
+        approx_bytes / (1024 ** 3),
+        len(ordered_keep),
+    )
+    return reduced_df, ordered_keep, info
+
+
+def _coerce_numeric_dataframe(
+    df: pd.DataFrame,
+    columns: Optional[List[str]] = None,
+    *,
+    downcast: bool = True,
+) -> pd.DataFrame:
+    cols = columns or list(df.columns)
+    target_dtype = np.float32 if downcast else None
+    for col in cols:
+        series = df[col]
+        numeric = pd.to_numeric(series, errors="coerce")
+        if downcast and target_dtype is not None:
+            numeric = numeric.astype(target_dtype)
+        df[col] = numeric
+    return df
 
 
 def compute_risk_components(
@@ -708,6 +844,43 @@ def _train_from_dataframe(
         if categorical_maps
         else {}
     )
+    feature_df_numeric = feature_df.loc[:, feature_columns].copy()
+    reduction_info: Optional[Dict[str, object]] = None
+    (
+        feature_df_numeric,
+        feature_columns,
+        reduction_info,
+    ) = _auto_reduce_high_dimensional_data(feature_df_numeric, feature_columns)
+    if reduction_info and reduction_info.get("dropped_features", 0) > 0:
+        fill_values_clean = {
+            key: val for key, val in fill_values_clean.items() if key in feature_columns
+        }
+        categorical_maps_clean = {
+            key: val for key, val in categorical_maps_clean.items() if key in feature_columns
+        }
+
+    approx_numeric_bytes = _estimate_dataframe_bytes(feature_df_numeric)
+    approx_before_cast = approx_numeric_bytes
+    require_numeric_cast = any(
+        not is_numeric_dtype(feature_df_numeric[col]) for col in feature_columns
+    )
+    need_downcast = approx_numeric_bytes > AUTO_DOWNCAST_MEMORY
+    if require_numeric_cast or need_downcast:
+        feature_df_numeric = _coerce_numeric_dataframe(
+            feature_df_numeric,
+            feature_columns,
+            downcast=need_downcast,
+        )
+        approx_numeric_bytes = _estimate_dataframe_bytes(feature_df_numeric)
+        if need_downcast:
+            logger.info(
+                "Downcasting feature matrix to float32: %.2f GiB -> %.2f GiB",
+                approx_before_cast / (1024 ** 3),
+                approx_numeric_bytes / (1024 ** 3),
+            )
+    if reduction_info:
+        reduction_info["estimated_memory_after"] = int(approx_numeric_bytes)
+
     categorical_fill_defaults = {key: -1 for key in categorical_maps_clean.keys()}
     column_fill_values = dict(categorical_fill_defaults)
     column_fill_values.update(fill_values_clean)
@@ -724,14 +897,12 @@ def _train_from_dataframe(
         categorical_maps=categorical_maps_clean,
         aligner_in_pipeline=True,
     )
-    feature_df_numeric = feature_df.loc[:, feature_columns].copy()
 
     ratio_clean = _sanitize_ratio(feature_selection_ratio)
     feature_weights: Optional[Dict[str, float]] = None
     feature_weight_info: Optional[Dict[str, object]] = None
     if ratio_clean is not None:
-        numeric_for_var = feature_df_numeric.apply(pd.to_numeric, errors="coerce")
-        var_series = numeric_for_var.var(axis=0, skipna=True, ddof=0)
+        var_series = feature_df_numeric.var(axis=0, skipna=True, ddof=0)
         variance_scores = {
             col: float(var_series.get(col, 0.0)) for col in feature_columns
         }
@@ -758,6 +929,12 @@ def _train_from_dataframe(
             )
 
     data_quality_report: Dict[str, object] = {}
+    if reduction_info:
+        data_quality_report["dimension_reduction"] = reduction_info
+    data_quality_report["memory_usage_bytes"] = int(approx_numeric_bytes)
+    data_quality_report["memory_usage_bytes_before_cast"] = int(approx_before_cast)
+    data_quality_report["downcast_to_float32"] = bool(need_downcast)
+    data_quality_report["forced_numeric_cast"] = bool(require_numeric_cast)
     empty_columns = [
         col
         for col in feature_columns
