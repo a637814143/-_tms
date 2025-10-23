@@ -50,14 +50,111 @@ def _resolve_data_base() -> Path:
 
 
 APP_STYLE = """
-QWidget { background-color: #F7F8FA; font-family: "Microsoft YaHei", "PingFang SC","SF Pro Text"; color:#1d1d1f; font-size:13px; }
-QTextEdit, QTableView { background-color: #FFFFFF; border:1px solid #E3E6EB; border-radius:8px; }
-QLineEdit, QSpinBox, QComboBox { background:#FFFFFF; border:1px solid #D7DBE2; border-radius:8px; padding:6px; }
-QPushButton { background:#EEF1F6; border:0; border-radius:10px; padding:8px 12px; min-height:30px;}
-QPushButton:hover { background:#E2E8F0; } QPushButton:pressed { background:#D9E0EA; }
-QHeaderView::section { background:#F3F5F9; padding:6px; border:1px solid #E6E9EF; }
-QGroupBox { border:1px solid #E6E9EF; border-radius:10px; margin-top:10px; }
-QGroupBox::title { subcontrol-origin: margin; left:12px; padding:0 6px; background:transparent; }
+QWidget {
+  background-color: #F5F6FA;
+  font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI";
+  font-size: 14px;
+  color: #1F1F1F;
+}
+QGroupBox {
+  border: 1px solid #E0E3E7;
+  border-radius: 8px;
+  margin-top: 10px;
+  background: #FFFFFF;
+}
+QGroupBox::title {
+  subcontrol-origin: margin;
+  left: 10px;
+  padding: 0 6px;
+  font-weight: bold;
+  color: #333333;
+}
+QTextEdit,
+QTableView,
+QListWidget,
+QPlainTextEdit {
+  background: #FFFFFF;
+  border: 1px solid #E3E6EB;
+  border-radius: 8px;
+}
+QLineEdit,
+QSpinBox,
+QDoubleSpinBox,
+QComboBox {
+  background: #FFFFFF;
+  border: 1px solid #D0D5DC;
+  border-radius: 6px;
+  padding: 6px 8px;
+}
+QLineEdit:focus,
+QSpinBox:focus,
+QDoubleSpinBox:focus,
+QComboBox:focus {
+  border-color: #0078D7;
+}
+QPushButton {
+  background-color: #0078D7;
+  color: #FFFFFF;
+  border-radius: 8px;
+  padding: 8px 16px;
+  min-height: 36px;
+  font-weight: 600;
+  border: none;
+}
+QPushButton:hover {
+  background-color: #1084E0;
+}
+QPushButton:pressed {
+  background-color: #0A65B3;
+}
+QToolButton {
+  background: transparent;
+  border: none;
+  padding: 4px;
+}
+QToolButton:hover {
+  background: rgba(0, 120, 215, 0.08);
+  border-radius: 6px;
+}
+QHeaderView::section {
+  background: #F3F5F9;
+  border: 1px solid #E6E9EF;
+  padding: 6px 10px;
+  font-weight: bold;
+}
+QTableView {
+  gridline-color: #E3E6EB;
+  border: 1px solid #E3E6EB;
+  border-radius: 8px;
+  selection-background-color: rgba(0, 120, 215, 0.15);
+}
+QSplitter::handle {
+  background-color: #E8EAED;
+  width: 2px;
+}
+QScrollArea {
+  border: none;
+}
+QStatusBar {
+  background: #F3F4F6;
+  border-top: 1px solid #E0E0E0;
+  font-size: 12px;
+  color: #666666;
+  padding: 4px 8px;
+}
+#RightPanelFrame {
+  background-color: #F9FAFB;
+  border-radius: 12px;
+  border: 1px solid #E0E3E7;
+  padding: 8px;
+}
+#OnlineStatusLabel {
+  font-size: 12px;
+  color: #5F6368;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background-color: #F3F4F6;
+}
 """
 
 # 仅表格预览上限（全部数据都会落盘）
@@ -463,7 +560,7 @@ class ResultsDashboard(QtWidgets.QGroupBox):
     def __init__(self, parent=None):
         super().__init__("结果仪表盘", parent)
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setContentsMargins(12, 8, 12, 12)
         layout.setSpacing(6)
 
         self.anomaly_bar = QtWidgets.QProgressBar()
@@ -720,27 +817,29 @@ class Ui_MainWindow(object):
 
         self.centralwidget = QtWidgets.QWidget(MainWindow)
         self.main_layout = QtWidgets.QVBoxLayout(self.centralwidget)
-        self.main_layout.setContentsMargins(8, 8, 8, 8)
+        self.main_layout.setContentsMargins(16, 12, 16, 12)
+        self.main_layout.setSpacing(12)
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self.centralwidget)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(2)
         self.main_layout.addWidget(self.splitter)
 
         # 左侧滚动区
         self.left_scroll = QtWidgets.QScrollArea()
         self.left_scroll.setWidgetResizable(True)
+        self.left_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.left_container = QtWidgets.QWidget()
         self.left_scroll.setWidget(self.left_container)
         self.left_layout = QtWidgets.QVBoxLayout(self.left_container)
-        self.left_layout.setContentsMargins(4, 4, 4, 4)
-        self.left_layout.setSpacing(8)
+        self.left_layout.setContentsMargins(12, 12, 12, 12)
+        self.left_layout.setSpacing(16)
 
         self._build_path_bar()
         self._build_param_panel()
         self._build_center_tabs()
         self._build_paging_toolbar()
         self._build_output_list()
-        self._build_footer()
-        self._update_status_message("@2025 恶意流量检测系统")
 
         self.splitter.addWidget(self.left_scroll)
 
@@ -751,6 +850,8 @@ class Ui_MainWindow(object):
         self.splitter.setStretchFactor(1, 3)
 
         MainWindow.setCentralWidget(self.centralwidget)
+        self._build_status_bar(MainWindow)
+        self._update_status_message("@2025 恶意流量检测系统")
         self._bind_signals()
 
         # 状态缓存
@@ -793,31 +894,53 @@ class Ui_MainWindow(object):
 
     # --------- UI 子构建 ----------
     def _build_path_bar(self):
-        self.file_bar = QtWidgets.QWidget(self.left_container)
-        fb = QtWidgets.QHBoxLayout(self.file_bar)
-        fb.setContentsMargins(8, 0, 8, 0)
-        fb.setSpacing(8)
-        self.file_label = QtWidgets.QLabel("选择流量文件或目录 (.pcap/.pcapng 或 split 目录):")
+        self.file_group = QtWidgets.QGroupBox("数据源选择")
+        fg = QtWidgets.QVBoxLayout(self.file_group)
+        fg.setContentsMargins(12, 8, 12, 12)
+        fg.setSpacing(8)
+
+        hint = QtWidgets.QLabel("选择流量文件或目录 (.pcap/.pcapng 或 split 目录)")
+        hint.setWordWrap(True)
+        fg.addWidget(hint)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        self.path_tool_button = QtWidgets.QToolButton(self.file_group)
+        self.path_tool_button.setIcon(self.file_group.style().standardIcon(QtWidgets.QStyle.SP_DirIcon))
+        self.path_tool_button.setIconSize(QtCore.QSize(20, 20))
+        self.path_tool_button.setAutoRaise(True)
+        self.path_tool_button.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.path_tool_button.setToolTip("浏览文件或目录")
+        row.addWidget(self.path_tool_button)
+
         self.file_edit = QtWidgets.QLineEdit()
         self.file_edit.setPlaceholderText("请选择文件或目录路径")
+        self.file_edit.setClearButtonEnabled(True)
+        row.addWidget(self.file_edit, 1)
+        row.addStretch(1)
+
         self.btn_pick_file = QtWidgets.QPushButton("选文件")
         self.btn_pick_dir = QtWidgets.QPushButton("选目录")
-        self.btn_browse = QtWidgets.QPushButton("浏览(文件或目录)")
-        fb.addWidget(self.file_label, 2)
-        fb.addWidget(self.file_edit, 8)
-        fb.addWidget(self.btn_pick_file, 1)
-        fb.addWidget(self.btn_pick_dir, 1)
-        fb.addWidget(self.btn_browse, 2)
-        self.left_layout.addWidget(self.file_bar)
+        self.btn_browse = QtWidgets.QPushButton("浏览")
+        for btn in (self.btn_pick_file, self.btn_pick_dir, self.btn_browse):
+            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        row.addWidget(self.btn_pick_file)
+        row.addWidget(self.btn_pick_dir)
+        row.addWidget(self.btn_browse)
+
+        fg.addLayout(row)
+        self.left_layout.addWidget(self.file_group)
 
     def _build_param_panel(self):
         self.param_group = QtWidgets.QGroupBox("查看流量信息参数")
-        pg = QtWidgets.QGridLayout(self.param_group)
-        pg.setContentsMargins(10, 6, 10, 6)
-        pg.setHorizontalSpacing(12)
-        pg.setVerticalSpacing(6)
+        pg = QtWidgets.QFormLayout()
+        pg.setContentsMargins(12, 10, 12, 12)
+        pg.setHorizontalSpacing(24)
+        pg.setVerticalSpacing(12)
+        pg.setLabelAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
-        self.mode_label = QtWidgets.QLabel("查看模式：")
         self.mode_combo = QtWidgets.QComboBox()
         self._mode_map = {
             "自动(文件=单文件/目录=全部)": "auto",
@@ -826,32 +949,20 @@ class Ui_MainWindow(object):
             "分批(按文件名排序)": "batch"
         }
         self.mode_combo.addItems(list(self._mode_map.keys()))
-
-        self.batch_label = QtWidgets.QLabel("batch_size：")
         self.batch_spin = QtWidgets.QSpinBox()
         self.batch_spin.setRange(1, 99999)
         self.batch_spin.setValue(10)
-
-        self.start_label = QtWidgets.QLabel("start_index：")
         self.start_spin = QtWidgets.QSpinBox()
         self.start_spin.setRange(0, 10**9)
         self.start_spin.setSingleStep(10)
         self.start_spin.setValue(0)
-
-        self.workers_label = QtWidgets.QLabel("并发数：")
         self.workers_spin = QtWidgets.QSpinBox()
         self.workers_spin.setRange(1, 32)
         self.workers_spin.setValue(8)
-
-        self.proto_label = QtWidgets.QLabel("协议：")
         self.proto_combo = QtWidgets.QComboBox()
         self.proto_combo.addItems(["TCP+UDP", "仅TCP", "仅UDP"])
-
-        self.whitelist_label = QtWidgets.QLabel("端口白名单(任一命中保留)：")
         self.whitelist_edit = QtWidgets.QLineEdit()
         self.whitelist_edit.setPlaceholderText("例: 80,443,53")
-
-        self.blacklist_label = QtWidgets.QLabel("端口黑名单(任一命中排除)：")
         self.blacklist_edit = QtWidgets.QLineEdit()
         self.blacklist_edit.setPlaceholderText("例: 135,137,138,139")
 
@@ -860,18 +971,24 @@ class Ui_MainWindow(object):
 
         self.btn_prev = QtWidgets.QPushButton("上一批")
         self.btn_next = QtWidgets.QPushButton("下一批")
+        nav_widget = QtWidgets.QWidget()
+        nav_layout = QtWidgets.QHBoxLayout(nav_widget)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+        nav_layout.setSpacing(12)
+        nav_layout.addWidget(self.btn_prev, 1)
+        nav_layout.addWidget(self.btn_next, 1)
 
-        r = 0
-        pg.addWidget(self.mode_label, r, 0); pg.addWidget(self.mode_combo, r, 1, 1, 5); r += 1
-        pg.addWidget(self.batch_label, r, 0); pg.addWidget(self.batch_spin, r, 1)
-        pg.addWidget(self.start_label, r, 2); pg.addWidget(self.start_spin, r, 3)
-        pg.addWidget(self.workers_label, r, 4); pg.addWidget(self.workers_spin, r, 5); r += 1
-        pg.addWidget(self.proto_label, r, 0); pg.addWidget(self.proto_combo, r, 1)
-        pg.addWidget(self.whitelist_label, r, 2); pg.addWidget(self.whitelist_edit, r, 3, 1, 3); r += 1
-        pg.addWidget(self.blacklist_label, r, 0); pg.addWidget(self.blacklist_edit, r, 1, 1, 4)
-        pg.addWidget(self.fast_check, r, 5); r += 1
-        pg.addWidget(self.btn_prev, r, 0, 1, 3); pg.addWidget(self.btn_next, r, 3, 1, 3); r += 1
+        pg.addRow("查看模式", self.mode_combo)
+        pg.addRow("批处理数量", self.batch_spin)
+        pg.addRow("起始索引", self.start_spin)
+        pg.addRow("并发数", self.workers_spin)
+        pg.addRow("协议", self.proto_combo)
+        pg.addRow("端口白名单", self.whitelist_edit)
+        pg.addRow("端口黑名单", self.blacklist_edit)
+        pg.addRow("极速模式", self.fast_check)
+        pg.addRow(nav_widget)
 
+        self.param_group.setLayout(pg)
         self.left_layout.addWidget(self.param_group)
         self.mode_combo.currentIndexChanged.connect(self._update_batch_controls)
         self._update_batch_controls()
@@ -881,7 +998,7 @@ class Ui_MainWindow(object):
 
         self.results_widget = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(self.results_widget)
-        rl.setContentsMargins(6, 6, 6, 6)
+        rl.setContentsMargins(12, 12, 12, 12)
         self.results_text = QtWidgets.QTextEdit()
         self.results_text.setReadOnly(True)
         rl.addWidget(self.results_text)
@@ -889,11 +1006,13 @@ class Ui_MainWindow(object):
 
         self.table_widget = QtWidgets.QWidget()
         tl = QtWidgets.QVBoxLayout(self.table_widget)
-        tl.setContentsMargins(6, 6, 6, 6)
+        tl.setContentsMargins(12, 12, 12, 12)
         self.table_view = QtWidgets.QTableView()
         self.table_view.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table_view.horizontalHeader().setStretchLastSection(True)
-        self.table_view.verticalHeader().setDefaultSectionSize(22)
+        self.table_view.verticalHeader().setDefaultSectionSize(28)
+        self.table_view.setAlternatingRowColors(True)
+        self.table_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table_widget.setMinimumHeight(22 * 16 + 40)
         tl.addWidget(self.table_view)
         self.display_tabs.addTab(self.table_widget, "流量表格")
@@ -903,7 +1022,8 @@ class Ui_MainWindow(object):
     def _build_paging_toolbar(self):
         bar = QtWidgets.QWidget(self.left_container)
         hb = QtWidgets.QHBoxLayout(bar)
-        hb.setContentsMargins(4, 0, 4, 0); hb.setSpacing(8)
+        hb.setContentsMargins(12, 0, 12, 0)
+        hb.setSpacing(10)
 
         self.btn_page_prev = QtWidgets.QPushButton("上一页")
         self.btn_page_next = QtWidgets.QPushButton("下一页")
@@ -915,6 +1035,9 @@ class Ui_MainWindow(object):
         self.page_size_spin.setValue(50)
         self.btn_show_all = QtWidgets.QPushButton("显示全部（可能较慢）")
 
+        for btn in (self.btn_page_prev, self.btn_page_next, self.btn_show_all):
+            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+
         hb.addWidget(self.btn_page_prev); hb.addWidget(self.btn_page_next)
         hb.addSpacing(8); hb.addWidget(self.page_info); hb.addStretch(1)
         hb.addWidget(self.page_size_label); hb.addWidget(self.page_size_spin)
@@ -925,21 +1048,20 @@ class Ui_MainWindow(object):
     def _build_output_list(self):
         self.out_group = QtWidgets.QGroupBox("输出文件（双击打开所在目录，右键复制路径）")
         og = QtWidgets.QVBoxLayout(self.out_group)
-        og.setContentsMargins(8, 6, 8, 8)
+        og.setContentsMargins(12, 8, 12, 12)
         self.output_list = QtWidgets.QListWidget()
         self.output_list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         og.addWidget(self.output_list)
         self.left_layout.addWidget(self.out_group, stretch=1)
 
-    def _build_footer(self):
-        self.bottom_bar = QtWidgets.QWidget(self.left_container)
-        self.bottom_bar.setFixedHeight(22)
-        bb = QtWidgets.QHBoxLayout(self.bottom_bar)
-        bb.setContentsMargins(6, 0, 6, 0); bb.addStretch()
-        self.bottom_label = QtWidgets.QLabel()
-        self.bottom_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        bb.addWidget(self.bottom_label)
-        self.left_layout.addWidget(self.bottom_bar)
+    def _build_status_bar(self, MainWindow: QtWidgets.QMainWindow) -> None:
+        self.status_bar = QtWidgets.QStatusBar(MainWindow)
+        self.status_bar.setObjectName("MainStatusBar")
+        self.status_bar.setSizeGripEnabled(False)
+        self.status_label = QtWidgets.QLabel()
+        self.status_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.status_bar.addPermanentWidget(self.status_label, 1)
+        MainWindow.setStatusBar(self.status_bar)
 
     def _action_buttons(self) -> List[QtWidgets.QPushButton]:
         return [
@@ -1000,21 +1122,124 @@ class Ui_MainWindow(object):
             pass
 
     def _update_status_message(self, message: Optional[str] = None) -> None:
+        label = getattr(self, "status_label", None)
+        if label is None:
+            return
         base = f"数据目录: {DATA_BASE}"
         if message:
-            self.bottom_label.setText(f"{message} | {base}")
+            label.setText(f"{message} | {base}")
         else:
-            self.bottom_label.setText(base)
+            label.setText(base)
 
     def _build_right_panel(self):
         self.right_frame = QtWidgets.QFrame(self.centralwidget)
+        self.right_frame.setObjectName("RightPanelFrame")
         self.right_layout = QtWidgets.QVBoxLayout(self.right_frame)
-        self.right_layout.setContentsMargins(6, 6, 6, 6)
-        self.right_layout.setSpacing(10)
+        self.right_layout.setContentsMargins(12, 12, 12, 12)
+        self.right_layout.setSpacing(16)
 
-        self.advanced_group = QtWidgets.QGroupBox("高级设置")
+        self.btn_view = QtWidgets.QPushButton("查看流量信息")
+        self.btn_fe = QtWidgets.QPushButton("提取特征")
+        self.btn_vector = QtWidgets.QPushButton("数据预处理")
+        self.btn_train = QtWidgets.QPushButton("训练模型")
+        self.btn_analysis = QtWidgets.QPushButton("运行分析")
+        self.btn_predict = QtWidgets.QPushButton("加载模型预测")
+        self.btn_export = QtWidgets.QPushButton("导出结果（异常）")
+        self.btn_open_results = QtWidgets.QPushButton("打开结果目录")
+        self.btn_view_logs = QtWidgets.QPushButton("查看日志")
+        self.btn_clear = QtWidgets.QPushButton("清空显示")
+        self.btn_export_report = QtWidgets.QPushButton("导出 PDF 报告")
+        self.btn_config_editor = QtWidgets.QPushButton("编辑全局配置")
+        self.btn_online_toggle = QtWidgets.QPushButton("开启在线检测")
+        for btn in (
+            self.btn_view,
+            self.btn_fe,
+            self.btn_vector,
+            self.btn_train,
+            self.btn_analysis,
+            self.btn_predict,
+            self.btn_export,
+            self.btn_open_results,
+            self.btn_view_logs,
+            self.btn_clear,
+            self.btn_export_report,
+            self.btn_config_editor,
+            self.btn_online_toggle,
+        ):
+            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+
+        data_group = QtWidgets.QGroupBox("数据阶段")
+        data_layout = QtWidgets.QVBoxLayout(data_group)
+        data_layout.setContentsMargins(12, 8, 12, 12)
+        data_layout.setSpacing(8)
+        data_layout.addWidget(self.btn_view)
+        data_layout.addWidget(self.btn_fe)
+        data_layout.addWidget(self.btn_vector)
+        self.right_layout.addWidget(data_group)
+
+        model_actions_group = QtWidgets.QGroupBox("模型阶段")
+        model_actions_layout = QtWidgets.QVBoxLayout(model_actions_group)
+        model_actions_layout.setContentsMargins(12, 8, 12, 12)
+        model_actions_layout.setSpacing(8)
+        model_actions_layout.addWidget(self.btn_train)
+        model_actions_layout.addWidget(self.btn_analysis)
+        model_actions_layout.addWidget(self.btn_predict)
+        self.right_layout.addWidget(model_actions_group)
+
+        output_group = QtWidgets.QGroupBox("输出管理")
+        output_layout = QtWidgets.QVBoxLayout(output_group)
+        output_layout.setContentsMargins(12, 8, 12, 12)
+        output_layout.setSpacing(8)
+        output_layout.addWidget(self.btn_export)
+        output_layout.addWidget(self.btn_open_results)
+        output_layout.addWidget(self.btn_view_logs)
+        self.right_layout.addWidget(output_group)
+
+        utility_group = QtWidgets.QGroupBox("系统与维护")
+        utility_layout = QtWidgets.QVBoxLayout(utility_group)
+        utility_layout.setContentsMargins(12, 8, 12, 12)
+        utility_layout.setSpacing(8)
+        utility_layout.addWidget(self.btn_export_report)
+        utility_layout.addWidget(self.btn_config_editor)
+        utility_layout.addWidget(self.btn_online_toggle)
+        self.online_status_label = QtWidgets.QLabel("在线检测未启动")
+        self.online_status_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.online_status_label.setObjectName("OnlineStatusLabel")
+        utility_layout.addWidget(self.online_status_label)
+        utility_layout.addWidget(self.btn_clear)
+        self.right_layout.addWidget(utility_group)
+
+        self.dashboard = ResultsDashboard()
+        self.right_layout.addWidget(self.dashboard)
+
+        pipeline_options = [
+            ("feature_weighter", "特征加权"),
+            ("variance_filter", "低方差过滤"),
+            ("scaler", "标准化"),
+            ("deep_features", "深度表征 (AutoEncoder)"),
+            ("gaussianizer", "分位数正态化"),
+            ("rbf_expander", "RBF 特征扩展"),
+        ]
+        self.pipeline_labels = {key: label for key, label in pipeline_options}
+        self.pipeline_group = QtWidgets.QGroupBox("Pipeline 组件")
+        pipeline_layout = QtWidgets.QVBoxLayout(self.pipeline_group)
+        pipeline_layout.setContentsMargins(12, 8, 12, 12)
+        pipeline_layout.setSpacing(6)
+        self.pipeline_checks = {}
+        for key, label in pipeline_options:
+            checkbox = QtWidgets.QCheckBox(label)
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(self._on_pipeline_option_toggled)
+            self.pipeline_checks[key] = checkbox
+            pipeline_layout.addWidget(checkbox)
+        pipeline_layout.addStretch(1)
+        self.right_layout.addWidget(self.pipeline_group)
+
+        self.advanced_group = QtWidgets.QGroupBox("模型高级设置")
         ag_layout = QtWidgets.QFormLayout(self.advanced_group)
-        ag_layout.setContentsMargins(10, 8, 10, 8)
+        ag_layout.setContentsMargins(12, 8, 12, 12)
+        ag_layout.setSpacing(6)
+
         self.rbf_components_spin = QtWidgets.QSpinBox()
         self.rbf_components_spin.setRange(0, 5000)
         self.rbf_components_spin.setSingleStep(50)
@@ -1056,38 +1281,13 @@ class Ui_MainWindow(object):
         self._on_feature_slider_changed(self.feature_slider.value())
         self.right_layout.addWidget(self.advanced_group)
 
-        pipeline_options = [
-            ("feature_weighter", "特征加权"),
-            ("variance_filter", "低方差过滤"),
-            ("scaler", "标准化"),
-            ("deep_features", "深度表征 (AutoEncoder)"),
-            ("gaussianizer", "分位数正态化"),
-            ("rbf_expander", "RBF 特征扩展"),
-        ]
-        self.pipeline_labels = {key: label for key, label in pipeline_options}
-        self.pipeline_group = QtWidgets.QGroupBox("Pipeline 组件")
-        pipeline_layout = QtWidgets.QVBoxLayout(self.pipeline_group)
-        pipeline_layout.setContentsMargins(10, 8, 10, 8)
-        pipeline_layout.setSpacing(4)
-        self.pipeline_checks = {}
-        for key, label in pipeline_options:
-            checkbox = QtWidgets.QCheckBox(label)
-            checkbox.setChecked(True)
-            checkbox.toggled.connect(self._on_pipeline_option_toggled)
-            self.pipeline_checks[key] = checkbox
-            pipeline_layout.addWidget(checkbox)
-        pipeline_layout.addStretch(1)
-        self.right_layout.addWidget(self.pipeline_group)
-
-        self.dashboard = ResultsDashboard()
-        self.right_layout.addWidget(self.dashboard)
-
         self.model_group = QtWidgets.QGroupBox("模型版本管理")
         mg_layout = QtWidgets.QVBoxLayout(self.model_group)
-        mg_layout.setContentsMargins(10, 8, 10, 8)
+        mg_layout.setContentsMargins(12, 8, 12, 12)
         model_row = QtWidgets.QHBoxLayout()
         self.model_combo = QtWidgets.QComboBox()
         self.model_refresh_btn = QtWidgets.QPushButton("刷新")
+        self.model_refresh_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         model_row.addWidget(self.model_combo)
         model_row.addWidget(self.model_refresh_btn)
         mg_layout.addLayout(model_row)
@@ -1098,50 +1298,14 @@ class Ui_MainWindow(object):
 
         self.plugin_group = QtWidgets.QGroupBox("特征插件")
         pg_layout = QtWidgets.QVBoxLayout(self.plugin_group)
-        pg_layout.setContentsMargins(10, 8, 10, 8)
+        pg_layout.setContentsMargins(12, 8, 12, 12)
         self.plugin_label = QtWidgets.QLabel("未发现插件")
         self.plugin_label.setWordWrap(True)
         pg_layout.addWidget(self.plugin_label)
         self.right_layout.addWidget(self.plugin_group)
 
-        self.btn_export_report = QtWidgets.QPushButton("导出 PDF 报告")
-        self.btn_config_editor = QtWidgets.QPushButton("编辑全局配置")
-        self.btn_online_toggle = QtWidgets.QPushButton("开启在线检测")
-        self.online_status_label = QtWidgets.QLabel("在线检测未启动")
-        self.online_status_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.online_status_label.setStyleSheet("QLabel { color:#555; font-size:12px; }")
-        self.right_layout.addWidget(self.btn_export_report)
-        self.right_layout.addWidget(self.btn_config_editor)
-        self.right_layout.addWidget(self.btn_online_toggle)
-        self.right_layout.addWidget(self.online_status_label)
-
-        self.btn_view = QtWidgets.QPushButton("查看流量信息")
-        self.btn_fe = QtWidgets.QPushButton("提取特征")
-        self.btn_vector = QtWidgets.QPushButton("数据预处理")
-        self.btn_train = QtWidgets.QPushButton("训练模型")
-        self.btn_analysis = QtWidgets.QPushButton("运行分析")
-        self.btn_predict = QtWidgets.QPushButton("加载模型预测")
-        self.btn_export = QtWidgets.QPushButton("导出结果（异常）")
-        self.btn_clear = QtWidgets.QPushButton("清空显示")
-        self.btn_open_results = QtWidgets.QPushButton("打开结果目录")
-        self.btn_view_logs = QtWidgets.QPushButton("查看日志")
-
-        for b in [
-            self.btn_view,
-            self.btn_fe,
-            self.btn_vector,
-            self.btn_train,
-            self.btn_analysis,
-            self.btn_predict,
-            self.btn_export,
-            self.btn_open_results,
-            self.btn_view_logs,
-            self.btn_clear,
-        ]:
-            self.right_layout.addWidget(b); self.right_layout.addSpacing(2)
-
         self.right_layout.addStretch(1)
-        self.right_frame.setMinimumWidth(200)
+        self.right_frame.setMinimumWidth(240)
 
     def _update_plugin_summary(self):
         if not hasattr(self, "plugin_label"):
@@ -1369,6 +1533,7 @@ class Ui_MainWindow(object):
         self.btn_pick_file.clicked.connect(self._choose_file)
         self.btn_pick_dir.clicked.connect(self._choose_dir)
         self.btn_browse.clicked.connect(self._browse_compat)
+        self.path_tool_button.clicked.connect(self._browse_compat)
 
         self.btn_prev.clicked.connect(self._on_prev_batch)
         self.btn_next.clicked.connect(self._on_next_batch)
