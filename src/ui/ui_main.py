@@ -50,104 +50,120 @@ def _resolve_data_base() -> Path:
 
 
 APP_STYLE = """
+/* 全局 */
 QWidget {
   background-color: #F5F6FA;
   font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI";
   font-size: 14px;
   color: #1F1F1F;
 }
+
+/* 卡片/分组 */
 QGroupBox {
-  border: 1px solid #E0E3E7;
-  border-radius: 8px;
-  margin-top: 10px;
+  border: 1px solid #E5E7EB;
+  border-radius: 10px;
+  margin-top: 12px;
   background: #FFFFFF;
 }
 QGroupBox::title {
   subcontrol-origin: margin;
-  left: 10px;
+  left: 12px;
   padding: 0 6px;
-  font-weight: bold;
-  color: #333333;
-}
-QTextEdit,
-QTableView,
-QListWidget,
-QPlainTextEdit {
-  background: #FFFFFF;
-  border: 1px solid #E3E6EB;
-  border-radius: 8px;
-}
-QLineEdit,
-QSpinBox,
-QDoubleSpinBox,
-QComboBox {
-  background: #FFFFFF;
-  border: 1px solid #D0D5DC;
-  border-radius: 6px;
-  padding: 6px 8px;
-}
-QLineEdit:focus,
-QSpinBox:focus,
-QDoubleSpinBox:focus,
-QComboBox:focus {
-  border-color: #0078D7;
-}
-QPushButton {
-  background-color: #0078D7;
-  color: #FFFFFF;
-  border-radius: 8px;
-  padding: 8px 16px;
-  min-height: 36px;
   font-weight: 600;
-  border: none;
+  color: #111827;
 }
-QPushButton:hover {
-  background-color: #1084E0;
+
+/* 输入控件 */
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+  background: #FFFFFF;
+  border: 1px solid #D1D5DB;
+  border-radius: 8px;
+  padding: 8px 10px;
 }
-QPushButton:pressed {
-  background-color: #0A65B3;
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+  border: 1px solid #60A5FA;
 }
+
+/* 主按钮（执行类） */
+QPushButton {
+  background-color: #0EA5E9;
+  color: #FFFFFF;
+  border-radius: 10px;
+  padding: 8px 16px;
+  min-height: 38px;
+  border: 0;
+}
+QPushButton:hover { background-color: #38BDF8; }
+QPushButton:pressed { background-color: #0284C7; }
+QPushButton:disabled { background-color: #C7CDD4; color: #F9FAFB; }
+
+/* 次要按钮/分页按钮 */
+QPushButton#secondary {
+  background: #EEF1F6;
+  color: #111827;
+}
+QPushButton#secondary:hover { background: #E5EAF1; }
+QPushButton#secondary:pressed { background: #D9E0EA; }
+
+/* 表格 */
+QHeaderView::section {
+  background: #F3F4F6;
+  border: 1px solid #E5E7EB;
+  padding: 8px;
+  font-weight: 600;
+}
+QTableView {
+  background: #FFFFFF;
+  gridline-color: #E5E7EB;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+}
+
+/* 分隔条 */
+QSplitter::handle {
+  background-color: #E5E7EB;
+  width: 2px;
+}
+
+/* 顶部标题 */
+#pageTitle {
+  font-size: 18px;
+  font-weight: 700;
+  color: #111827;
+  padding: 8px 0 4px 0;
+}
+
+/* 状态栏 */
+QStatusBar {
+  background: #F3F4F6;
+  border-top: 1px solid #E5E7EB;
+  font-size: 12px;
+  color: #6B7280;
+  padding: 4px 8px;
+}
+
+/* 列表/文本区域 */
+QTextEdit, QPlainTextEdit, QListWidget {
+  background: #FFFFFF;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+}
+
+/* 工具按钮 & 滚动区 */
 QToolButton {
   background: transparent;
   border: none;
   padding: 4px;
 }
 QToolButton:hover {
-  background: rgba(0, 120, 215, 0.08);
+  background: rgba(14, 165, 233, 0.1);
   border-radius: 6px;
-}
-QHeaderView::section {
-  background: #F3F5F9;
-  border: 1px solid #E6E9EF;
-  padding: 6px 10px;
-  font-weight: bold;
-}
-QTableView {
-  gridline-color: #E3E6EB;
-  border: 1px solid #E3E6EB;
-  border-radius: 8px;
-  selection-background-color: rgba(0, 120, 215, 0.15);
-}
-QSplitter::handle {
-  background-color: #E8EAED;
-  width: 2px;
 }
 QScrollArea {
   border: none;
 }
-QStatusBar {
-  background: #F3F4F6;
-  border-top: 1px solid #E0E0E0;
-  font-size: 12px;
-  color: #666666;
-  padding: 4px 8px;
-}
-#RightPanelFrame {
-  background-color: #F9FAFB;
-  border-radius: 12px;
-  border: 1px solid #E0E3E7;
-  padding: 8px;
-}
+
+/* 在线状态徽标 */
 #OnlineStatusLabel {
   font-size: 12px;
   color: #5F6368;
@@ -817,8 +833,10 @@ class Ui_MainWindow(object):
 
         self.centralwidget = QtWidgets.QWidget(MainWindow)
         self.main_layout = QtWidgets.QVBoxLayout(self.centralwidget)
-        self.main_layout.setContentsMargins(16, 12, 16, 12)
-        self.main_layout.setSpacing(12)
+        self.main_layout.setContentsMargins(12, 10, 12, 10)
+        self.main_layout.setSpacing(8)
+
+        self.main_layout.addWidget(self._build_page_title())
 
         self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self.centralwidget)
         self.splitter.setChildrenCollapsible(False)
@@ -832,8 +850,8 @@ class Ui_MainWindow(object):
         self.left_container = QtWidgets.QWidget()
         self.left_scroll.setWidget(self.left_container)
         self.left_layout = QtWidgets.QVBoxLayout(self.left_container)
-        self.left_layout.setContentsMargins(12, 12, 12, 12)
-        self.left_layout.setSpacing(16)
+        self.left_layout.setContentsMargins(8, 8, 8, 8)
+        self.left_layout.setSpacing(8)
 
         self._build_path_bar()
         self._build_param_panel()
@@ -845,8 +863,7 @@ class Ui_MainWindow(object):
 
         # 右侧按钮列
         self._build_right_panel()
-        self.splitter.addWidget(self.right_frame)
-        self.splitter.setStretchFactor(0, 7)
+        self.splitter.setStretchFactor(0, 8)
         self.splitter.setStretchFactor(1, 3)
 
         MainWindow.setCentralWidget(self.centralwidget)
@@ -893,6 +910,19 @@ class Ui_MainWindow(object):
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
 
     # --------- UI 子构建 ----------
+    def _build_page_title(self) -> QtWidgets.QWidget:
+        wrap = QtWidgets.QWidget(self.centralwidget)
+        lay = QtWidgets.QHBoxLayout(wrap)
+        lay.setContentsMargins(8, 4, 8, 0)
+        lay.setSpacing(0)
+
+        title = QtWidgets.QLabel("恶意流量检测系统 — 主功能页面")
+        title.setObjectName("pageTitle")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+
+        lay.addWidget(title)
+        return wrap
+
     def _build_path_bar(self):
         self.file_group = QtWidgets.QGroupBox("数据源选择")
         fg = QtWidgets.QVBoxLayout(self.file_group)
@@ -978,7 +1008,10 @@ class Ui_MainWindow(object):
         nav_layout.addWidget(self.btn_prev, 1)
         nav_layout.addWidget(self.btn_next, 1)
 
-        pg.addRow("查看模式", self.mode_combo)
+        for btn in (self.btn_prev, self.btn_next):
+            btn.setObjectName("secondary")
+
+        pg.addRow("处理模式：", self.mode_combo)
         pg.addRow("批处理数量", self.batch_spin)
         pg.addRow("起始索引", self.start_spin)
         pg.addRow("并发数", self.workers_spin)
@@ -1037,6 +1070,7 @@ class Ui_MainWindow(object):
 
         for btn in (self.btn_page_prev, self.btn_page_next, self.btn_show_all):
             btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+            btn.setObjectName("secondary")
 
         hb.addWidget(self.btn_page_prev); hb.addWidget(self.btn_page_next)
         hb.addSpacing(8); hb.addWidget(self.page_info); hb.addStretch(1)
@@ -1132,11 +1166,17 @@ class Ui_MainWindow(object):
             label.setText(base)
 
     def _build_right_panel(self):
-        self.right_frame = QtWidgets.QFrame(self.centralwidget)
+        self.right_scroll = QtWidgets.QScrollArea(self.centralwidget)
+        self.right_scroll.setWidgetResizable(True)
+        self.right_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+        self.right_frame = QtWidgets.QFrame()
         self.right_frame.setObjectName("RightPanelFrame")
+        self.right_scroll.setWidget(self.right_frame)
+
         self.right_layout = QtWidgets.QVBoxLayout(self.right_frame)
-        self.right_layout.setContentsMargins(12, 12, 12, 12)
-        self.right_layout.setSpacing(16)
+        self.right_layout.setContentsMargins(8, 8, 8, 8)
+        self.right_layout.setSpacing(10)
 
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
         self.btn_fe = QtWidgets.QPushButton("提取特征")
@@ -1306,6 +1346,8 @@ class Ui_MainWindow(object):
 
         self.right_layout.addStretch(1)
         self.right_frame.setMinimumWidth(240)
+
+        self.splitter.addWidget(self.right_scroll)
 
     def _update_plugin_summary(self):
         if not hasattr(self, "plugin_label"):
@@ -3492,6 +3534,15 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main() -> int:
     """启动 Qt 应用并展示主窗口。"""
+    try:
+        QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling)
+        QtCore.QCoreApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps)
+        policy = getattr(QtCore.Qt, "HighDpiScaleFactorRoundingPolicy", None)
+        if policy:
+            QtWidgets.QApplication.setHighDpiScaleFactorRoundingPolicy(policy.PassThrough)
+    except Exception:
+        pass
+
     app = QtWidgets.QApplication.instance()
     if app is None:
         app = QtWidgets.QApplication(sys.argv)
@@ -3500,7 +3551,7 @@ def main() -> int:
         owns_app = False
 
     window = MainWindow()
-    window.show()
+    window.showMaximized()
 
     if owns_app:
         return app.exec_()
