@@ -125,14 +125,6 @@ QSplitter::handle {
   width: 2px;
 }
 
-/* 顶部标题 */
-#pageTitle {
-  font-size: 18px;
-  font-weight: 700;
-  color: #111827;
-  padding: 8px 0 4px 0;
-}
-
 /* 状态栏 */
 QStatusBar {
   background: #F3F4F6;
@@ -828,20 +820,46 @@ class Ui_MainWindow(object):
     # --------- 基本结构 ----------
     def setupUi(self, MainWindow):
         MainWindow.setObjectName("MainWindow")
-        MainWindow.resize(1100, 680)
+        MainWindow.resize(1400, 800)
         MainWindow.setStyleSheet(APP_STYLE)
 
         self.centralwidget = QtWidgets.QWidget(MainWindow)
         self.main_layout = QtWidgets.QVBoxLayout(self.centralwidget)
-        self.main_layout.setContentsMargins(12, 10, 12, 10)
-        self.main_layout.setSpacing(8)
+        self.main_layout.setContentsMargins(0, 0, 0, 0)
+        self.main_layout.setSpacing(0)
 
-        self.main_layout.addWidget(self._build_page_title())
+        title_bar = QtWidgets.QWidget(self.centralwidget)
+        title_bar.setStyleSheet(
+            "background-color: #F5F6FA;\n"
+            "border-bottom: 1px solid #E5E7EB;"
+        )
+        title_layout = QtWidgets.QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(0, 10, 0, 10)
+        title_layout.setSpacing(0)
+        title_label = QtWidgets.QLabel("恶意流量检测系统 — 主功能页面", title_bar)
+        title_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
+        )
+        title_label.setAlignment(QtCore.Qt.AlignCenter)
+        title_label.setStyleSheet(
+            'font-family: "Microsoft YaHei UI";\n'
+            "font-size: 18px;\n"
+            "font-weight: bold;\n"
+            "color: #111827;"
+        )
+        title_layout.addWidget(title_label)
+        self.main_layout.addWidget(title_bar)
 
-        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self.centralwidget)
+        self.content_area = QtWidgets.QWidget(self.centralwidget)
+        self.content_layout = QtWidgets.QVBoxLayout(self.content_area)
+        self.content_layout.setContentsMargins(12, 10, 12, 10)
+        self.content_layout.setSpacing(8)
+        self.main_layout.addWidget(self.content_area)
+
+        self.splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal, self.content_area)
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setHandleWidth(2)
-        self.main_layout.addWidget(self.splitter)
+        self.content_layout.addWidget(self.splitter)
 
         # 左侧滚动区
         self.left_scroll = QtWidgets.QScrollArea()
@@ -908,20 +926,6 @@ class Ui_MainWindow(object):
 
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
-
-    # --------- UI 子构建 ----------
-    def _build_page_title(self) -> QtWidgets.QWidget:
-        wrap = QtWidgets.QWidget(self.centralwidget)
-        lay = QtWidgets.QHBoxLayout(wrap)
-        lay.setContentsMargins(8, 4, 8, 0)
-        lay.setSpacing(0)
-
-        title = QtWidgets.QLabel("恶意流量检测系统 — 主功能页面")
-        title.setObjectName("pageTitle")
-        title.setAlignment(QtCore.Qt.AlignCenter)
-
-        lay.addWidget(title)
-        return wrap
 
     def _build_path_bar(self):
         self.file_group = QtWidgets.QGroupBox("数据源选择")
