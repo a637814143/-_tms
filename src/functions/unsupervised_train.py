@@ -156,11 +156,13 @@ ANOMALY_TOKENS = {
 }
 
 
-AUTO_REDUCTION_MAX_COLUMNS = 120_000
+AUTO_REDUCTION_MAX_COLUMNS = 65_536
 AUTO_REDUCTION_MIN_COLUMNS = 4_096
 AUTO_REDUCTION_MAX_MEMORY = 2_000_000_000  # ~1.86 GiB
 AUTO_REDUCTION_CHUNK_SIZE = 512
 AUTO_DOWNCAST_MEMORY = 1_000_000_000  # ~0.93 GiB
+AUTO_FORCE_FLOAT32_COLUMNS = 8_192
+AUTO_NUMERIC_BYTES_PER_VALUE = 8  # assume float64 worst-case during sklearn ops
 
 
 def _build_token_variants(tokens: set[str]) -> set[str]:
@@ -208,23 +210,41 @@ def _auto_reduce_high_dimensional_data(
         return df, feature_columns, None
 
     approx_bytes = _estimate_dataframe_bytes(df)
+    rows = max(1, len(df))
+    approx_matrix_bytes = int(rows * max(1, total_columns) * AUTO_NUMERIC_BYTES_PER_VALUE)
+
     target_columns = min(max_columns, total_columns)
     reasons: List[str] = []
 
     if total_columns > max_columns:
         reasons.append("column_limit")
 
-    rows = max(1, len(df))
+    aspect_limit = max(min_columns, min(total_columns, rows * 64))
+    if total_columns > aspect_limit:
+        target_columns = min(target_columns, aspect_limit)
+        reasons.append("aspect_ratio_limit")
+
     allowed_by_memory = total_columns
-    if approx_bytes > max_memory_bytes:
+    approx_allowed_raw = max_memory_bytes // max(1, rows * AUTO_NUMERIC_BYTES_PER_VALUE)
+    approx_allowed = max(1, min(total_columns, int(approx_allowed_raw)))
+    if approx_bytes > max_memory_bytes or approx_matrix_bytes > max_memory_bytes:
         reasons.append("memory_limit")
-        allowed_by_memory = int(max_memory_bytes / (rows * 4))
-        allowed_by_memory = max(min_columns, min(total_columns, allowed_by_memory))
+        allowed_by_memory = approx_allowed
+    else:
+        allowed_by_memory = min(allowed_by_memory, approx_allowed)
+
     if allowed_by_memory < total_columns:
         target_columns = min(target_columns, allowed_by_memory)
 
-    target_columns = max(min_columns, target_columns)
     target_columns = min(total_columns, target_columns)
+    if (
+        target_columns < min_columns
+        and total_columns >= min_columns
+        and allowed_by_memory >= min_columns
+    ):
+        target_columns = min_columns
+    target_columns = max(1, target_columns)
+    reasons = list(dict.fromkeys(reasons))
 
     if target_columns >= total_columns:
         info = {
@@ -233,6 +253,8 @@ def _auto_reduce_high_dimensional_data(
             "dropped_features": 0,
             "estimated_memory_before": int(approx_bytes),
             "estimated_memory_after": int(approx_bytes),
+            "estimated_matrix_memory_before": int(approx_matrix_bytes),
+            "estimated_matrix_memory_after": int(approx_matrix_bytes),
             "reasons": reasons or ["no_reduction"],
         }
         return df, feature_columns, info if reasons else None
@@ -275,14 +297,18 @@ def _auto_reduce_high_dimensional_data(
         ordered_keep = column_order[:target_columns]
         dropped = total_columns - len(ordered_keep)
 
+    ordered_keep = ordered_keep[:target_columns]
     reduced_df = df.loc[:, ordered_keep].copy()
-    approx_after = len(reduced_df.columns) * rows * 4
+    approx_df_after = _estimate_dataframe_bytes(reduced_df)
+    approx_after = len(reduced_df.columns) * rows * AUTO_NUMERIC_BYTES_PER_VALUE
     info = {
         "original_features": int(total_columns),
         "kept_features": int(len(ordered_keep)),
         "dropped_features": int(dropped),
         "estimated_memory_before": int(approx_bytes),
-        "estimated_memory_after": int(approx_after),
+        "estimated_memory_after": int(approx_df_after),
+        "estimated_matrix_memory_before": int(approx_matrix_bytes),
+        "estimated_matrix_memory_after": int(approx_after),
         "reasons": reasons or ["column_limit"],
         "selection_strategy": "variance_coverage",
     }
@@ -864,22 +890,37 @@ def _train_from_dataframe(
     require_numeric_cast = any(
         not is_numeric_dtype(feature_df_numeric[col]) for col in feature_columns
     )
+    force_downcast = len(feature_columns) >= AUTO_FORCE_FLOAT32_COLUMNS
     need_downcast = approx_numeric_bytes > AUTO_DOWNCAST_MEMORY
-    if require_numeric_cast or need_downcast:
+    downcast_reason: Optional[str] = None
+    if need_downcast:
+        downcast_reason = "memory"
+    elif force_downcast:
+        downcast_reason = "feature_width"
+    if require_numeric_cast or need_downcast or force_downcast:
         feature_df_numeric = _coerce_numeric_dataframe(
             feature_df_numeric,
             feature_columns,
-            downcast=need_downcast,
+            downcast=need_downcast or force_downcast,
         )
         approx_numeric_bytes = _estimate_dataframe_bytes(feature_df_numeric)
-        if need_downcast:
+        if downcast_reason:
             logger.info(
-                "Downcasting feature matrix to float32: %.2f GiB -> %.2f GiB",
+                "Downcasting feature matrix to float32 due to %s: %.2f GiB -> %.2f GiB",
+                downcast_reason,
                 approx_before_cast / (1024 ** 3),
                 approx_numeric_bytes / (1024 ** 3),
             )
+    applied_downcast = bool(need_downcast or force_downcast)
     if reduction_info:
         reduction_info["estimated_memory_after"] = int(approx_numeric_bytes)
+        dtype_size = 4 if applied_downcast else AUTO_NUMERIC_BYTES_PER_VALUE
+        reduction_info["estimated_matrix_memory_after"] = int(
+            len(feature_columns) * len(feature_df_numeric) * dtype_size
+        )
+        reduction_info["downcast_applied"] = bool(applied_downcast)
+        if downcast_reason:
+            reduction_info["downcast_reason"] = downcast_reason
 
     categorical_fill_defaults = {key: -1 for key in categorical_maps_clean.keys()}
     column_fill_values = dict(categorical_fill_defaults)
@@ -931,9 +972,17 @@ def _train_from_dataframe(
     data_quality_report: Dict[str, object] = {}
     if reduction_info:
         data_quality_report["dimension_reduction"] = reduction_info
+    estimated_matrix_bytes = int(
+        len(feature_df_numeric) * len(feature_columns) * (
+            4 if applied_downcast else AUTO_NUMERIC_BYTES_PER_VALUE
+        )
+    )
     data_quality_report["memory_usage_bytes"] = int(approx_numeric_bytes)
     data_quality_report["memory_usage_bytes_before_cast"] = int(approx_before_cast)
-    data_quality_report["downcast_to_float32"] = bool(need_downcast)
+    data_quality_report["numeric_matrix_bytes_estimate"] = estimated_matrix_bytes
+    data_quality_report["downcast_to_float32"] = bool(applied_downcast)
+    if downcast_reason:
+        data_quality_report["downcast_reason"] = downcast_reason
     data_quality_report["forced_numeric_cast"] = bool(require_numeric_cast)
     empty_columns = [
         col
@@ -990,6 +1039,20 @@ def _train_from_dataframe(
         used_components = int(rbf_components)
     else:
         used_components = auto_components
+    if base_dim >= 32_768 and used_components > 768:
+        logger.info(
+            "Reducing RBF components due to extremely wide feature matrix: %d -> %d",
+            used_components,
+            768,
+        )
+        used_components = 768
+    elif base_dim >= 16_384 and used_components > 1_024:
+        logger.info(
+            "Reducing RBF components due to wide feature matrix: %d -> %d",
+            used_components,
+            1_024,
+        )
+        used_components = 1_024
     auto_gamma = float(np.clip(1.0 / np.sqrt(float(base_dim)), 0.05, 0.5))
     gamma_source = "manual" if rbf_gamma and rbf_gamma > 0 else "auto"
     used_gamma = float(rbf_gamma) if gamma_source == "manual" else auto_gamma
@@ -1027,6 +1090,28 @@ def _train_from_dataframe(
                 pipeline_components_config[key] = bool(enabled)
     pipeline_components_config["aligner"] = True
     pipeline_components_config["preprocessor"] = True
+
+    wide_feature_count = len(feature_columns)
+    if wide_feature_count >= 16_384:
+        if pipeline_components_config.get("gaussianizer"):
+            pipeline_components_config["gaussianizer"] = False
+            logger.info(
+                "Skipping quantile transformer: feature matrix is extremely wide (%d columns).",
+                wide_feature_count,
+            )
+    if wide_feature_count >= 32_768:
+        if pipeline_components_config.get("scaler"):
+            pipeline_components_config["scaler"] = False
+            logger.info(
+                "Skipping standard scaler: feature matrix is extremely wide (%d columns).",
+                wide_feature_count,
+            )
+        if pipeline_components_config.get("deep_features"):
+            pipeline_components_config["deep_features"] = False
+            logger.info(
+                "Skipping deep autoencoder features: feature matrix is extremely wide (%d columns).",
+                wide_feature_count,
+            )
 
     feature_weighter = FeatureWeighter(feature_weights or {})
     deep_latent_dim = int(np.clip(len(feature_columns) // 2, 8, 128))
