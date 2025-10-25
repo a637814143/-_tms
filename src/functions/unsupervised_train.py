@@ -321,6 +321,74 @@ def _auto_reduce_high_dimensional_data(
     return reduced_df, ordered_keep, info
 
 
+def _variance_screen_features(
+    df: pd.DataFrame,
+    feature_columns: List[str],
+    *,
+    max_features: int = 5000,
+    variance_threshold: Optional[float] = 1e-6,
+) -> tuple[pd.DataFrame, List[str], Optional[Dict[str, object]]]:
+    """Apply low-variance filtering and variance top-k selection.
+
+    The function operates purely on the numeric feature frame so it should be
+    invoked right after拼接/对齐完成，以避免在后续步骤中处理超宽矩阵。
+    """
+
+    if not feature_columns:
+        return df, feature_columns, None
+
+    numeric_df = df.loc[:, feature_columns]
+    try:
+        numeric_df = numeric_df.apply(pd.to_numeric, errors="coerce")
+    except Exception:
+        numeric_df = numeric_df.copy()
+    numeric_df = numeric_df.astype(np.float32, copy=False)
+
+    info: Dict[str, object] = {
+        "original_features": int(len(feature_columns)),
+    }
+    changed = False
+    working_columns = list(feature_columns)
+    matrix = numeric_df.to_numpy(dtype=np.float32, copy=False)
+
+    if variance_threshold is not None and matrix.size:
+        try:
+            selector = VarianceThreshold(threshold=float(variance_threshold))
+            matrix = selector.fit_transform(matrix)
+            support = selector.get_support()
+        except Exception:
+            support = np.ones(len(working_columns), dtype=bool)
+        if support.size and not support.all():
+            kept = [col for col, keep in zip(working_columns, support) if keep]
+            dropped = int(len(working_columns) - len(kept))
+            working_columns = kept
+            numeric_df = numeric_df.loc[:, working_columns]
+            matrix = matrix.astype(np.float32, copy=False)
+            info["variance_threshold"] = float(variance_threshold)
+            info["dropped_low_variance"] = dropped
+            changed = True
+        elif not support.size:
+            matrix = numeric_df.to_numpy(dtype=np.float32, copy=False)
+
+    if working_columns and len(working_columns) > max_features:
+        variance_scores = np.var(matrix, axis=0)
+        order = np.argsort(variance_scores)
+        keep_idx = order[-max_features:]
+        keep_idx.sort()
+        before = len(working_columns)
+        working_columns = [working_columns[idx] for idx in keep_idx]
+        numeric_df = numeric_df.loc[:, working_columns]
+        matrix = matrix[:, keep_idx]
+        info["top_variance_max_features"] = int(max_features)
+        info["dropped_top_variance"] = int(before - len(working_columns))
+        changed = True
+
+    info["kept_features"] = int(len(working_columns))
+    if not changed:
+        return numeric_df, working_columns, None
+    return numeric_df, working_columns, info
+
+
 def _coerce_numeric_dataframe(
     df: pd.DataFrame,
     columns: Optional[List[str]] = None,
@@ -871,6 +939,12 @@ def _train_from_dataframe(
         else {}
     )
     feature_df_numeric = feature_df.loc[:, feature_columns].copy()
+    try:
+        feature_df_numeric = feature_df_numeric.apply(pd.to_numeric, errors="coerce")
+    except Exception:
+        feature_df_numeric = feature_df_numeric.copy()
+    feature_df_numeric = feature_df_numeric.astype(np.float32, copy=False)
+
     reduction_info: Optional[Dict[str, object]] = None
     (
         feature_df_numeric,
@@ -878,6 +952,33 @@ def _train_from_dataframe(
         reduction_info,
     ) = _auto_reduce_high_dimensional_data(feature_df_numeric, feature_columns)
     if reduction_info and reduction_info.get("dropped_features", 0) > 0:
+        fill_values_clean = {
+            key: val for key, val in fill_values_clean.items() if key in feature_columns
+        }
+        categorical_maps_clean = {
+            key: val for key, val in categorical_maps_clean.items() if key in feature_columns
+        }
+
+    variance_screen_info: Optional[Dict[str, object]] = None
+    (
+        feature_df_numeric,
+        feature_columns,
+        variance_screen_info,
+    ) = _variance_screen_features(
+        feature_df_numeric,
+        feature_columns,
+        max_features=5000,
+        variance_threshold=1e-6,
+    )
+    if variance_screen_info:
+        if reduction_info:
+            reduction_info.setdefault("extra_filters", []).append(variance_screen_info)
+        else:
+            reduction_info = {
+                "original_features": variance_screen_info.get("original_features", len(feature_columns)),
+                "kept_features": variance_screen_info.get("kept_features", len(feature_columns)),
+                "extra_filters": [variance_screen_info],
+            }
         fill_values_clean = {
             key: val for key, val in fill_values_clean.items() if key in feature_columns
         }
@@ -1083,6 +1184,7 @@ def _train_from_dataframe(
         "deep_features": True,
         "gaussianizer": True,
         "rbf_expander": True,
+        "svd_reducer": False,
     }
     if pipeline_components:
         for key, enabled in pipeline_components.items():
@@ -1092,6 +1194,35 @@ def _train_from_dataframe(
     pipeline_components_config["preprocessor"] = True
 
     wide_feature_count = len(feature_columns)
+    svd_components = 0
+    svd_step: Optional[TruncatedSVD] = None
+    if wide_feature_count >= 4_096:
+        sample_rows = min(len(feature_df_numeric), 2_000)
+        sample_cols = min(wide_feature_count, 2_000)
+        sample_view = feature_df_numeric.iloc[:sample_rows, :sample_cols].to_numpy(
+            dtype=np.float32,
+            copy=False,
+        )
+        zero_ratio = 0.0
+        if sample_view.size:
+            zero_ratio = float(np.count_nonzero(sample_view == 0.0)) / float(sample_view.size)
+        if zero_ratio >= 0.85:
+            pipeline_components_config["gaussianizer"] = False
+            pipeline_components_config["scaler"] = False
+            logger.info(
+                "Detected extremely sparse wide matrix (cols=%d zero_ratio=%.2f), disabling scaler/quantile.",
+                wide_feature_count,
+                zero_ratio,
+            )
+        svd_components = min(512, max(64, wide_feature_count // 4))
+        if svd_components >= 2:
+            pipeline_components_config["svd_reducer"] = True
+            svd_step = TruncatedSVD(n_components=svd_components, random_state=42)
+            logger.info(
+                "Applying TruncatedSVD before detector to compress wide feature space: components=%d",
+                svd_components,
+            )
+
     if wide_feature_count >= 16_384:
         if pipeline_components_config.get("gaussianizer"):
             pipeline_components_config["gaussianizer"] = False
@@ -1162,6 +1293,8 @@ def _train_from_dataframe(
         pipeline_steps.append(("gaussianizer", gaussianizer_step))
     if feature_expander_step is not None:
         pipeline_steps.append(("feature_expander", feature_expander_step))
+    if pipeline_components_config.get("svd_reducer") and svd_step is not None:
+        pipeline_steps.append(("svd_reducer", svd_step))
     pipeline_steps.append(("detector", detector))
 
     pipeline = Pipeline(pipeline_steps)
@@ -1172,13 +1305,14 @@ def _train_from_dataframe(
         if enabled and name not in {"aligner", "preprocessor"}
     ]
     logger.info(
-        "Starting unsupervised training: rows=%d features=%d contamination=%.4f (adaptive=%.4f) rbf_components=%d rbf_gamma=%.3f [%s] pipeline_steps=%s",
+        "Starting unsupervised training: rows=%d features=%d contamination=%.4f (adaptive=%.4f) rbf_components=%d rbf_gamma=%.3f svd_components=%d [%s] pipeline_steps=%s",
         len(feature_df_numeric),
         len(feature_columns),
         contamination,
         adaptive_contamination,
         used_components,
         used_gamma,
+        svd_components,
         gamma_source,
         ",".join(enabled_optional_steps) if enabled_optional_steps else "aligner,preprocessor",
     )
