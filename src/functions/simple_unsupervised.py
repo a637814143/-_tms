@@ -19,11 +19,15 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from src.functions.logging_utils import get_logger, log_training_run
 
 logger = get_logger(__name__)
+
+
+SIMPLE_MAX_FEATURES = 4_096
+SIMPLE_VARIANCE_SAMPLE_ROWS = 512
 
 
 @dataclass
@@ -50,7 +54,9 @@ class _SimpleModel:
         return -total
 
 
-def _read_numeric_csv(path: str) -> Tuple[List[str], List[List[float]]]:
+def _read_csv_structure(path: str) -> Tuple[List[str], List[int]]:
+    """Return the sanitised column names and indices used for extraction."""
+
     with open(path, "r", encoding="utf-8") as handle:
         reader = csv.reader(handle)
         try:
@@ -58,32 +64,117 @@ def _read_numeric_csv(path: str) -> Tuple[List[str], List[List[float]]]:
         except StopIteration as exc:  # pragma: no cover - defensive
             raise RuntimeError("训练数据为空。") from exc
 
-        columns = [name.strip() for name in header if name.strip()]
-        if not columns:
-            raise RuntimeError("未发现可用于训练的特征列。")
+    columns: List[str] = []
+    indices: List[int] = []
+    for idx, raw in enumerate(header):
+        name = raw.strip()
+        if not name:
+            continue
+        columns.append(name)
+        indices.append(idx)
 
-        rows: List[List[float]] = []
+    if not columns:
+        raise RuntimeError("未发现可用于训练的特征列。")
+
+    return columns, indices
+
+
+def _iter_numeric_rows(
+    path: str,
+    *,
+    source_indices: Sequence[int],
+    limit: Optional[int] = None,
+) -> Iterator[List[float]]:
+    """Yield numeric rows using the provided source column indices."""
+
+    if not source_indices:
+        raise RuntimeError("未发现可用于训练的特征列。")
+
+    max_required = max(source_indices)
+    emitted = 0
+    with open(path, "r", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        next(reader, None)
         for line_no, row in enumerate(reader, start=2):
-            if len(row) < len(columns):
+            if limit is not None and emitted >= limit:
+                break
+            if len(row) <= max_required:
                 logger.debug("Skipping row %d with insufficient columns", line_no)
                 continue
+            numeric: List[float] = []
             try:
-                numeric = [float(cell) for cell in row[: len(columns)]]
+                for idx in source_indices:
+                    value = float(row[idx])
+                    if not math.isfinite(value):
+                        value = 0.0
+                    numeric.append(value)
             except ValueError:
                 logger.debug("Skipping non-numeric row %d", line_no)
                 continue
-            rows.append(numeric)
+            emitted += 1
+            yield numeric
 
-    if not rows:
+
+def _select_feature_indices(
+    path: str,
+    columns: Sequence[str],
+    base_indices: Sequence[int],
+) -> Tuple[List[int], Optional[Dict[str, object]]]:
+    total_columns = len(columns)
+    if total_columns <= SIMPLE_MAX_FEATURES:
+        return list(range(total_columns)), None
+
+    sample_count = 0
+    coverage = [0] * total_columns
+    nonzero = [0] * total_columns
+    means = [0.0] * total_columns
+    m2 = [0.0] * total_columns
+
+    for row in _iter_numeric_rows(
+        path,
+        source_indices=base_indices,
+        limit=SIMPLE_VARIANCE_SAMPLE_ROWS,
+    ):
+        sample_count += 1
+        for idx, value in enumerate(row):
+            coverage[idx] += 1
+            if abs(value) > 1e-12:
+                nonzero[idx] += 1
+            delta = value - means[idx]
+            means[idx] += delta / coverage[idx]
+            delta2 = value - means[idx]
+            m2[idx] += delta * delta2
+
+    if sample_count == 0:
         raise RuntimeError("训练数据为空，无法继续。")
 
-    if len(rows) < 10:
-        logger.warning(
-            "检测到样本量仅 %d 条，建议至少提供 10 条记录以获得稳定阈值。继续训练以便调试。",
-            len(rows),
-        )
+    scores = []
+    for idx in range(total_columns):
+        variance = m2[idx] / max(coverage[idx], 1)
+        variance = max(variance, 0.0)
+        coverage_ratio = coverage[idx] / sample_count
+        nonzero_ratio = nonzero[idx] / sample_count
+        score = variance * (0.2 + 0.5 * coverage_ratio + 0.3 * nonzero_ratio)
+        scores.append((idx, score))
 
-    return columns, rows
+    scores.sort(key=lambda item: item[1], reverse=True)
+    keep_positions = {idx for idx, _ in scores[:SIMPLE_MAX_FEATURES]}
+    ordered_positions = [idx for idx in range(total_columns) if idx in keep_positions]
+    if not ordered_positions:
+        ordered_positions = list(range(min(SIMPLE_MAX_FEATURES, total_columns)))
+
+    logger.warning(
+        "检测到特征列数为 %d，超出回退模型的安全范围，将自动保留前 %d 列以降低内存消耗。",
+        total_columns,
+        len(ordered_positions),
+    )
+
+    info = {
+        "original_features": total_columns,
+        "kept_features": len(ordered_positions),
+        "dropped_features": total_columns - len(ordered_positions),
+    }
+    return ordered_positions, info
 
 
 def _population_mean(values: Iterable[float]) -> float:
@@ -127,6 +218,38 @@ def _dump_json(path: str, payload: Dict[str, object]) -> None:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
+def _stream_export_results(
+    output_path: str,
+    columns: Sequence[str],
+    row_iter: Iterator[List[float]],
+    scores: Sequence[float],
+    votes: Sequence[float],
+    risk: Sequence[float],
+    predictions: Sequence[int],
+) -> None:
+    header = list(columns) + [
+        "anomaly_score",
+        "vote_ratio",
+        "risk_score",
+        "prediction",
+        "is_malicious",
+    ]
+    with open(output_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        for row, score, vote, rk, pred in zip(row_iter, scores, votes, risk, predictions):
+            writer.writerow(
+                list(row)
+                + [
+                    f"{score:.6f}",
+                    f"{vote:.6f}",
+                    f"{rk:.6f}",
+                    pred,
+                    1 if pred == -1 else 0,
+                ]
+            )
+
+
 def compute_risk_components(
     scores: Sequence[float],
     vote_ratio: Sequence[float],
@@ -160,24 +283,7 @@ def _export_results(
     risk: Sequence[float],
     predictions: Sequence[int],
 ) -> None:
-    header = list(columns) + [
-        "anomaly_score",
-        "vote_ratio",
-        "risk_score",
-        "prediction",
-        "is_malicious",
-    ]
-    with open(output_path, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(header)
-        for row, score, vote, rk, pred in zip(rows, scores, votes, risk, predictions):
-            writer.writerow(list(row) + [
-                f"{score:.6f}",
-                f"{vote:.6f}",
-                f"{rk:.6f}",
-                pred,
-                1 if pred == -1 else 0,
-            ])
+    _stream_export_results(output_path, columns, iter(rows), scores, votes, risk, predictions)
 
 
 def _resolve_dataset_path(split_dir: str) -> str:
@@ -208,21 +314,51 @@ def train_unsupervised_on_split(
     dataset_path = _resolve_dataset_path(split_dir)
     _ensure_dirs(results_dir, models_dir)
 
-    columns, rows = _read_numeric_csv(dataset_path)
-    column_values = list(zip(*rows))
+    columns, base_indices = _read_csv_structure(dataset_path)
+    keep_positions, reduction_info = _select_feature_indices(dataset_path, columns, base_indices)
+    selected_columns = [columns[idx] for idx in keep_positions]
+    selected_indices = [base_indices[idx] for idx in keep_positions]
 
-    means = {name: _population_mean(vals) for name, vals in zip(columns, column_values)}
-    stds = {name: _population_std(vals, means[name]) for name, vals in zip(columns, column_values)}
+    feature_count = len(selected_columns)
+    means_arr = [0.0] * feature_count
+    m2_arr = [0.0] * feature_count
+    sample_count = 0
+    for row in _iter_numeric_rows(dataset_path, source_indices=selected_indices, limit=None):
+        sample_count += 1
+        for idx, value in enumerate(row):
+            delta = value - means_arr[idx]
+            means_arr[idx] += delta / sample_count
+            delta2 = value - means_arr[idx]
+            m2_arr[idx] += delta * delta2
+
+    if sample_count == 0:
+        raise RuntimeError("训练数据为空，无法继续。")
+
+    if sample_count < 10:
+        logger.warning(
+            "检测到样本量仅 %d 条，建议至少提供 10 条记录以获得稳定阈值。继续训练以便调试。",
+            sample_count,
+        )
+
+    stds_arr = []
+    for idx in range(feature_count):
+        variance = m2_arr[idx] / max(sample_count, 1)
+        stds_arr.append(math.sqrt(variance) if variance > 0 else 1.0)
+
+    means_map = {name: means_arr[idx] for idx, name in enumerate(selected_columns)}
+    stds_map = {name: stds_arr[idx] for idx, name in enumerate(selected_columns)}
 
     model = _SimpleModel(
-        columns=list(columns),
-        means=means,
-        stds=stds,
+        columns=list(selected_columns),
+        means=means_map,
+        stds=stds_map,
         threshold=0.0,
         contamination=float(min(max(contamination, 0.001), 0.4)),
     )
 
-    scores = [model.score_row(row) for row in rows]
+    scores: List[float] = []
+    for row in _iter_numeric_rows(dataset_path, source_indices=selected_indices, limit=None):
+        scores.append(model.score_row(row))
     threshold = _quantile(scores, model.contamination)
     model.threshold = threshold
     score_std = _population_std(scores)
@@ -238,20 +374,31 @@ def train_unsupervised_on_split(
     metadata_path = os.path.join(results_dir, f"{base_name}_metadata.json")
     model_path = os.path.join(models_dir, f"{base_name}_model.json")
 
-    _export_results(results_csv, columns, rows, scores, votes, risk, predictions)
+    export_rows = _iter_numeric_rows(dataset_path, source_indices=selected_indices, limit=None)
+    _stream_export_results(
+        results_csv,
+        selected_columns,
+        export_rows,
+        scores,
+        votes,
+        risk,
+        predictions,
+    )
 
     metadata = {
         "type": "simple_zscore",
-        "columns": columns,
-        "means": means,
-        "stds": stds,
+        "columns": selected_columns,
+        "means": means_map,
+        "stds": stds_map,
         "threshold": threshold,
         "vote_threshold": model.vote_threshold,
         "score_std": score_std,
         "contamination": model.contamination,
-        "samples": len(rows),
+        "samples": sample_count,
         "anomaly_count": int(sum(1 for pred in predictions if pred == -1)),
     }
+    if reduction_info:
+        metadata["feature_reduction"] = reduction_info
     _dump_json(metadata_path, metadata)
     _dump_json(model_path, metadata)
 
@@ -259,8 +406,8 @@ def train_unsupervised_on_split(
         {
             "strategy": "simple_zscore",
             "dataset": dataset_path,
-            "samples": len(rows),
-            "features": len(columns),
+            "samples": sample_count,
+            "features": len(selected_columns),
             "contamination": model.contamination,
         }
     )
@@ -272,7 +419,7 @@ def train_unsupervised_on_split(
         "results_csv": results_csv,
         "metadata_path": metadata_path,
         "pipeline_path": model_path,
-        "packets": len(rows),
+        "packets": sample_count,
         "score_component": score_component,
         "vote_component": vote_component,
     }
@@ -298,15 +445,20 @@ def simple_predict(
     *,
     output_path: Optional[str] = None,
 ) -> Tuple[str, Dict[str, object]]:
-    columns, rows = _read_numeric_csv(feature_csv)
-    missing = [name for name in model.columns if name not in columns]
+    file_columns, base_indices = _read_csv_structure(feature_csv)
+    index_map = {name: idx for name, idx in zip(file_columns, base_indices)}
+    missing = [name for name in model.columns if name not in index_map]
     if missing:
         raise RuntimeError("特征 CSV 缺少训练时的列: " + ", ".join(missing))
 
-    column_indices = [columns.index(name) for name in model.columns]
-    aligned_rows = [[row[idx] for idx in column_indices] for row in rows]
+    selected_indices = [index_map[name] for name in model.columns]
 
-    scores = [model.score_row(row) for row in aligned_rows]
+    scores: List[float] = []
+    for row in _iter_numeric_rows(feature_csv, source_indices=selected_indices, limit=None):
+        scores.append(model.score_row(row))
+
+    if not scores:
+        raise RuntimeError("特征 CSV 为空，无法预测。")
     predictions = [-1 if score <= model.threshold else 1 for score in scores]
     votes = [1.0 if pred == -1 else 0.0 for pred in predictions]
     score_std = _population_std(scores)
@@ -318,7 +470,16 @@ def simple_predict(
         base = os.path.splitext(feature_csv)[0]
         output_path = f"{base}_predictions.csv"
 
-    _export_results(output_path, model.columns, aligned_rows, scores, votes, risk, predictions)
+    export_iter = _iter_numeric_rows(feature_csv, source_indices=selected_indices, limit=None)
+    _stream_export_results(
+        output_path,
+        model.columns,
+        export_iter,
+        scores,
+        votes,
+        risk,
+        predictions,
+    )
 
     details = {
         "threshold": model.threshold,
