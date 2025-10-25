@@ -74,8 +74,14 @@ def _read_numeric_csv(path: str) -> Tuple[List[str], List[List[float]]]:
                 continue
             rows.append(numeric)
 
+    if not rows:
+        raise RuntimeError("训练数据为空，无法继续。")
+
     if len(rows) < 10:
-        raise RuntimeError("样本量过少，至少需要 10 条记录。")
+        logger.warning(
+            "检测到样本量仅 %d 条，建议至少提供 10 条记录以获得稳定阈值。继续训练以便调试。",
+            len(rows),
+        )
 
     return columns, rows
 
