@@ -156,12 +156,12 @@ ANOMALY_TOKENS = {
 }
 
 
-AUTO_REDUCTION_MAX_COLUMNS = 65_536
-AUTO_REDUCTION_MIN_COLUMNS = 4_096
-AUTO_REDUCTION_MAX_MEMORY = 2_000_000_000  # ~1.86 GiB
+AUTO_REDUCTION_MAX_COLUMNS = 16_384
+AUTO_REDUCTION_MIN_COLUMNS = 2_048
+AUTO_REDUCTION_MAX_MEMORY = 1_000_000_000  # ~0.93 GiB
 AUTO_REDUCTION_CHUNK_SIZE = 512
-AUTO_DOWNCAST_MEMORY = 1_000_000_000  # ~0.93 GiB
-AUTO_FORCE_FLOAT32_COLUMNS = 8_192
+AUTO_DOWNCAST_MEMORY = 750_000_000  # ~0.7 GiB
+AUTO_FORCE_FLOAT32_COLUMNS = 6_144
 AUTO_NUMERIC_BYTES_PER_VALUE = 8  # assume float64 worst-case during sklearn ops
 
 
@@ -219,7 +219,7 @@ def _auto_reduce_high_dimensional_data(
     if total_columns > max_columns:
         reasons.append("column_limit")
 
-    aspect_limit = max(min_columns, min(total_columns, rows * 64))
+    aspect_limit = max(min_columns, min(total_columns, rows * 24))
     if total_columns > aspect_limit:
         target_columns = min(target_columns, aspect_limit)
         reasons.append("aspect_ratio_limit")
