@@ -310,6 +310,7 @@ def train_unsupervised_on_split(
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
+    memory_budget_bytes: Optional[int] = None,
 ) -> Dict[str, object]:
     dataset_path = _resolve_dataset_path(split_dir)
     _ensure_dirs(results_dir, models_dir)

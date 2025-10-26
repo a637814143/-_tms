@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import random
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -25,8 +26,17 @@ from sklearn.metrics import (
     recall_score,
 )
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import QuantileTransformer, StandardScaler
+from sklearn.preprocessing import (
+    FunctionTransformer,
+    QuantileTransformer,
+    StandardScaler,
+)
 from joblib import dump
+
+try:  # pragma: no cover - psutil may be unavailable in minimal envs
+    import psutil
+except Exception:  # pragma: no cover - gracefully degrade
+    psutil = None
 
 from src.functions.feature_extractor import extract_features, extract_features_dir
 from src.functions.anomaly_detector import EnsembleAnomalyDetector
@@ -163,6 +173,127 @@ AUTO_REDUCTION_CHUNK_SIZE = 512
 AUTO_DOWNCAST_MEMORY = 750_000_000  # ~0.7 GiB
 AUTO_FORCE_FLOAT32_COLUMNS = 6_144
 AUTO_NUMERIC_BYTES_PER_VALUE = 8  # assume float64 worst-case during sklearn ops
+
+
+def set_seeds(seed: int = 42) -> None:
+    """设置全局随机种子，提升可复现性。"""
+
+    import os as _os
+
+    random.seed(seed)
+    np.random.seed(seed)
+    _os.environ["PYTHONHASHSEED"] = str(int(seed))
+    try:  # pragma: no cover - torch 可选
+        import torch
+
+        torch.manual_seed(seed)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+
+
+def max_features_under_memory(
+    n_samples: int,
+    *,
+    bytes_per_elem: int = 4,
+    copies: int = 3,
+    headroom: float = 0.4,
+    ceiling_bytes: Optional[int] = None,
+) -> int:
+    """按照可用内存估算可容纳的最大特征数。"""
+
+    safe_samples = max(1, int(n_samples))
+    total_bytes = None
+    try:
+        if psutil is not None:
+            total_bytes = float(psutil.virtual_memory().available)
+    except Exception:  # pragma: no cover - 保护性降级
+        total_bytes = None
+
+    if total_bytes is None:
+        # 保守默认值（约 3 GiB 可用内存）
+        total_bytes = float(3 * 1024 ** 3)
+
+    if ceiling_bytes is not None:
+        total_bytes = min(total_bytes, float(max(0, ceiling_bytes)))
+
+    usable_bytes = max(0.0, total_bytes * (1.0 - float(headroom)))
+    denom = max(1.0, float(bytes_per_elem) * float(copies) * float(safe_samples))
+    capacity = int(max(0.0, usable_bytes / denom))
+    return max(64, capacity)
+
+
+def _apply_memory_guard(
+    df: pd.DataFrame,
+    feature_columns: List[str],
+    *,
+    want_dim: Optional[int] = None,
+    copies: int = 3,
+    memory_ceiling: Optional[int] = None,
+) -> Tuple[pd.DataFrame, List[str], Optional[Dict[str, object]]]:
+    """按照内存预算裁剪特征列。"""
+
+    if not feature_columns:
+        return df, feature_columns, None
+
+    view = df.loc[:, feature_columns]
+    matrix = np.asarray(view.to_numpy(dtype=np.float32, copy=False), dtype=np.float32)
+    n_samples, n_features = matrix.shape
+    if n_features == 0:
+        return view, feature_columns, None
+
+    target_cap = max_features_under_memory(
+        n_samples,
+        bytes_per_elem=matrix.dtype.itemsize or 4,
+        copies=max(1, copies),
+        ceiling_bytes=memory_ceiling,
+    )
+    requested = int(want_dim) if want_dim is not None else 5000
+    keep_limit = max(1, min(requested, target_cap))
+
+    info: Dict[str, object] = {
+        "memory_guard": True,
+        "samples": int(n_samples),
+        "original_features": int(n_features),
+        "budget_features": int(target_cap),
+        "requested_features": int(requested),
+        "copies": int(copies),
+        "bytes_per_value": int(matrix.dtype.itemsize or 4),
+        "ceiling_bytes": int(memory_ceiling) if memory_ceiling else None,
+    }
+
+    if n_features <= keep_limit:
+        info["kept_features"] = int(n_features)
+        info["dropped_features"] = 0
+        info["triggered"] = False
+        return view, feature_columns, info
+
+    variances = np.nan_to_num(np.var(matrix, axis=0), nan=0.0, posinf=0.0, neginf=0.0)
+    order = np.argsort(variances)
+    keep_idx = np.sort(order[-keep_limit:])
+    keep_columns = [feature_columns[idx] for idx in keep_idx]
+    reduced_df = view.loc[:, keep_columns].copy()
+    info.update(
+        {
+            "kept_features": int(len(keep_columns)),
+            "dropped_features": int(n_features - len(keep_columns)),
+            "triggered": True,
+            "estimated_matrix_bytes": int(
+                len(keep_columns)
+                * max(1, n_samples)
+                * (matrix.dtype.itemsize or 4)
+                * max(1, copies)
+            ),
+        }
+    )
+    logger.warning(
+        "Memory guard activated: %d -> %d features (samples=%d, budget=%d)",
+        n_features,
+        len(keep_columns),
+        n_samples,
+        keep_limit,
+    )
+    return reduced_df, keep_columns, info
 
 
 def _build_token_variants(tokens: set[str]) -> set[str]:
@@ -634,7 +765,7 @@ def _load_npz_dataset(dataset_path: str) -> Tuple[np.ndarray, list]:
     if not isinstance(X, np.ndarray):
         raise ValueError("X 必须为 numpy.ndarray")
 
-    return X.astype(float), columns
+    return np.asarray(X, dtype=np.float32), columns
 
 
 def _load_npy_dataset(dataset_path: str) -> Tuple[np.ndarray, List[str], Dict[str, np.ndarray]]:
@@ -650,7 +781,7 @@ def _load_npy_dataset(dataset_path: str) -> Tuple[np.ndarray, List[str], Dict[st
     if "X" not in payload:
         raise ValueError(f"NPY 文件缺少 'X' 键: {dataset_path}")
 
-    X = np.asarray(payload["X"], dtype=float)
+    X = np.asarray(payload["X"], dtype=np.float32)
     columns_raw = payload.get("columns")
     if columns_raw is None:
         columns = [f"feature_{i}" for i in range(X.shape[1])]
@@ -677,7 +808,7 @@ def _load_npy_dataset(dataset_path: str) -> Tuple[np.ndarray, List[str], Dict[st
             )
         meta_data[col] = arr
 
-    return X.astype(float), columns, meta_data
+    return np.asarray(X, dtype=np.float32), columns, meta_data
 
 
 def _ensure_dirs(results_dir: str, models_dir: str) -> None:
@@ -846,9 +977,12 @@ def _train_from_dataframe(
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
+    memory_budget_bytes: Optional[int] = None,
 ) -> dict:
     if df.empty:
         raise RuntimeError("训练数据为空。")
+
+    set_seeds(42)
 
     working_df = df.copy()
     ground_truth_column, ground_truth_raw = _extract_ground_truth(working_df)
@@ -938,12 +1072,33 @@ def _train_from_dataframe(
         if categorical_maps
         else {}
     )
+    if memory_guard_info and memory_guard_info.get("triggered"):
+        fill_values_clean = {
+            key: val for key, val in fill_values_clean.items() if key in feature_columns
+        }
+        categorical_maps_clean = {
+            key: val for key, val in categorical_maps_clean.items() if key in feature_columns
+        }
     feature_df_numeric = feature_df.loc[:, feature_columns].copy()
     try:
         feature_df_numeric = feature_df_numeric.apply(pd.to_numeric, errors="coerce")
     except Exception:
         feature_df_numeric = feature_df_numeric.copy()
     feature_df_numeric = feature_df_numeric.astype(np.float32, copy=False)
+
+    memory_guard_info: Optional[Dict[str, object]] = None
+    (
+        feature_df_numeric,
+        feature_columns,
+        memory_guard_info,
+    ) = _apply_memory_guard(
+        feature_df_numeric,
+        feature_columns,
+        want_dim=5000,
+        memory_ceiling=memory_budget_bytes,
+    )
+    if memory_guard_info and memory_guard_info.get("triggered"):
+        feature_df_numeric = feature_df_numeric.astype(np.float32, copy=False)
 
     reduction_info: Optional[Dict[str, object]] = None
     (
@@ -1071,6 +1226,8 @@ def _train_from_dataframe(
             )
 
     data_quality_report: Dict[str, object] = {}
+    if memory_guard_info:
+        data_quality_report["memory_guard"] = memory_guard_info
     if reduction_info:
         data_quality_report["dimension_reduction"] = reduction_info
     estimated_matrix_bytes = int(
@@ -1128,10 +1285,17 @@ def _train_from_dataframe(
     data_quality_report["constant_columns"] = constant_columns
     data_quality_report["winsorized_columns"] = winsor_bounds
 
+    memory_guard_triggered = bool(memory_guard_info and memory_guard_info.get("triggered"))
+    memory_guard_budget = (
+        int(memory_guard_info.get("budget_features", len(feature_columns)))
+        if memory_guard_info
+        else None
+    )
+
     sample_count = len(feature_df_numeric)
     base_dim = max(len(feature_columns), 1)
     auto_components = int(
-        np.clip(np.sqrt(max(1, min(sample_count, base_dim))) * 40, 600, 2000)
+        np.clip(np.sqrt(max(1, min(sample_count, base_dim))) * 12, 192, 768)
     )
     representation_shapes: Dict[str, List[int]] = {
         "base": [int(sample_count), int(base_dim)]
@@ -1154,6 +1318,15 @@ def _train_from_dataframe(
             1_024,
         )
         used_components = 1_024
+    if memory_guard_triggered:
+        guard_cap = max(128, min(512, memory_guard_budget or used_components))
+        if used_components > guard_cap:
+            logger.info(
+                "Reducing RBF components due to memory guard: %d -> %d",
+                used_components,
+                guard_cap,
+            )
+            used_components = guard_cap
     auto_gamma = float(np.clip(1.0 / np.sqrt(float(base_dim)), 0.05, 0.5))
     gamma_source = "manual" if rbf_gamma and rbf_gamma > 0 else "auto"
     used_gamma = float(rbf_gamma) if gamma_source == "manual" else auto_gamma
@@ -1178,7 +1351,7 @@ def _train_from_dataframe(
     pipeline_components_config: Dict[str, bool] = {
         "aligner": True,
         "preprocessor": True,
-        "feature_weighter": True,
+        "feature_weighter": feature_weights is not None,
         "variance_filter": True,
         "scaler": True,
         "deep_features": True,
@@ -1192,10 +1365,13 @@ def _train_from_dataframe(
                 pipeline_components_config[key] = bool(enabled)
     pipeline_components_config["aligner"] = True
     pipeline_components_config["preprocessor"] = True
+    if memory_guard_triggered:
+        pipeline_components_config["gaussianizer"] = False
+        pipeline_components_config["deep_features"] = False
 
     wide_feature_count = len(feature_columns)
     svd_components = 0
-    svd_step: Optional[TruncatedSVD] = None
+    svd_step: Optional[Pipeline] = None
     if wide_feature_count >= 4_096:
         sample_rows = min(len(feature_df_numeric), 2_000)
         sample_cols = min(wide_feature_count, 2_000)
@@ -1214,10 +1390,26 @@ def _train_from_dataframe(
                 wide_feature_count,
                 zero_ratio,
             )
-        svd_components = min(512, max(64, wide_feature_count // 4))
+        svd_components = min(
+            512,
+            max(32, min(max(2, wide_feature_count // 4), max(2, wide_feature_count - 1))),
+        )
         if svd_components >= 2:
             pipeline_components_config["svd_reducer"] = True
-            svd_step = TruncatedSVD(n_components=svd_components, random_state=42)
+            raw_svd = TruncatedSVD(n_components=svd_components, random_state=42)
+            svd_step = Pipeline(
+                [
+                    ("svd", raw_svd),
+                    (
+                        "astype32",
+                        FunctionTransformer(
+                            np.asarray,
+                            validate=False,
+                            kw_args={"dtype": np.float32},
+                        ),
+                    ),
+                ]
+            )
             logger.info(
                 "Applying TruncatedSVD before detector to compress wide feature space: components=%d",
                 svd_components,
@@ -1827,6 +2019,9 @@ def _train_from_dataframe(
         "feature_list_latest": latest_feature_list_path,
     }
 
+    if memory_guard_info:
+        metadata["memory_guard"] = memory_guard_info
+
     if manual_label_summary:
         metadata["manual_annotations"] = manual_label_summary
         try:
@@ -1969,6 +2164,9 @@ def _train_from_dataframe(
         "score_histogram": score_histogram,
     }
 
+    if memory_guard_info:
+        result_payload["memory_guard"] = memory_guard_info
+
     if manual_label_summary:
         result_payload["manual_annotations"] = manual_label_summary
 
@@ -2008,6 +2206,7 @@ def _train_from_preprocessed_csv(
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
+    memory_budget_bytes: Optional[int] = None,
 ) -> dict:
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"预处理数据集不存在: {dataset_path}")
@@ -2084,7 +2283,9 @@ def _train_from_preprocessed_csv(
         enable_supervised_fusion=enable_supervised_fusion,
         feature_selection_ratio=feature_selection_ratio,
         pipeline_components=pipeline_components,
+        memory_budget_bytes=memory_budget_bytes,
     )
+
 
 
 
@@ -2102,6 +2303,7 @@ def _train_from_npz(
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
+    memory_budget_bytes: Optional[int] = None,
 ) -> dict:
     X, columns = _load_npz_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -2164,6 +2366,7 @@ def _train_from_npz(
         enable_supervised_fusion=enable_supervised_fusion,
         feature_selection_ratio=feature_selection_ratio,
         pipeline_components=pipeline_components,
+        memory_budget_bytes=memory_budget_bytes,
     )
 
 
@@ -2181,6 +2384,7 @@ def _train_from_npy(
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
+    memory_budget_bytes: Optional[int] = None,
 ) -> dict:
     X, columns, meta_data = _load_npy_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -2259,6 +2463,7 @@ def _train_from_npy(
         enable_supervised_fusion=enable_supervised_fusion,
         feature_selection_ratio=feature_selection_ratio,
         pipeline_components=pipeline_components,
+        memory_budget_bytes=memory_budget_bytes,
     )
 
 
@@ -2276,6 +2481,7 @@ def train_unsupervised_on_split(
     enable_supervised_fusion: bool = True,
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
+    memory_budget_bytes: Optional[int] = None,
 ):
     """
     无监督训练：
@@ -2340,6 +2546,7 @@ def train_unsupervised_on_split(
                 enable_supervised_fusion=enable_supervised_fusion,
                 feature_selection_ratio=feature_selection_ratio,
                 pipeline_components=pipeline_components,
+                memory_budget_bytes=memory_budget_bytes,
             )
         if ext == ".npy":
             return _train_from_npy(
@@ -2355,6 +2562,7 @@ def train_unsupervised_on_split(
                 enable_supervised_fusion=enable_supervised_fusion,
                 feature_selection_ratio=feature_selection_ratio,
                 pipeline_components=pipeline_components,
+                memory_budget_bytes=memory_budget_bytes,
             )
         if ext == ".npz":
             return _train_from_npz(
@@ -2370,6 +2578,7 @@ def train_unsupervised_on_split(
                 enable_supervised_fusion=enable_supervised_fusion,
                 feature_selection_ratio=feature_selection_ratio,
                 pipeline_components=pipeline_components,
+                memory_budget_bytes=memory_budget_bytes,
             )
         raise FileNotFoundError(f"不支持的数据集格式: {dataset_path}")
 
@@ -2428,4 +2637,5 @@ def train_unsupervised_on_split(
         enable_supervised_fusion=enable_supervised_fusion,
         feature_selection_ratio=feature_selection_ratio,
         pipeline_components=pipeline_components,
+        memory_budget_bytes=memory_budget_bytes,
     )

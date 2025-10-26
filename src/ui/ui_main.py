@@ -1377,10 +1377,10 @@ class Ui_MainWindow(object):
         )
 
         self.rbf_components_spin = QtWidgets.QSpinBox()
-        self.rbf_components_spin.setRange(0, 5000)
-        self.rbf_components_spin.setSingleStep(50)
+        self.rbf_components_spin.setRange(0, 2048)
+        self.rbf_components_spin.setSingleStep(32)
         self.rbf_components_spin.setSpecialValueText("自动")
-        self.rbf_components_spin.setValue(0)
+        self.rbf_components_spin.setValue(384)
         self.rbf_gamma_spin = QtWidgets.QDoubleSpinBox()
         self.rbf_gamma_spin.setRange(0.0, 5.0)
         self.rbf_gamma_spin.setDecimals(4)
@@ -1772,6 +1772,22 @@ class Ui_MainWindow(object):
 
     def _preprocess_out_dir(self):
         return str(PATHS["csv_preprocess"])
+
+    def _current_memory_budget_bytes(self) -> Optional[int]:
+        idx = self.memory_ceiling_combo.currentIndex()
+        if idx <= 0:
+            return None
+        mapping = {
+            1: 512,
+            2: 1024,
+            3: 2048,
+            4: 4096,
+            5: 8192,
+        }
+        value_mb = mapping.get(idx)
+        if value_mb is None:
+            return None
+        return int(value_mb) * 1024 * 1024
 
     def _refresh_model_versions(self):
         if not hasattr(self, "model_combo"):
@@ -2831,6 +2847,7 @@ class Ui_MainWindow(object):
         feature_ratio = self.feature_slider.value()
         feature_ratio = (float(feature_ratio) / 100.0) if feature_ratio > 0 else None
         pipeline_config = self._collect_pipeline_config()
+        memory_budget = self._current_memory_budget_bytes()
         train_task = BackgroundTask(
             run_train,
             path,
@@ -2842,6 +2859,7 @@ class Ui_MainWindow(object):
             fusion_alpha=float(fusion_alpha),
             feature_selection_ratio=feature_ratio,
             pipeline_components=pipeline_config,
+            memory_budget_bytes=memory_budget,
         )
         self._start_background_task(
             train_task,
@@ -2878,6 +2896,20 @@ class Ui_MainWindow(object):
         empty_cols = list(data_quality.get("empty_columns") or [])
         const_cols = list(data_quality.get("constant_columns") or [])
         wins_cols = data_quality.get("winsorized_columns") or {}
+        guard_info = res.get("memory_guard") or data_quality.get("memory_guard")
+        if isinstance(guard_info, dict):
+            dropped = int(guard_info.get("dropped_features", 0) or 0)
+            kept = int(guard_info.get("kept_features", 0) or 0)
+            budget = guard_info.get("budget_features")
+            if guard_info.get("triggered") and dropped:
+                msg = f"内存守护生效：{dropped} 列被裁剪，保留 {kept} 列"
+                if budget:
+                    msg += f"（预算上限 {int(budget)} 列）"
+                self.display_result(f"[内存守护] {msg}")
+            elif not guard_info.get("triggered") and budget:
+                self.display_result(
+                    f"[内存守护] 预算允许 {int(budget)} 列，本次未触发裁剪。"
+                )
         if empty_cols:
             preview = ", ".join(empty_cols[:5])
             if len(empty_cols) > 5:
@@ -3544,6 +3576,7 @@ class Ui_MainWindow(object):
             self._settings.set("rbf_gamma", float(self.rbf_gamma_spin.value()))
             self._settings.set("fusion_enabled", bool(self.fusion_checkbox.isChecked()))
             self._settings.set("fusion_alpha", float(self.fusion_alpha_spin.value()))
+            self._settings.set("memory_ceiling_idx", int(self.memory_ceiling_combo.currentIndex()))
         except Exception:
             pass
 
@@ -3573,6 +3606,13 @@ class Ui_MainWindow(object):
                 self.fusion_alpha_spin.setValue(float(saved_alpha))
             except Exception:
                 self.fusion_alpha_spin.setValue(0.5)
+            saved_memory_idx = self._settings.get("memory_ceiling_idx", 0) or 0
+            try:
+                idx = int(saved_memory_idx)
+                idx = max(0, min(self.memory_ceiling_combo.count() - 1, idx))
+                self.memory_ceiling_combo.setCurrentIndex(idx)
+            except Exception:
+                self.memory_ceiling_combo.setCurrentIndex(0)
             self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
             saved_pipeline = self._settings.get("pipeline_components", {})
             if isinstance(saved_pipeline, dict) and hasattr(self, "pipeline_checks"):

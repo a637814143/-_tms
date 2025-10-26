@@ -106,7 +106,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
 
     # sklearn API -----------------------------------------------------
     def fit(self, X: np.ndarray, y=None):  # noqa: D401  (sklearn 兼容签名)
-        X = np.asarray(X, dtype=float)
+        X = np.asarray(X, dtype=np.float32)
         if X.ndim != 2:
             raise ValueError("X 必须为二维数组")
 
@@ -147,6 +147,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                 random_state=self.random_state,
             )
             projected_X = self.projection_model_.fit_transform(X)
+            projected_X = np.asarray(projected_X, dtype=np.float32)
             self.projected_dim_ = int(projected_X.shape[1])
 
         def _view(use_proj: bool) -> np.ndarray:
@@ -158,7 +159,7 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                 IsolationForest(
                     n_estimators=self.n_estimators,
                     contamination=self.contamination,
-                    random_state=self.random_state,
+                    random_state=self.random_state if self.random_state is not None else 0,
                     n_jobs=-1,
                     max_samples=min(10000, n_samples),
                     max_features=1.0,
