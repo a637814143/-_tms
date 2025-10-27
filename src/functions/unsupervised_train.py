@@ -30,6 +30,7 @@ from sklearn.preprocessing import (
     FunctionTransformer,
     QuantileTransformer,
     StandardScaler,
+    RobustScaler,
 )
 from joblib import dump
 
@@ -173,6 +174,71 @@ AUTO_REDUCTION_CHUNK_SIZE = 512
 AUTO_DOWNCAST_MEMORY = 750_000_000  # ~0.7 GiB
 AUTO_FORCE_FLOAT32_COLUMNS = 6_144
 AUTO_NUMERIC_BYTES_PER_VALUE = 8  # assume float64 worst-case during sklearn ops
+
+
+SPEED_DEFAULTS = {
+    "enabled": True,
+    "two_stage_refine": True,
+    "refine_ratio": 0.03,
+    "two_stage_weight": 0.6,
+    "two_stage_min_samples": 256,
+    "two_stage_max_samples": 5_000,
+    "if_n_estimators": 64,
+    "if_max_samples": 4_096,
+    "if_bootstrap": True,
+    "enable_lof": False,
+    "enable_ocsvm": False,
+    "refine_with_lof": True,
+    "refine_with_ocsvm": True,
+    "variance_topk": 256,
+    "svd_components_cap": 256,
+    "disable_rbf": True,
+    "rbf_components_cap": 128,
+    "prefer_robust_scaler": True,
+    "allow_gaussianizer": False,
+}
+
+
+def _resolve_speed_config(
+    speed_config: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    config = dict(SPEED_DEFAULTS)
+    if isinstance(speed_config, dict):
+        for key, value in speed_config.items():
+            if key in config:
+                config[key] = value
+
+    config["enabled"] = bool(config.get("enabled", True))
+    config["two_stage_refine"] = bool(config.get("two_stage_refine", True))
+    config["refine_ratio"] = float(
+        np.clip(float(config.get("refine_ratio", 0.03) or 0.03), 0.001, 0.2)
+    )
+    config["two_stage_weight"] = float(
+        np.clip(float(config.get("two_stage_weight", 0.6) or 0.6), 0.0, 1.0)
+    )
+    config["two_stage_min_samples"] = int(
+        max(64, int(config.get("two_stage_min_samples", 256) or 256))
+    )
+    config["two_stage_max_samples"] = int(
+        max(
+            config["two_stage_min_samples"],
+            int(config.get("two_stage_max_samples", 5_000) or 5_000),
+        )
+    )
+    config["if_n_estimators"] = int(max(32, int(config.get("if_n_estimators", 64) or 64)))
+    config["if_max_samples"] = int(max(512, int(config.get("if_max_samples", 4_096) or 4_096)))
+    config["if_bootstrap"] = bool(config.get("if_bootstrap", True))
+    config["enable_lof"] = bool(config.get("enable_lof", False))
+    config["enable_ocsvm"] = bool(config.get("enable_ocsvm", False))
+    config["refine_with_lof"] = bool(config.get("refine_with_lof", True))
+    config["refine_with_ocsvm"] = bool(config.get("refine_with_ocsvm", True))
+    config["variance_topk"] = int(max(0, int(config.get("variance_topk", 256) or 256)))
+    config["svd_components_cap"] = int(max(32, int(config.get("svd_components_cap", 256) or 256)))
+    config["disable_rbf"] = bool(config.get("disable_rbf", True))
+    config["rbf_components_cap"] = int(max(16, int(config.get("rbf_components_cap", 128) or 128)))
+    config["prefer_robust_scaler"] = bool(config.get("prefer_robust_scaler", True))
+    config["allow_gaussianizer"] = bool(config.get("allow_gaussianizer", False))
+    return config
 
 
 def set_seeds(seed: int = 42) -> None:
@@ -978,6 +1044,7 @@ def _train_from_dataframe(
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
     memory_budget_bytes: Optional[int] = None,
+    speed_config: Optional[Dict[str, object]] = None,
 ) -> dict:
     if df.empty:
         raise RuntimeError("训练数据为空。")
@@ -985,6 +1052,8 @@ def _train_from_dataframe(
     set_seeds(42)
 
     working_df = df.copy()
+    speed_options = _resolve_speed_config(speed_config)
+    speed_enabled = bool(speed_options.get("enabled", True))
     ground_truth_column, ground_truth_raw = _extract_ground_truth(working_df)
     ground_truth: Optional[np.ndarray] = None
     ground_truth_mask: Optional[np.ndarray] = None
@@ -1055,11 +1124,30 @@ def _train_from_dataframe(
             )
 
     adaptive_neighbors = int(max(15, min(120, np.sqrt(len(working_df)) * 2)))
+    detector_estimators = max(256, base_estimators * 4)
+    detector_lof = True
+    detector_ocsvm = True
+    if speed_enabled:
+        detector_estimators = int(speed_options["if_n_estimators"])
+        detector_lof = bool(speed_options["enable_lof"])
+        detector_ocsvm = bool(speed_options["enable_ocsvm"])
+
     detector = EnsembleAnomalyDetector(
         contamination=adaptive_contamination,
-        n_estimators=max(256, base_estimators * 4),
+        n_estimators=detector_estimators,
         n_neighbors=adaptive_neighbors,
         random_state=42,
+        enable_lof=detector_lof,
+        enable_ocsvm=detector_ocsvm,
+        if_max_samples=speed_options["if_max_samples"] if speed_enabled else 10_000,
+        if_bootstrap=speed_options["if_bootstrap"] if speed_enabled else False,
+        two_stage_refine=speed_enabled and bool(speed_options["two_stage_refine"]),
+        two_stage_ratio=speed_options["refine_ratio"],
+        two_stage_weight=speed_options["two_stage_weight"],
+        two_stage_min_samples=speed_options["two_stage_min_samples"],
+        two_stage_max_samples=speed_options["two_stage_max_samples"],
+        refine_with_lof=bool(speed_options["refine_with_lof"]),
+        refine_with_ocsvm=bool(speed_options["refine_with_ocsvm"]),
     )
 
     fill_values_clean: Dict[str, object] = (
@@ -1114,6 +1202,9 @@ def _train_from_dataframe(
         }
 
     variance_screen_info: Optional[Dict[str, object]] = None
+    variance_max_features = 5000
+    if speed_enabled and speed_options.get("variance_topk", 0) > 0:
+        variance_max_features = int(max(32, speed_options["variance_topk"]))
     (
         feature_df_numeric,
         feature_columns,
@@ -1121,7 +1212,7 @@ def _train_from_dataframe(
     ) = _variance_screen_features(
         feature_df_numeric,
         feature_columns,
-        max_features=5000,
+        max_features=variance_max_features,
         variance_threshold=1e-6,
     )
     if variance_screen_info:
@@ -1303,6 +1394,11 @@ def _train_from_dataframe(
         used_components = int(rbf_components)
     else:
         used_components = auto_components
+    if speed_enabled:
+        if speed_options.get("disable_rbf", True):
+            used_components = 0
+        else:
+            used_components = min(used_components, int(speed_options["rbf_components_cap"]))
     if base_dim >= 32_768 and used_components > 768:
         logger.info(
             "Reducing RBF components due to extremely wide feature matrix: %d -> %d",
@@ -1364,6 +1460,13 @@ def _train_from_dataframe(
                 pipeline_components_config[key] = bool(enabled)
     pipeline_components_config["aligner"] = True
     pipeline_components_config["preprocessor"] = True
+    if speed_enabled:
+        pipeline_components_config["scaler"] = True
+        if not speed_options.get("allow_gaussianizer", False):
+            pipeline_components_config["gaussianizer"] = False
+        if speed_options.get("disable_rbf", True):
+            pipeline_components_config["rbf_expander"] = False
+        pipeline_components_config["deep_features"] = False
     if memory_guard_triggered:
         pipeline_components_config["gaussianizer"] = False
         pipeline_components_config["deep_features"] = False
@@ -1393,6 +1496,8 @@ def _train_from_dataframe(
             512,
             max(32, min(max(2, wide_feature_count // 4), max(2, wide_feature_count - 1))),
         )
+        if speed_enabled:
+            svd_components = min(svd_components, int(speed_options["svd_components_cap"]))
         if svd_components >= 2:
             pipeline_components_config["svd_reducer"] = True
             raw_svd = TruncatedSVD(n_components=svd_components, random_state=42)
@@ -1449,7 +1554,13 @@ def _train_from_dataframe(
         if pipeline_components_config["variance_filter"]
         else None
     )
-    scaler_step = StandardScaler() if pipeline_components_config["scaler"] else None
+    if pipeline_components_config["scaler"]:
+        if speed_enabled and speed_options.get("prefer_robust_scaler", True):
+            scaler_step = RobustScaler(with_centering=True, with_scaling=True, quantile_range=(10.0, 90.0))
+        else:
+            scaler_step = StandardScaler()
+    else:
+        scaler_step = None
     gaussianizer_step = (
         QuantileTransformer(
             output_distribution="normal",
@@ -2016,6 +2127,7 @@ def _train_from_dataframe(
         "feature_hash": feature_hash,
         "feature_list_path": feature_list_path,
         "feature_list_latest": latest_feature_list_path,
+        "speed_config": speed_options,
     }
 
     if memory_guard_info:
@@ -2040,6 +2152,9 @@ def _train_from_dataframe(
 
     if pseudo_summary:
         metadata["pseudo_labels"] = pseudo_summary
+
+    if detector.refine_report_:
+        metadata["refinement_report"] = dict(detector.refine_report_)
 
     if detector.calibration_report_ is not None:
         metadata["calibration"] = detector.calibration_report_
@@ -2161,6 +2276,7 @@ def _train_from_dataframe(
         "compute_device": metadata.get("compute_device", "cpu"),
         "active_learning_csv": active_learning_csv,
         "score_histogram": score_histogram,
+        "speed_config": speed_options,
     }
 
     if memory_guard_info:
@@ -2179,6 +2295,9 @@ def _train_from_dataframe(
 
     if pseudo_summary:
         result_payload["pseudo_labels"] = pseudo_summary
+
+    if detector.refine_report_:
+        result_payload["refinement_report"] = dict(detector.refine_report_)
 
     if feature_importances_topk:
         result_payload["feature_importances_topk"] = feature_importances_topk
@@ -2206,6 +2325,7 @@ def _train_from_preprocessed_csv(
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
     memory_budget_bytes: Optional[int] = None,
+    speed_config: Optional[Dict[str, object]] = None,
 ) -> dict:
     if not os.path.exists(dataset_path):
         raise FileNotFoundError(f"预处理数据集不存在: {dataset_path}")
@@ -2283,6 +2403,7 @@ def _train_from_preprocessed_csv(
         feature_selection_ratio=feature_selection_ratio,
         pipeline_components=pipeline_components,
         memory_budget_bytes=memory_budget_bytes,
+        speed_config=speed_config,
     )
 
 
@@ -2303,6 +2424,7 @@ def _train_from_npz(
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
     memory_budget_bytes: Optional[int] = None,
+    speed_config: Optional[Dict[str, object]] = None,
 ) -> dict:
     X, columns = _load_npz_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -2366,6 +2488,7 @@ def _train_from_npz(
         feature_selection_ratio=feature_selection_ratio,
         pipeline_components=pipeline_components,
         memory_budget_bytes=memory_budget_bytes,
+        speed_config=speed_config,
     )
 
 
@@ -2384,6 +2507,7 @@ def _train_from_npy(
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
     memory_budget_bytes: Optional[int] = None,
+    speed_config: Optional[Dict[str, object]] = None,
 ) -> dict:
     X, columns, meta_data = _load_npy_dataset(dataset_path)
     df = pd.DataFrame(X, columns=columns)
@@ -2463,6 +2587,7 @@ def _train_from_npy(
         feature_selection_ratio=feature_selection_ratio,
         pipeline_components=pipeline_components,
         memory_budget_bytes=memory_budget_bytes,
+        speed_config=speed_config,
     )
 
 
@@ -2481,6 +2606,7 @@ def train_unsupervised_on_split(
     feature_selection_ratio: Optional[float] = None,
     pipeline_components: Optional[Dict[str, bool]] = None,
     memory_budget_bytes: Optional[int] = None,
+    speed_config: Optional[Dict[str, object]] = None,
 ):
     """
     无监督训练：
@@ -2546,6 +2672,7 @@ def train_unsupervised_on_split(
                 feature_selection_ratio=feature_selection_ratio,
                 pipeline_components=pipeline_components,
                 memory_budget_bytes=memory_budget_bytes,
+                speed_config=speed_config,
             )
         if ext == ".npy":
             return _train_from_npy(
@@ -2562,6 +2689,7 @@ def train_unsupervised_on_split(
                 feature_selection_ratio=feature_selection_ratio,
                 pipeline_components=pipeline_components,
                 memory_budget_bytes=memory_budget_bytes,
+                speed_config=speed_config,
             )
         if ext == ".npz":
             return _train_from_npz(
@@ -2578,6 +2706,7 @@ def train_unsupervised_on_split(
                 feature_selection_ratio=feature_selection_ratio,
                 pipeline_components=pipeline_components,
                 memory_budget_bytes=memory_budget_bytes,
+                speed_config=speed_config,
             )
         raise FileNotFoundError(f"不支持的数据集格式: {dataset_path}")
 
@@ -2637,4 +2766,5 @@ def train_unsupervised_on_split(
         feature_selection_ratio=feature_selection_ratio,
         pipeline_components=pipeline_components,
         memory_budget_bytes=memory_budget_bytes,
+        speed_config=speed_config,
     )
