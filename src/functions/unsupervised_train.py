@@ -1072,13 +1072,6 @@ def _train_from_dataframe(
         if categorical_maps
         else {}
     )
-    if memory_guard_info and memory_guard_info.get("triggered"):
-        fill_values_clean = {
-            key: val for key, val in fill_values_clean.items() if key in feature_columns
-        }
-        categorical_maps_clean = {
-            key: val for key, val in categorical_maps_clean.items() if key in feature_columns
-        }
     feature_df_numeric = feature_df.loc[:, feature_columns].copy()
     try:
         feature_df_numeric = feature_df_numeric.apply(pd.to_numeric, errors="coerce")
@@ -1099,6 +1092,12 @@ def _train_from_dataframe(
     )
     if memory_guard_info and memory_guard_info.get("triggered"):
         feature_df_numeric = feature_df_numeric.astype(np.float32, copy=False)
+        fill_values_clean = {
+            key: val for key, val in fill_values_clean.items() if key in feature_columns
+        }
+        categorical_maps_clean = {
+            key: val for key, val in categorical_maps_clean.items() if key in feature_columns
+        }
 
     reduction_info: Optional[Dict[str, object]] = None
     (
