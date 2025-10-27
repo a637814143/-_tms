@@ -5,7 +5,7 @@
 """
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 from sklearn.base import BaseEstimator, OutlierMixin
@@ -40,6 +40,50 @@ def _normalize_scores(arr: np.ndarray) -> np.ndarray:
     return normed
 
 
+def _spearman_correlation(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute the Spearman rank correlation without SciPy."""
+
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.size == 0 or b.size == 0 or a.size != b.size:
+        return 1.0
+
+    def _rank(values: np.ndarray) -> np.ndarray:
+        order = np.argsort(values, kind="mergesort")
+        ranks = np.empty_like(order, dtype=float)
+        ranks[order] = np.arange(1, len(values) + 1, dtype=float)
+        # Handle ties by averaging ranks within identical values
+        unique_vals, inverse, counts = np.unique(values, return_inverse=True, return_counts=True)
+        if np.any(counts > 1):
+            for idx, count in enumerate(counts):
+                if count <= 1:
+                    continue
+                mask = inverse == idx
+                avg_rank = float(np.mean(ranks[mask]))
+                ranks[mask] = avg_rank
+        return ranks
+
+    rank_a = _rank(a)
+    rank_b = _rank(b)
+    cov = float(np.cov(rank_a, rank_b, bias=True)[0, 1])
+    std_a = float(np.std(rank_a)) or 1.0
+    std_b = float(np.std(rank_b)) or 1.0
+    return float(np.clip(cov / (std_a * std_b), -1.0, 1.0))
+
+
+def _topk_overlap(base_order: np.ndarray, new_order: np.ndarray, k: int) -> float:
+    if k <= 0:
+        return 1.0
+    if base_order.size == 0 or new_order.size == 0:
+        return 1.0
+    k = min(k, base_order.size, new_order.size)
+    base_set = set(base_order[:k])
+    new_set = set(new_order[:k])
+    if not base_set or not new_set:
+        return 1.0
+    return float(len(base_set & new_set) / max(1, len(base_set)))
+
+
 @dataclass
 class DetectorInfo:
     name: str
@@ -66,12 +110,34 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         n_neighbors: int = 35,
         svm_gamma: str = "scale",
         random_state: int = 42,
+        enable_lof: bool = True,
+        enable_ocsvm: bool = True,
+        if_max_samples: int = 10_000,
+        if_bootstrap: bool = False,
+        two_stage_refine: bool = False,
+        two_stage_ratio: float = 0.03,
+        two_stage_weight: float = 0.5,
+        two_stage_min_samples: int = 128,
+        two_stage_max_samples: int = 10_000,
+        refine_with_lof: Optional[bool] = None,
+        refine_with_ocsvm: Optional[bool] = None,
     ) -> None:
         self.contamination = float(max(1e-4, min(0.49, contamination)))
         self.n_estimators = int(max(32, n_estimators))
         self.n_neighbors = int(max(5, n_neighbors))
         self.svm_gamma = svm_gamma
         self.random_state = random_state
+        self.enable_lof = bool(enable_lof)
+        self.enable_ocsvm = bool(enable_ocsvm)
+        self.if_max_samples = int(max(64, if_max_samples))
+        self.if_bootstrap = bool(if_bootstrap)
+        self.two_stage_refine = bool(two_stage_refine)
+        self.two_stage_ratio = float(np.clip(two_stage_ratio, 0.001, 0.5))
+        self.two_stage_weight = float(np.clip(two_stage_weight, 0.0, 1.0))
+        self.two_stage_min_samples = int(max(32, two_stage_min_samples))
+        self.two_stage_max_samples = int(max(self.two_stage_min_samples, two_stage_max_samples))
+        self.refine_with_lof = bool(refine_with_lof) if refine_with_lof is not None else True
+        self.refine_with_ocsvm = bool(refine_with_ocsvm) if refine_with_ocsvm is not None else True
 
         self.detectors_: Dict[str, DetectorInfo] = {}
         self.threshold_: Optional[float] = None
@@ -103,6 +169,11 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.pseudo_label_origins_: Optional[np.ndarray] = None
         self.pseudo_label_summary_: Optional[Dict[str, object]] = None
         self.ocsvm_bias_: float = 0.0
+        self.refine_report_: Optional[Dict[str, object]] = None
+        self.base_score_snapshot_: Optional[np.ndarray] = None
+        self.refine_raw_scores_: Dict[str, np.ndarray] = {}
+        self.last_refine_indices_: Optional[np.ndarray] = None
+        self.last_refined_scores_: Optional[np.ndarray] = None
 
     # sklearn API -----------------------------------------------------
     def fit(self, X: np.ndarray, y=None):  # noqa: D401  (sklearn 兼容签名)
@@ -137,6 +208,11 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.pseudo_label_origins_ = None
         self.pseudo_label_summary_ = None
         self.ocsvm_bias_ = 0.0
+        self.refine_report_ = None
+        self.base_score_snapshot_ = None
+        self.refine_raw_scores_.clear()
+        self.last_refine_indices_ = None
+        self.last_refined_scores_ = None
 
         projected_X = X
         use_projection = X.shape[1] > 512
@@ -161,16 +237,19 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                     contamination=self.contamination,
                     random_state=self.random_state if self.random_state is not None else 0,
                     n_jobs=-1,
-                    max_samples=min(10000, n_samples),
+                    max_samples=min(self.if_max_samples, n_samples),
                     max_features=1.0,
                     warm_start=False,
+                    bootstrap=self.if_bootstrap,
                 ),
                 weight=1.0,
                 use_projected=False,
             )
         ]
 
-        include_lof = True if self.projection_model_ is not None else X.shape[1] <= 1024
+        include_lof = self.enable_lof and (
+            True if self.projection_model_ is not None else X.shape[1] <= 1024
+        )
         if include_lof:
             estimators.append(
                 DetectorInfo(
@@ -186,7 +265,9 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
                 )
             )
 
-        include_svm = True if self.projection_model_ is not None else X.shape[1] <= 1200
+        include_svm = self.enable_ocsvm and (
+            True if self.projection_model_ is not None else X.shape[1] <= 1200
+        )
         if include_svm:
             estimators.append(
                 DetectorInfo(
@@ -262,7 +343,18 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         self.last_normalized_stack_ = stacked.astype(float)
         weights = np.asarray(weight_stack, dtype=float)
         weights = weights / weights.sum()
-        combined = np.average(stacked, axis=0, weights=weights)
+        combined = np.average(stacked, axis=0, weights=weights).astype(float)
+        base_scores = combined.copy()
+        self.base_score_snapshot_ = base_scores.copy()
+
+        combined, refine_report = self._apply_two_stage_refinement(
+            combined,
+            base_scores,
+            X,
+            projected_X,
+        )
+        self.refine_report_ = refine_report
+        self.last_refined_scores_ = combined.copy()
 
         vote_matrix = np.vstack(vote_stack) if vote_stack else np.zeros((0, n_samples))
         if vote_matrix.size:
@@ -458,6 +550,170 @@ class EnsembleAnomalyDetector(BaseEstimator, OutlierMixin):
         return np.where(anomalies, -1, 1)
 
     # 内部方法 ---------------------------------------------------------
+    def _apply_two_stage_refinement(
+        self,
+        combined: np.ndarray,
+        base_scores: np.ndarray,
+        base_view: np.ndarray,
+        projected_view: np.ndarray,
+    ) -> Tuple[np.ndarray, Dict[str, object]]:
+        report: Dict[str, object] = {"enabled": bool(self.two_stage_refine)}
+        if not self.two_stage_refine:
+            return combined, report
+
+        n_samples = combined.size
+        if n_samples == 0:
+            report["reason"] = "no_samples"
+            return combined, report
+
+        ratio = float(np.clip(self.two_stage_ratio, 0.001, 0.5))
+        subset = int(np.ceil(n_samples * ratio))
+        subset = max(self.two_stage_min_samples, subset)
+        subset = min(self.two_stage_max_samples, subset)
+        subset = min(subset, n_samples)
+        if subset < max(32, int(0.5 * self.two_stage_min_samples)):
+            report.update({"reason": "subset_too_small", "subset_size": subset})
+            return combined, report
+
+        base_order = np.argsort(base_scores)
+        candidate_idx = base_order[:subset]
+        if candidate_idx.size == 0:
+            report.update({"reason": "no_candidates", "subset_size": 0})
+            return combined, report
+
+        use_projection = projected_view is not None and projected_view.ndim == 2 and projected_view.shape[0] == n_samples
+        subset_view = projected_view[candidate_idx] if use_projection else base_view[candidate_idx]
+        subset_view = np.asarray(subset_view, dtype=np.float32, copy=False)
+        if subset_view.ndim != 2 or subset_view.shape[0] <= 5:
+            report.update({"reason": "insufficient_subset", "subset_size": int(subset_view.shape[0])})
+            return combined, report
+
+        refine_estimators: List[DetectorInfo] = []
+        detectors_used: List[str] = []
+        if self.refine_with_lof:
+            max_neighbors = max(5, min(self.n_neighbors, subset_view.shape[0] - 1))
+            if max_neighbors >= 5:
+                detectors_used.append("lof")
+                refine_estimators.append(
+                    DetectorInfo(
+                        "refine_lof",
+                        LocalOutlierFactor(
+                            n_neighbors=max_neighbors,
+                            contamination=self.contamination,
+                            novelty=True,
+                            metric="minkowski",
+                        ),
+                        weight=1.0,
+                        use_projected=use_projection,
+                    )
+                )
+        if self.refine_with_ocsvm and subset_view.shape[0] > 10:
+            detectors_used.append("ocsvm")
+            refine_estimators.append(
+                DetectorInfo(
+                    "refine_ocsvm",
+                    OneClassSVM(
+                        kernel="rbf",
+                        gamma=self.svm_gamma,
+                        nu=self.contamination,
+                    ),
+                    weight=0.9,
+                    use_projected=use_projection,
+                )
+            )
+
+        if not refine_estimators:
+            report.update({"reason": "no_refine_estimators", "subset_size": int(subset_view.shape[0])})
+            return combined, report
+
+        refine_stack: List[np.ndarray] = []
+        refine_weights: List[float] = []
+        raw_scores: Dict[str, np.ndarray] = {}
+        for info in refine_estimators:
+            estimator = info.estimator
+            try:
+                estimator.fit(subset_view)
+            except Exception:
+                continue
+            if hasattr(estimator, "decision_function"):
+                dec = estimator.decision_function(subset_view)
+            elif hasattr(estimator, "score_samples"):
+                dec = estimator.score_samples(subset_view)
+            else:
+                dec = estimator.predict(subset_view)
+            normalized = _normalize_scores(dec)
+            refine_stack.append(normalized)
+            refine_weights.append(float(info.weight))
+            raw_scores[info.name] = np.asarray(dec, dtype=float)
+
+        if not refine_stack:
+            report.update({"reason": "refine_failed", "subset_size": int(subset_view.shape[0])})
+            return combined, report
+
+        weights = np.asarray(refine_weights, dtype=float)
+        weights = weights / max(weights.sum(), 1e-9)
+        refined_scores = np.average(np.vstack(refine_stack), axis=0, weights=weights)
+        blend = float(np.clip(self.two_stage_weight, 0.0, 1.0))
+        base_subset = combined[candidate_idx]
+        combined[candidate_idx] = (1.0 - blend) * base_subset + blend * refined_scores
+
+        new_order = np.argsort(combined)
+        topk_values = [50, 100, 200, 500, 1000]
+        overlaps = {
+            str(k): _topk_overlap(base_order, new_order, k)
+            for k in topk_values
+            if k <= n_samples and k <= base_order.size
+        }
+
+        overlap_min = None
+        for value in overlaps.values():
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            overlap_min = numeric if overlap_min is None else min(overlap_min, numeric)
+
+        overlap_alert: Optional[Dict[str, float]] = None
+        overlap_threshold = 0.90
+        for key, value in overlaps.items():
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if numeric < overlap_threshold:
+                if overlap_alert is None:
+                    overlap_alert = {}
+                overlap_alert[str(key)] = numeric
+
+        report.update(
+            {
+                "enabled": True,
+                "refined": True,
+                "ratio": ratio,
+                "weight": blend,
+                "subset_size": int(candidate_idx.size),
+                "detectors": detectors_used,
+                "topk_overlap": overlaps,
+                "spearman": _spearman_correlation(base_scores, combined),
+                "indices_preview": candidate_idx[: min(100, candidate_idx.size)].tolist(),
+            }
+        )
+        if overlap_min is not None:
+            report["topk_overlap_min"] = float(overlap_min)
+        if overlap_alert:
+            report["topk_overlap_alert"] = {
+                "threshold": overlap_threshold,
+                "failing": {key: float(val) for key, val in overlap_alert.items()},
+            }
+        base_quant = float(np.quantile(base_scores, self.contamination))
+        new_quant = float(np.quantile(combined, self.contamination))
+        report["threshold_shift"] = {
+            "before": base_quant,
+            "after": new_quant,
+        }
+        self.refine_raw_scores_ = raw_scores
+        self.last_refine_indices_ = candidate_idx
+        return combined, report
     def _compute_decision_details(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         if not self.detectors_:
             raise RuntimeError("模型尚未拟合")

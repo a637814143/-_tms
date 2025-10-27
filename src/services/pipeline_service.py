@@ -68,6 +68,24 @@ def _build_pipeline_components(disabled: Iterable[str]) -> Dict[str, bool]:
     return {step: step not in disabled_set for step in PIPELINE_STEPS}
 
 
+def _build_speed_config(
+    enabled: Optional[bool],
+    two_stage: Optional[bool],
+    refine_percent: Optional[float],
+) -> Optional[Dict[str, object]]:
+    config: Dict[str, object] = {}
+    if enabled is not None:
+        config["enabled"] = bool(enabled)
+    if two_stage is not None:
+        config["two_stage_refine"] = bool(two_stage)
+    if refine_percent is not None:
+        raw = float(refine_percent)
+        if raw > 1:
+            raw = raw / 100.0
+        config["refine_ratio"] = raw
+    return config or None
+
+
 def _run_prediction(
     pipeline_path: str,
     feature_csv: str,
@@ -194,6 +212,11 @@ def _handle_extract(args: argparse.Namespace) -> int:
 def _handle_train(args: argparse.Namespace) -> int:
     disabled_steps = args.disable_step or []
     pipeline_components = _build_pipeline_components(disabled_steps)
+    speed_config = _build_speed_config(
+        args.speed_optimizations,
+        args.two_stage_refine,
+        args.refine_top_percent,
+    )
     result = train_unsupervised_on_split(
         args.split_dir,
         args.results_dir,
@@ -205,6 +228,7 @@ def _handle_train(args: argparse.Namespace) -> int:
         enable_supervised_fusion=not args.no_fusion,
         feature_selection_ratio=args.feature_ratio,
         pipeline_components=pipeline_components,
+        speed_config=speed_config,
     )
     summary = {
         "results_csv": result.get("results_csv"),
@@ -220,6 +244,7 @@ def _handle_train(args: argparse.Namespace) -> int:
             "results_dir": args.results_dir,
             "models_dir": args.models_dir,
             "pipeline_components": pipeline_components,
+            "speed_config": speed_config,
         },
     )
     return 0
@@ -288,6 +313,24 @@ def build_parser() -> argparse.ArgumentParser:
         choices=sorted(PIPELINE_STEPS),
         help="禁用指定的 pipeline 步骤，可重复",
     )
+    p_train.add_argument(
+        "--speed-optimizations",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="启用/禁用默认的提速优化（默认启用）",
+    )
+    p_train.add_argument(
+        "--two-stage-refine",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="启用/禁用两阶段精排（默认启用）",
+    )
+    p_train.add_argument(
+        "--refine-top-percent",
+        type=float,
+        default=None,
+        help="阶段 B 精排使用的 Top 百分比，例如 3 表示 Top 3%",
+    )
     p_train.set_defaults(func=_handle_train)
 
     p_predict = sub.add_parser("predict", help="使用训练好的管线进行预测")
@@ -335,6 +378,9 @@ if FastAPI is not None:
         fusion_enabled: bool = True
         feature_ratio: Optional[float] = None
         disable_steps: Optional[List[str]] = None
+        speed_enabled: Optional[bool] = None
+        two_stage_refine: Optional[bool] = None
+        refine_ratio: Optional[float] = None
 
     class PredictRequest(BaseModel):
         pipeline_path: str
@@ -355,6 +401,11 @@ if FastAPI is not None:
         def train_endpoint(req: TrainRequest):
             try:
                 components = _build_pipeline_components(req.disable_steps or [])
+                speed_cfg = _build_speed_config(
+                    req.speed_enabled,
+                    req.two_stage_refine,
+                    req.refine_ratio,
+                )
                 result = train_unsupervised_on_split(
                     req.split_dir,
                     req.results_dir,
@@ -366,6 +417,7 @@ if FastAPI is not None:
                     enable_supervised_fusion=req.fusion_enabled,
                     feature_selection_ratio=req.feature_ratio,
                     pipeline_components=components,
+                    speed_config=speed_cfg,
                 )
                 log_model_event(
                     "rest.train",
@@ -374,6 +426,7 @@ if FastAPI is not None:
                         "results_dir": req.results_dir,
                         "models_dir": req.models_dir,
                         "pipeline_components": components,
+                        "speed_config": speed_cfg,
                     },
                 )
                 return result

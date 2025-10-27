@@ -1207,6 +1207,23 @@ class Ui_MainWindow(object):
             return {}
         return {key: checkbox.isChecked() for key, checkbox in self.pipeline_checks.items()}
 
+    def _collect_speed_config(self) -> Dict[str, object]:
+        if not hasattr(self, "speed_mode_checkbox"):
+            return {}
+        ratio = float(self.two_stage_ratio_spin.value()) / 100.0 if hasattr(self, "two_stage_ratio_spin") else 0.03
+        return {
+            "enabled": bool(self.speed_mode_checkbox.isChecked()),
+            "two_stage_refine": bool(self.two_stage_checkbox.isChecked()),
+            "refine_ratio": ratio,
+        }
+
+    def _update_two_stage_controls(self) -> None:
+        if not hasattr(self, "two_stage_checkbox"):
+            return
+        enabled = bool(self.speed_mode_checkbox.isChecked())
+        self.two_stage_checkbox.setEnabled(enabled)
+        self.two_stage_ratio_spin.setEnabled(enabled and self.two_stage_checkbox.isChecked())
+
     def _on_pipeline_option_toggled(self) -> None:
         if getattr(self, "_loading_settings", False):
             return
@@ -1376,6 +1393,24 @@ class Ui_MainWindow(object):
             "模型高级设置", QtWidgets.QFormLayout, spacing=10
         )
 
+        self.speed_mode_checkbox = QtWidgets.QCheckBox("启用极速模式（IF 提速）")
+        self.speed_mode_checkbox.setChecked(True)
+        self.two_stage_checkbox = QtWidgets.QCheckBox("两阶段精排（建议）")
+        self.two_stage_checkbox.setChecked(True)
+        self.two_stage_ratio_spin = QtWidgets.QDoubleSpinBox()
+        self.two_stage_ratio_spin.setRange(0.5, 10.0)
+        self.two_stage_ratio_spin.setDecimals(1)
+        self.two_stage_ratio_spin.setSingleStep(0.5)
+        self.two_stage_ratio_spin.setSuffix("%")
+        self.two_stage_ratio_spin.setValue(3.0)
+        two_stage_row = QtWidgets.QWidget()
+        two_stage_layout = QtWidgets.QHBoxLayout(two_stage_row)
+        two_stage_layout.setContentsMargins(0, 0, 0, 0)
+        two_stage_layout.setSpacing(6)
+        two_stage_layout.addWidget(self.two_stage_checkbox)
+        two_stage_layout.addWidget(self.two_stage_ratio_spin)
+        two_stage_row.setMinimumHeight(38)
+
         self.rbf_components_spin = QtWidgets.QSpinBox()
         self.rbf_components_spin.setRange(0, 2048)
         self.rbf_components_spin.setSingleStep(32)
@@ -1421,6 +1456,8 @@ class Ui_MainWindow(object):
         self.feature_slider_value = QtWidgets.QLabel("全部")
         feature_slider_layout.addWidget(self.feature_slider_value)
         feature_slider_row.setMinimumHeight(38)
+        ag_layout.addRow("极速模式：", self.speed_mode_checkbox)
+        ag_layout.addRow("两阶段精排：", two_stage_row)
         ag_layout.addRow("RBF 维度：", self.rbf_components_spin)
         ag_layout.addRow("RBF γ：", self.rbf_gamma_spin)
         ag_layout.addRow("半监督融合：", self.fusion_checkbox)
@@ -1429,14 +1466,18 @@ class Ui_MainWindow(object):
         ag_layout.addRow("内存上限", self.memory_ceiling_combo)
         self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
         self._on_feature_slider_changed(self.feature_slider.value())
+        self._update_two_stage_controls()
         for widget in (
             self.rbf_components_spin,
             self.rbf_gamma_spin,
             self.fusion_alpha_spin,
             self.memory_ceiling_combo,
+            self.two_stage_ratio_spin,
         ):
             widget.setMinimumHeight(38)
         for field in (
+            self.speed_mode_checkbox,
+            two_stage_row,
             self.rbf_components_spin,
             self.rbf_gamma_spin,
             self.fusion_checkbox,
@@ -1732,11 +1773,16 @@ class Ui_MainWindow(object):
         self.btn_page_next.clicked.connect(self._on_page_next)
         self.page_size_spin.valueChanged.connect(self._on_page_size_changed)
         self.btn_show_all.clicked.connect(self._show_full_preview)
-        self.rbf_components_spin.valueChanged.connect(self._on_rbf_settings_changed)
-        self.rbf_gamma_spin.valueChanged.connect(self._on_rbf_settings_changed)
+        self.rbf_components_spin.valueChanged.connect(self._on_training_settings_changed)
+        self.rbf_gamma_spin.valueChanged.connect(self._on_training_settings_changed)
         self.fusion_checkbox.toggled.connect(lambda checked: self.fusion_alpha_spin.setEnabled(checked))
-        self.fusion_checkbox.toggled.connect(self._on_rbf_settings_changed)
-        self.fusion_alpha_spin.valueChanged.connect(self._on_rbf_settings_changed)
+        self.fusion_checkbox.toggled.connect(self._on_training_settings_changed)
+        self.fusion_alpha_spin.valueChanged.connect(self._on_training_settings_changed)
+        self.speed_mode_checkbox.toggled.connect(self._on_training_settings_changed)
+        self.two_stage_checkbox.toggled.connect(self._on_training_settings_changed)
+        self.two_stage_ratio_spin.valueChanged.connect(self._on_training_settings_changed)
+        self.speed_mode_checkbox.toggled.connect(self._update_two_stage_controls)
+        self.two_stage_checkbox.toggled.connect(self._update_two_stage_controls)
         self.feature_slider.valueChanged.connect(self._on_feature_slider_changed)
 
         self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
@@ -2848,6 +2894,7 @@ class Ui_MainWindow(object):
         feature_ratio = (float(feature_ratio) / 100.0) if feature_ratio > 0 else None
         pipeline_config = self._collect_pipeline_config()
         memory_budget = self._current_memory_budget_bytes()
+        speed_config = self._collect_speed_config()
         train_task = BackgroundTask(
             run_train,
             path,
@@ -2860,6 +2907,7 @@ class Ui_MainWindow(object):
             feature_selection_ratio=feature_ratio,
             pipeline_components=pipeline_config,
             memory_budget_bytes=memory_budget,
+            speed_config=speed_config,
         )
         self._start_background_task(
             train_task,
@@ -3040,6 +3088,64 @@ class Ui_MainWindow(object):
                 msg_lines.append("启用组件: " + ", ".join(enabled_labels))
             if disabled_labels:
                 msg_lines.append("停用组件: " + ", ".join(disabled_labels))
+        speed_cfg = res.get("speed_config") or {}
+        if isinstance(speed_cfg, dict) and speed_cfg:
+            status = "开启" if speed_cfg.get("enabled", True) else "关闭"
+            ratio_val = speed_cfg.get("refine_ratio")
+            if ratio_val is not None:
+                try:
+                    ratio_pct = float(ratio_val) * 100.0
+                except Exception:
+                    ratio_pct = 0.0
+                msg_lines.append(f"极速模式={status}（精排Top≈{ratio_pct:.1f}%）")
+            else:
+                msg_lines.append(f"极速模式={status}")
+        refine_report = res.get("refinement_report") or {}
+        if isinstance(refine_report, dict) and refine_report.get("refined"):
+            subset = refine_report.get("subset_size")
+            ratio_val = refine_report.get("ratio")
+            overlap_map = refine_report.get("topk_overlap") or {}
+            overlap100 = overlap_map.get("100")
+            overlap_alert = refine_report.get("topk_overlap_alert") or {}
+            try:
+                ratio_pct = float(ratio_val) * 100.0 if ratio_val is not None else None
+            except Exception:
+                ratio_pct = None
+            line = "两阶段精排: "
+            if ratio_pct is not None:
+                line += f"Top≈{ratio_pct:.1f}%"
+            if subset is not None:
+                line += f" ({int(subset)} 条)"
+            if overlap100 is not None:
+                try:
+                    line += f" @100重叠≈{float(overlap100) * 100:.1f}%"
+                except Exception:
+                    pass
+            failing_entries: List[str] = []
+            if isinstance(overlap_alert, dict):
+                failing = overlap_alert.get("failing") or {}
+                threshold = overlap_alert.get("threshold")
+                for key, value in (failing.items() if isinstance(failing, dict) else []):
+                    try:
+                        failing_entries.append(f"@{key}≈{float(value) * 100:.1f}%")
+                    except Exception:
+                        continue
+                if failing_entries:
+                    if isinstance(threshold, (int, float)):
+                        try:
+                            line += f" ⚠️重叠<{float(threshold) * 100:.0f}%: "
+                        except Exception:
+                            line += " ⚠️重叠不足: "
+                    else:
+                        line += " ⚠️重叠不足: "
+                    line += ", ".join(failing_entries)
+            spearman = refine_report.get("spearman")
+            if spearman is not None:
+                try:
+                    line += f" ρ≈{float(spearman):.3f}"
+                except Exception:
+                    pass
+            msg_lines.append(line)
         compute_device = res.get("compute_device") or res.get("deep_features", {}).get("device")
         backend_name = None
         deep_info = res.get("deep_features") or {}
@@ -3564,19 +3670,24 @@ class Ui_MainWindow(object):
         except Exception:
             pass
 
-    def _on_rbf_settings_changed(self):
+    def _on_training_settings_changed(self):
         if getattr(self, "_loading_settings", False):
             return
         if not getattr(self, "_settings_ready", False):
             return
         if not hasattr(self, "_settings"):
             return
+        self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
+        self._update_two_stage_controls()
         try:
             self._settings.set("rbf_components", int(self.rbf_components_spin.value()))
             self._settings.set("rbf_gamma", float(self.rbf_gamma_spin.value()))
             self._settings.set("fusion_enabled", bool(self.fusion_checkbox.isChecked()))
             self._settings.set("fusion_alpha", float(self.fusion_alpha_spin.value()))
             self._settings.set("memory_ceiling_idx", int(self.memory_ceiling_combo.currentIndex()))
+            self._settings.set("speed_enabled", bool(self.speed_mode_checkbox.isChecked()))
+            self._settings.set("two_stage_refine", bool(self.two_stage_checkbox.isChecked()))
+            self._settings.set("two_stage_ratio", float(self.two_stage_ratio_spin.value()))
         except Exception:
             pass
 
@@ -3606,6 +3717,15 @@ class Ui_MainWindow(object):
                 self.fusion_alpha_spin.setValue(float(saved_alpha))
             except Exception:
                 self.fusion_alpha_spin.setValue(0.5)
+            speed_enabled = self._settings.get("speed_enabled", True)
+            self.speed_mode_checkbox.setChecked(bool(speed_enabled))
+            two_stage_enabled = self._settings.get("two_stage_refine", True)
+            self.two_stage_checkbox.setChecked(bool(two_stage_enabled))
+            saved_ratio = self._settings.get("two_stage_ratio", 3.0)
+            try:
+                self.two_stage_ratio_spin.setValue(float(saved_ratio))
+            except Exception:
+                self.two_stage_ratio_spin.setValue(3.0)
             saved_memory_idx = self._settings.get("memory_ceiling_idx", 0) or 0
             try:
                 idx = int(saved_memory_idx)
@@ -3625,6 +3745,7 @@ class Ui_MainWindow(object):
         finally:
             self._loading_settings = False
             self._settings_ready = True
+            self._update_two_stage_controls()
 
     def shutdown(self) -> None:
         try:
