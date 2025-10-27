@@ -3,7 +3,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap
 from pathlib import Path
 import numpy as np
-from typing import Dict, List, Optional, Set
+from typing import Collection, Dict, List, Optional, Set
 from datetime import datetime
 
 import yaml
@@ -21,7 +21,25 @@ from src.functions.feature_extractor import (
     extract_features_dir as fe_dir,
     get_loaded_plugin_info,
 )
-from src.functions.unsupervised_train import train_unsupervised_on_split as run_train
+try:
+    from src.functions.unsupervised_train import (
+        META_COLUMNS as TRAIN_META_COLUMNS,
+        train_unsupervised_on_split as run_train,
+    )
+except Exception:  # pragma: no cover - fallback for minimal environments
+    from src.functions.simple_unsupervised import train_unsupervised_on_split as run_train  # type: ignore
+
+    TRAIN_META_COLUMNS = {
+        "pcap_file",
+        "flow_id",
+        "src_ip",
+        "dst_ip",
+        "src_port",
+        "dst_port",
+        "protocol",
+        "__source_file__",
+        "__source_path__",
+    }
 from src.functions.analyze_results import analyze_results as run_analysis
 from src.functions.preprocess import preprocess_feature_dir as preprocess_dir
 from src.functions.annotations import (
@@ -227,11 +245,38 @@ SETTINGS_PATH = DATA_BASE / "settings.json"
 MODEL_SCHEMA_VERSION = "2025.10"
 
 
+def _feature_order_from_metadata(metadata: dict) -> List[str]:
+    if not isinstance(metadata, dict):
+        return []
+
+    candidate = (
+        metadata.get("feature_names_in")
+        or metadata.get("feature_order")
+        or (metadata.get("preprocessor") or {}).get("feature_order")
+        or (metadata.get("preprocessor") or {}).get("input_columns")
+        or metadata.get("feature_columns")
+    )
+
+    if candidate is None:
+        return []
+
+    if isinstance(candidate, (list, tuple, set)):
+        values = list(candidate)
+    else:
+        try:
+            values = list(candidate)
+        except TypeError:
+            values = [candidate]
+
+    return [str(col) for col in values if str(col)]
+
+
 def _align_input_features(
     df: "pd.DataFrame",
     metadata: dict,
     *,
     strict: bool = False,
+    allow_extra: Optional[Collection[str]] = None,
 ) -> tuple["pd.DataFrame", dict]:
     info: dict[str, object] = {}
     if not isinstance(metadata, dict):
@@ -242,21 +287,30 @@ def _align_input_features(
         raise ValueError("模型元数据缺少 schema_version 字段，请重新训练模型。")
     info["schema_version"] = schema_version
 
-    feature_order = (
-        metadata.get("feature_names_in")
-        or metadata.get("feature_order")
-        or (metadata.get("preprocessor") or {}).get("feature_order")
-        or (metadata.get("preprocessor") or {}).get("input_columns")
-        or metadata.get("feature_columns")
-    )
+    feature_order = _feature_order_from_metadata(metadata)
     if not feature_order:
         raise ValueError("模型元数据缺少 feature_order 描述，无法校验列。")
 
-    feature_order = [str(col) for col in feature_order]
-    if not feature_order:
-        raise ValueError("模型元数据的特征列为空。")
-
     default_fill = 0.0
+    allow_set = {str(col) for col in allow_extra or []}
+    # 始终允许内置的元信息列及自动生成的临时列
+    allow_set.update(TRAIN_META_COLUMNS)
+    allow_set.update({
+        "label",
+        "labels",
+        "ground_truth",
+        "attack",
+        "attacks",
+        "is_attack",
+        "is_malicious",
+        "malicious",
+        "score",
+        "is_anomaly",
+        "prediction",
+        "anomaly_score",
+        "risk_score",
+        "vote_ratio",
+    })
     fill_values = {}
     preprocessor_meta = metadata.get("preprocessor") if isinstance(metadata.get("preprocessor"), dict) else None
     if isinstance(metadata.get("fill_values"), dict):
@@ -279,10 +333,21 @@ def _align_input_features(
         working[column] = fill_value
         missing_columns.append(column)
 
-    extra_columns = [col for col in working.columns if col not in feature_order]
+    dropped_columns = [col for col in working.columns if col not in feature_order]
+    extra_columns: List[str] = []
+    ignored_columns: List[str] = []
+    for column in dropped_columns:
+        ignored_columns.append(column)
+        column_norm = str(column)
+        if column_norm in allow_set:
+            continue
+        if column_norm.startswith("__") or column_norm.lower().startswith("unnamed:"):
+            continue
+        extra_columns.append(column_norm)
     info["missing_filled"] = missing_columns
     info["extra_columns"] = extra_columns
     info["feature_order"] = feature_order
+    info["ignored_columns"] = ignored_columns
 
     if strict and (missing_columns or extra_columns):
         parts: List[str] = []
@@ -1986,6 +2051,182 @@ class Ui_MainWindow(object):
         candidates.sort(key=lambda item: item[0], reverse=True)
         _, path, meta = candidates[0]
         return path, meta
+
+    def _prediction_allowed_extras(self, metadata: Optional[dict]) -> Set[str]:
+        allowed: Set[str] = set(TRAIN_META_COLUMNS)
+        if not isinstance(metadata, dict):
+            return allowed
+
+        def _extend_from(value) -> None:
+            if value is None:
+                return
+            if isinstance(value, (list, tuple, set)):
+                allowed.update(str(col) for col in value if str(col))
+            else:
+                allowed.add(str(value))
+
+        for key in (
+            "meta_columns",
+            "meta_fields",
+            "reserved_columns",
+            "id_columns",
+            "keep_columns",
+            "drop_columns",
+        ):
+            _extend_from(metadata.get(key))
+
+        for key in ("ground_truth_column", "label_column", "labels_column", "id_column"):
+            value = metadata.get(key)
+            if value:
+                allowed.add(str(value))
+
+        preprocessor_meta = metadata.get("preprocessor")
+        if isinstance(preprocessor_meta, dict):
+            for key in (
+                "meta_columns",
+                "id_columns",
+                "keep_columns",
+                "drop_columns",
+                "reserved_columns",
+            ):
+                _extend_from(preprocessor_meta.get(key))
+
+        allowed.update({
+            "timestamp",
+            "time",
+            "event_time",
+            "frame_time",
+            "frame_time_epoch",
+            "pcap_name",
+            "file_name",
+            "file_path",
+            "source_file",
+            "source_path",
+        })
+        return {str(col) for col in allowed if str(col)}
+
+    def _resolve_prediction_bundle(
+        self,
+        df: "pd.DataFrame",
+        *,
+        metadata_override: Optional[dict] = None,
+    ) -> Optional[dict]:
+        if pd is None:
+            return None
+
+        df_columns = [str(col) for col in df.columns if str(col)]
+        if not df_columns:
+            return None
+
+        column_set = {col for col in df_columns}
+        models_dir = Path(self._default_models_dir())
+
+        candidates: List[dict] = []
+
+        def _register_candidate(
+            metadata: Optional[dict],
+            metadata_path: Optional[str],
+            pipeline_hint: Optional[str],
+            priority: int,
+            source: str,
+        ) -> None:
+            if not isinstance(metadata, dict):
+                return
+
+            feature_order = _feature_order_from_metadata(metadata)
+            if not feature_order:
+                return
+
+            feature_set = {str(col) for col in feature_order}
+            missing = [col for col in feature_order if col not in column_set]
+            if missing:
+                return
+
+            pipeline_path = pipeline_hint or metadata.get("pipeline_latest") or metadata.get("pipeline_path")
+            if not pipeline_path:
+                return
+            if not os.path.isabs(pipeline_path):
+                pipeline_path = str((models_dir / pipeline_path).resolve())
+            if not os.path.exists(pipeline_path):
+                return
+
+            allowed_extra = self._prediction_allowed_extras(metadata)
+            extras = [col for col in column_set if col not in feature_set and col not in allowed_extra]
+            score = (len(extras), priority, -len(feature_set))
+
+            candidates.append(
+                {
+                    "metadata": metadata,
+                    "metadata_path": metadata_path,
+                    "pipeline_path": pipeline_path,
+                    "feature_order": feature_order,
+                    "allowed_extra": allowed_extra,
+                    "extras": extras,
+                    "score": score,
+                    "source": source,
+                }
+            )
+
+        seen_paths: Set[str] = set()
+
+        if isinstance(metadata_override, dict):
+            override_path = metadata_override.get("metadata_path")
+            if override_path:
+                seen_paths.add(str(override_path))
+            pipeline_hint = metadata_override.get("pipeline_latest") or metadata_override.get("pipeline_path")
+            if pipeline_hint is None:
+                pipeline_hint = self._selected_pipeline_path
+            _register_candidate(metadata_override, override_path, pipeline_hint, 0, "override")
+
+        if self._selected_metadata:
+            meta_path = self._selected_metadata_path
+            if meta_path:
+                seen_paths.add(str(meta_path))
+            _register_candidate(
+                self._selected_metadata,
+                meta_path,
+                self._selected_pipeline_path,
+                1,
+                "selected",
+            )
+
+        if models_dir.exists():
+            latest_meta = models_dir / "latest_iforest_metadata.json"
+            if latest_meta.exists():
+                resolved = str(latest_meta.resolve())
+                if resolved not in seen_paths:
+                    try:
+                        with open(latest_meta, "r", encoding="utf-8") as fh:
+                            metadata = json.load(fh)
+                    except Exception:
+                        metadata = None
+                    _register_candidate(metadata, resolved, None, 2, "latest")
+                    seen_paths.add(resolved)
+
+            pattern_files = sorted(
+                models_dir.glob("iforest_metadata_*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            priority = 3
+            for path in pattern_files:
+                resolved = str(path.resolve())
+                if resolved in seen_paths:
+                    continue
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        metadata = json.load(fh)
+                except Exception:
+                    continue
+                _register_candidate(metadata, resolved, None, priority, "history")
+                seen_paths.add(resolved)
+                priority += 1
+
+        if not candidates:
+            return None
+
+        best = min(candidates, key=lambda item: item["score"])
+        return best
     def _browse_compat(self):
         p, _ = QtWidgets.QFileDialog.getOpenFileName(None, "选择 pcap 文件", "", "pcap (*.pcap *.pcapng);;所有文件 (*)")
         if not p:
@@ -3377,40 +3618,68 @@ class Ui_MainWindow(object):
         if pd is None:
             raise RuntimeError("pandas 未安装，无法执行预测。")
 
-        pipeline_path, meta_path = self._latest_pipeline_bundle()
+        bundle = self._resolve_prediction_bundle(df, metadata_override=metadata_override)
+        if not bundle:
+            raise RuntimeError(
+                "未找到与所选特征CSV匹配的模型，请确认已选择训练时对应的特征文件。"
+            )
+
+        pipeline_path = bundle.get("pipeline_path")
+        metadata_obj = bundle.get("metadata") or {}
+        metadata = dict(metadata_obj) if isinstance(metadata_obj, dict) else {}
+        metadata_path = bundle.get("metadata_path")
+        allowed_extra = set(bundle.get("allowed_extra") or set())
+        extras_detected = list(bundle.get("extras") or [])
+        source = bundle.get("source")
+
         if not pipeline_path or not os.path.exists(pipeline_path):
             raise RuntimeError("未找到可用的模型管线，请先训练模型。")
-
-        metadata = dict(metadata_override) if isinstance(metadata_override, dict) else {}
-        if not metadata:
-            if not meta_path or not os.path.exists(meta_path):
-                raise RuntimeError("缺少模型元数据，请确认已训练并保留 latest_iforest_metadata.json。")
-            try:
-                with open(meta_path, "r", encoding="utf-8") as fh:
-                    loaded = json.load(fh)
-                if isinstance(loaded, dict):
-                    metadata = loaded
-            except Exception as exc:
-                raise RuntimeError(f"无法读取模型元数据：{exc}")
-
-        models_dir = self._default_models_dir()
-        canonical_pipeline = metadata.get("pipeline_latest") or metadata.get("pipeline_path")
-        if canonical_pipeline:
-            if not os.path.isabs(canonical_pipeline):
-                canonical_pipeline = str((Path(models_dir) / canonical_pipeline).resolve())
-            if not os.path.exists(canonical_pipeline):
-                raise RuntimeError(
-                    f"模型记录的管线文件不存在：{canonical_pipeline}，请重新训练或检查模型目录。"
-                )
-            pipeline_path = canonical_pipeline
 
         try:
             pipeline = joblib_load(pipeline_path)
         except Exception as exc:
             raise RuntimeError(f"模型管线加载失败：{exc}")
 
-        feature_df_raw, align_info = _align_input_features(df, metadata, strict=True)
-        messages: List[str] = [f"使用模型管线: {os.path.basename(pipeline_path)}"]
+        # 记录所选模型，确保后续操作保持一致
+        if metadata_path:
+            self._selected_metadata = metadata
+            self._selected_metadata_path = metadata_path
+            self._selected_pipeline_path = pipeline_path
+            if hasattr(self, "model_combo"):
+                idx = self.model_combo.findData(metadata_path)
+                if idx < 0:
+                    self._refresh_model_versions()
+                    idx = self.model_combo.findData(metadata_path)
+                if idx >= 0:
+                    self.model_combo.blockSignals(True)
+                    self.model_combo.setCurrentIndex(idx)
+                    self.model_combo.blockSignals(False)
+                    self._on_model_combo_changed(idx)
+
+        feature_df_raw, align_info = _align_input_features(
+            df,
+            metadata,
+            strict=False,
+            allow_extra=allowed_extra.union(extras_detected),
+        )
+
+        messages: List[str] = []
+        if source and source not in {"selected", "override"}:
+            messages.append("已根据特征列自动匹配模型版本。")
+        messages.append(f"使用模型管线: {os.path.basename(pipeline_path)}")
+        if extras_detected:
+            sample = ", ".join(sorted(extras_detected)[:8])
+            more = " ..." if len(extras_detected) > 8 else ""
+            messages.append(f"忽略了 {len(extras_detected)} 个额外列: {sample}{more}")
+        missing_after_align = align_info.get("missing_filled") if isinstance(align_info, dict) else None
+        if missing_after_align:
+            missing_list = list(missing_after_align)
+            sample_missing = ", ".join(missing_list[:8])
+            more_missing = " ..." if len(missing_list) > 8 else ""
+            raise RuntimeError(
+                "检测到特征 CSV 缺少模型所需列，请确认选择的特征文件正确。\n缺少列: "
+                f"{sample_missing}{more_missing}"
+            )
         schema_version = align_info.get("schema_version")
         if schema_version and schema_version != MODEL_SCHEMA_VERSION:
             messages.append(f"模型 schema_version={schema_version} 与当前 {MODEL_SCHEMA_VERSION} 不一致")
