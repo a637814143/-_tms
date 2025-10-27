@@ -227,7 +227,12 @@ SETTINGS_PATH = DATA_BASE / "settings.json"
 MODEL_SCHEMA_VERSION = "2025.10"
 
 
-def _align_input_features(df: "pd.DataFrame", metadata: dict) -> tuple["pd.DataFrame", dict]:
+def _align_input_features(
+    df: "pd.DataFrame",
+    metadata: dict,
+    *,
+    strict: bool = False,
+) -> tuple["pd.DataFrame", dict]:
     info: dict[str, object] = {}
     if not isinstance(metadata, dict):
         raise ValueError("模型缺少有效的元数据。")
@@ -237,26 +242,28 @@ def _align_input_features(df: "pd.DataFrame", metadata: dict) -> tuple["pd.DataF
         raise ValueError("模型元数据缺少 schema_version 字段，请重新训练模型。")
     info["schema_version"] = schema_version
 
-    feature_order = metadata.get("feature_order")
-    preprocessor_meta = metadata.get("preprocessor") if isinstance(metadata.get("preprocessor"), dict) else None
-    if not feature_order and preprocessor_meta:
-        feature_order = preprocessor_meta.get("feature_order") or preprocessor_meta.get("input_columns")
-    if not feature_order:
-        feature_order = metadata.get("feature_columns")
+    feature_order = (
+        metadata.get("feature_names_in")
+        or metadata.get("feature_order")
+        or (metadata.get("preprocessor") or {}).get("feature_order")
+        or (metadata.get("preprocessor") or {}).get("input_columns")
+        or metadata.get("feature_columns")
+    )
     if not feature_order:
         raise ValueError("模型元数据缺少 feature_order 描述，无法校验列。")
 
-    feature_order = list(feature_order)
+    feature_order = [str(col) for col in feature_order]
     if not feature_order:
         raise ValueError("模型元数据的特征列为空。")
 
     default_fill = 0.0
     fill_values = {}
+    preprocessor_meta = metadata.get("preprocessor") if isinstance(metadata.get("preprocessor"), dict) else None
     if isinstance(metadata.get("fill_values"), dict):
-        fill_values.update(metadata["fill_values"])
+        fill_values.update({str(k): v for k, v in metadata["fill_values"].items()})
     if isinstance(preprocessor_meta, dict):
         default_fill = float(preprocessor_meta.get("fill_value", default_fill))
-        fill_values.update(preprocessor_meta.get("fill_values") or {})
+        fill_values.update({str(k): v for k, v in (preprocessor_meta.get("fill_values") or {}).items()})
     if "fill_value" in metadata:
         try:
             default_fill = float(metadata.get("fill_value", default_fill))
@@ -275,8 +282,25 @@ def _align_input_features(df: "pd.DataFrame", metadata: dict) -> tuple["pd.DataF
     extra_columns = [col for col in working.columns if col not in feature_order]
     info["missing_filled"] = missing_columns
     info["extra_columns"] = extra_columns
+    info["feature_order"] = feature_order
+
+    if strict and (missing_columns or extra_columns):
+        parts: List[str] = []
+        if missing_columns:
+            sample = ", ".join(missing_columns[:10])
+            more = " ..." if len(missing_columns) > 10 else ""
+            parts.append(f"缺少列: {sample}{more}")
+        if extra_columns:
+            sample = ", ".join(extra_columns[:10])
+            more = " ..." if len(extra_columns) > 10 else ""
+            parts.append(f"多余列: {sample}{more}")
+        raise ValueError("特征列与训练时不一致，请选择正确的特征CSV。\n" + "\n".join(parts))
 
     aligned = working.loc[:, feature_order].copy()
+    numeric_cols = aligned.select_dtypes(include=["number"]).columns
+    if len(numeric_cols):
+        aligned.loc[:, numeric_cols] = aligned.loc[:, numeric_cols].astype("float32", copy=False)
+
     return aligned, info
 
 
@@ -3357,29 +3381,48 @@ class Ui_MainWindow(object):
         if not pipeline_path or not os.path.exists(pipeline_path):
             raise RuntimeError("未找到可用的模型管线，请先训练模型。")
 
-        pipeline = joblib_load(pipeline_path)
-
         metadata = dict(metadata_override) if isinstance(metadata_override, dict) else {}
-        if not metadata and meta_path and os.path.exists(meta_path):
+        if not metadata:
+            if not meta_path or not os.path.exists(meta_path):
+                raise RuntimeError("缺少模型元数据，请确认已训练并保留 latest_iforest_metadata.json。")
             try:
                 with open(meta_path, "r", encoding="utf-8") as fh:
                     loaded = json.load(fh)
                 if isinstance(loaded, dict):
                     metadata = loaded
-            except Exception:
-                metadata = {}
+            except Exception as exc:
+                raise RuntimeError(f"无法读取模型元数据：{exc}")
 
-        feature_df_raw, align_info = _align_input_features(df, metadata)
-        messages: List[str] = []
-        missing_cols = align_info.get("missing_filled") or []
-        extra_cols = align_info.get("extra_columns") or []
-        if missing_cols:
-            messages.append(f"自动补齐缺失列: {', '.join(missing_cols)}")
-        if extra_cols:
-            messages.append(f"忽略未使用列: {', '.join(extra_cols[:10])}{' ...' if len(extra_cols) > 10 else ''}")
+        models_dir = self._default_models_dir()
+        canonical_pipeline = metadata.get("pipeline_latest") or metadata.get("pipeline_path")
+        if canonical_pipeline:
+            if not os.path.isabs(canonical_pipeline):
+                canonical_pipeline = str((Path(models_dir) / canonical_pipeline).resolve())
+            if not os.path.exists(canonical_pipeline):
+                raise RuntimeError(
+                    f"模型记录的管线文件不存在：{canonical_pipeline}，请重新训练或检查模型目录。"
+                )
+            pipeline_path = canonical_pipeline
+
+        try:
+            pipeline = joblib_load(pipeline_path)
+        except Exception as exc:
+            raise RuntimeError(f"模型管线加载失败：{exc}")
+
+        feature_df_raw, align_info = _align_input_features(df, metadata, strict=True)
+        messages: List[str] = [f"使用模型管线: {os.path.basename(pipeline_path)}"]
         schema_version = align_info.get("schema_version")
         if schema_version and schema_version != MODEL_SCHEMA_VERSION:
             messages.append(f"模型 schema_version={schema_version} 与当前 {MODEL_SCHEMA_VERSION} 不一致")
+
+        expected_order = align_info.get("feature_order") or []
+        pipeline_features = getattr(pipeline, "feature_names_in_", None)
+        if pipeline_features is not None:
+            pipeline_cols = [str(col) for col in pipeline_features]
+            if list(pipeline_cols) != list(expected_order):
+                raise RuntimeError(
+                    "模型管线的特征列顺序与训练时不一致，请重新训练或重新选择模型。"
+                )
 
         models_dir = self._default_models_dir()
         preproc_candidates: List[str] = []
