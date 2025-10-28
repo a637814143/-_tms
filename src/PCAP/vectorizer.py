@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 import csv
+import json
 import numpy as np
 
 from .static_features import extract_pcap_features
@@ -164,6 +165,43 @@ class CSVDatasetSummary:
     has_labels: bool
 
 
+def _iter_jsonl_records(path: Union[str, Path]) -> Iterator[Dict[str, object]]:
+    """Yield parsed JSON objects from a JSONL file."""
+
+    jsonl_path = Path(path)
+    with jsonl_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, 1):
+            text = raw_line.strip()
+            if not text:
+                continue
+            try:
+                yield json.loads(text)
+            except json.JSONDecodeError as exc:  # pragma: no cover - invalid data
+                raise ValueError(
+                    f"Invalid JSON in {jsonl_path} at line {line_number}: {exc}"
+                ) from exc
+
+
+def _iter_flows_from_jsonl(
+    inputs: Sequence[Union[str, Path]]
+) -> Iterator[Tuple[Dict[str, object], Optional[int]]]:
+    """Iterate over all flows contained in one or more JSONL extraction files."""
+
+    for jsonl_path in inputs:
+        for record in _iter_jsonl_records(jsonl_path):
+            if not record.get("success", False):
+                source = record.get("path", str(jsonl_path))
+                error = record.get("error", "unknown error")
+                raise RuntimeError(f"Extraction failed for {source}: {error}")
+            record_label: Optional[int]
+            try:
+                record_label = int(record.get("label")) if record.get("label") is not None else None
+            except (TypeError, ValueError):
+                record_label = None
+            for flow in record.get("flows", []):
+                yield flow, record_label
+
+
 def _format_value(value: object) -> str:
     if value is None:
         return ""
@@ -267,6 +305,39 @@ def vectorize_pcaps(
                 flow_count += 1
                 if len(row) >= 1 and row[-1].strip() != "":
                     labels_present = True
+
+    return CSVDatasetSummary(
+        path=path,
+        flow_count=flow_count,
+        column_count=len(CSV_COLUMNS),
+        has_labels=labels_present,
+    )
+
+
+def vectorize_jsonl_files(
+    inputs: Sequence[Union[str, Path]],
+    output_path: Union[str, Path],
+    *,
+    label_override: Optional[int] = None,
+) -> CSVDatasetSummary:
+    """Convert JSONL extraction results into the mandated CSV format."""
+
+    jsonl_paths = [Path(item) for item in inputs]
+    path = Path(output_path)
+    flow_count = 0
+    labels_present = False
+
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(CSV_COLUMNS)
+
+        for flow, record_label in _iter_flows_from_jsonl(jsonl_paths):
+            effective_label = label_override if label_override is not None else record_label
+            row = _flow_to_csv_row(flow, effective_label)
+            writer.writerow(row)
+            flow_count += 1
+            if row and row[-1].strip():
+                labels_present = True
 
     return CSVDatasetSummary(
         path=path,
