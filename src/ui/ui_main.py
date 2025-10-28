@@ -47,6 +47,7 @@ from src.functions.annotations import (
     annotation_summary,
     apply_annotations_to_frame,
 )
+from scripts.auto_annotate import auto_annotate
 
 try:
     import pandas as pd
@@ -1256,6 +1257,7 @@ class Ui_MainWindow(object):
             for btn in (
                 getattr(self, "btn_view", None),
                 getattr(self, "btn_fe", None),
+                getattr(self, "btn_auto_label", None),
                 getattr(self, "btn_vector", None),
                 getattr(self, "btn_train", None),
                 getattr(self, "btn_analysis", None),
@@ -1390,6 +1392,7 @@ class Ui_MainWindow(object):
 
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
         self.btn_fe = QtWidgets.QPushButton("提取特征")
+        self.btn_auto_label = QtWidgets.QPushButton("自动打标签")
         self.btn_vector = QtWidgets.QPushButton("数据预处理")
         self.btn_train = QtWidgets.QPushButton("训练模型")
         self.btn_analysis = QtWidgets.QPushButton("运行分析")
@@ -1404,6 +1407,7 @@ class Ui_MainWindow(object):
         for btn in (
             self.btn_view,
             self.btn_fe,
+            self.btn_auto_label,
             self.btn_vector,
             self.btn_train,
             self.btn_analysis,
@@ -1421,6 +1425,7 @@ class Ui_MainWindow(object):
         data_group, data_layout = self._create_collapsible_group("数据阶段")
         data_layout.addWidget(self.btn_view)
         data_layout.addWidget(self.btn_fe)
+        data_layout.addWidget(self.btn_auto_label)
         data_layout.addWidget(self.btn_vector)
         data_layout.addStretch(1)
         self.right_layout.addWidget(data_group)
@@ -1846,6 +1851,7 @@ class Ui_MainWindow(object):
         self.btn_export.clicked.connect(self._on_export_results)
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_fe.clicked.connect(self._on_extract_features)
+        self.btn_auto_label.clicked.connect(self.on_auto_label_clicked)
         self.btn_vector.clicked.connect(self._on_preprocess_features)
         self.btn_train.clicked.connect(self._on_train_model)
         self.btn_analysis.clicked.connect(self._on_run_analysis)
@@ -3058,6 +3064,115 @@ class Ui_MainWindow(object):
         self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "特征提取失败", msg)
         self.display_result(f"[错误] 特征提取失败: {msg}")
+
+    def on_auto_label_clicked(self) -> None:
+        start_dir = self._default_csv_feature_dir()
+        feat_csv, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None,
+            "选择特征CSV",
+            start_dir,
+            "CSV (*.csv);;所有文件 (*)",
+        )
+        if not feat_csv:
+            return
+
+        self._remember_path(feat_csv)
+
+        models_dir = Path(self._default_models_dir())
+        meta_path = models_dir / "latest_iforest_metadata.json"
+        pipe_path = models_dir / "latest_iforest_pipeline.joblib"
+
+        if not pipe_path.exists():
+            candidates = sorted(models_dir.glob("iforest_pipeline_*.joblib"), key=lambda p: p.stat().st_mtime)
+            if not candidates:
+                QtWidgets.QMessageBox.critical(None, "错误", "未找到模型，请先训练。")
+                return
+            pipe_path = candidates[-1]
+
+        if not meta_path.exists():
+            meta_candidates = sorted(models_dir.glob("iforest_metadata_*.json"), key=lambda p: p.stat().st_mtime)
+            meta_path = meta_candidates[-1] if meta_candidates else None
+
+        results_dir = Path(self._prediction_out_dir())
+        results_dir.mkdir(parents=True, exist_ok=True)
+        out_csv = results_dir / "out.csv"
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "src.services.pipeline_service",
+            "predict",
+            str(pipe_path),
+            feat_csv,
+            "--output",
+            str(out_csv),
+        ]
+        if meta_path and meta_path.exists():
+            cmd.extend(["--metadata", str(meta_path)])
+
+        self._set_action_buttons_enabled(False)
+        cursor_applied = False
+        try:
+            try:
+                QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+                cursor_applied = True
+            except Exception:
+                cursor_applied = False
+
+            try:
+                subprocess.run(cmd, check=True)
+            except subprocess.CalledProcessError as exc:
+                QtWidgets.QMessageBox.critical(
+                    None,
+                    "预测失败",
+                    "命令失败：\n{}\n{}".format(" ".join(cmd), exc),
+                )
+                self.display_result("[错误] 自动打标签失败：模型预测命令执行失败。")
+                return
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
+                self.display_result(f"[错误] 自动打标签失败：{exc}")
+                return
+
+            out_csv_str = str(out_csv)
+            self.display_result(f"[INFO] 自动打标签：预测输出 {out_csv_str}")
+            self._add_output(out_csv_str)
+            self._last_out_csv = out_csv_str
+            try:
+                self._open_csv_paged(out_csv_str)
+            except Exception:
+                pass
+
+            try:
+                stats = auto_annotate(out_csv_str, mode="conservative", write_benign=True, top_k=300)
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(None, "自动打标签失败", str(exc))
+                self.display_result(f"[错误] 自动打标签失败：{exc}")
+                return
+
+            stats = stats or {}
+            anomalies = int(stats.get("anomalies", 0))
+            normals = int(stats.get("normals", 0))
+            total = int(stats.get("total", 0))
+            added_a = int(stats.get("added_anomalies", stats.get("added_positive", 0)))
+            added_b = int(stats.get("added_normals", stats.get("added_negative", 0)))
+            message = (
+                "已写入 labels.csv\n"
+                f"异常: {anomalies}  正常: {normals}  总计: {total}\n\n"
+                f"本次新增 - 异常: {added_a}  正常: {added_b}\n"
+                f"预测结果：{out_csv_str}"
+            )
+            QtWidgets.QMessageBox.information(None, "自动打标签完成", message)
+            self.display_result(
+                f"[INFO] 自动打标签完成：累计标签 {total} 条（异常 {anomalies}，正常 {normals}），本次新增异常 {added_a}，正常 {added_b}。"
+            )
+        finally:
+            if cursor_applied:
+                try:
+                    QtWidgets.QApplication.restoreOverrideCursor()
+                except Exception:
+                    pass
+            self._set_action_buttons_enabled(True)
 
     # --------- 数据预处理（基于特征 CSV） ----------
     def _on_preprocess_features(self):

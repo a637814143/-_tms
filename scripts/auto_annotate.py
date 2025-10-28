@@ -1,95 +1,135 @@
-# -*- coding: utf-8 -*-
-import argparse, json, os
+"""Utility helpers for automatically annotating high-confidence predictions."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Optional
+
 import pandas as pd
 
-# 用你项目里的标注工具
-from src.functions.annotations import upsert_annotation
-# 读取 analysis 的候选列名时保持一致
-SCORE_CANDIDATES = ("anomaly_score", "score", "iforest_score")
-VOTE_COL = "vote_ratio"
+from src.functions.annotations import annotation_summary, upsert_annotation
 
-def _pick_score_col(df: pd.DataFrame) -> str:
-    for c in SCORE_CANDIDATES:
-        if c in df.columns:
-            return c
-    # 兜底：找名字里带 score 的
-    for c in df.columns:
-        if "score" in c.lower():
-            return c
-    raise RuntimeError("未找到分数字段，请确认预测CSV包含 anomaly_score/score 列")
 
-def _load_metadata(path: str | None) -> dict:
-    if path and os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh) or {}
-    return {}
+def _pick_numeric(df: pd.DataFrame, *names: str) -> Optional[pd.Series]:
+    for name in names:
+        if name in df.columns:
+            series = pd.to_numeric(df[name], errors="coerce")
+            return series
+    return None
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("results_csv", help="预测结果CSV（pipeline_service predict 的输出）")
-    ap.add_argument("--metadata", help="模型元数据JSON（训练产物）")
-    ap.add_argument("--mode", choices=["conservative","balanced","aggressive"],
-                    default="conservative", help="自动标注策略强度")
-    ap.add_argument("--write-benign", action="store_true",
-                    help="同时自动标注高置信度正常样本(label=0)")
-    args = ap.parse_args()
 
-    df = pd.read_csv(args.results_csv, encoding="utf-8")
-    score_col = _pick_score_col(df)
-    vote_col = VOTE_COL if VOTE_COL in df.columns else None
+def auto_annotate(
+    out_csv: str,
+    mode: str = "conservative",
+    write_benign: bool = False,
+    top_k: Optional[int] = None,
+) -> dict:
+    """Annotate high-confidence predictions into the global labels store."""
 
-    meta = _load_metadata(args.metadata)
-    thr = float(meta.get("threshold", float(df[score_col].quantile(0.05))))
-    vote_thr = float(meta.get("vote_threshold", 0.5))
-    # 分数越小越异常：你项目的最终判定是 score<=threshold 且 vote>=vote_threshold 才算异常
-    # （与训练/推理一致）
+    path = Path(out_csv)
+    if not path.exists():
+        raise FileNotFoundError(f"未找到预测结果文件：{out_csv}")
 
-    # 策略参数
-    if args.mode == "conservative":
-        p_anom = 0.01   # 仅拿最异常的1%
-        p_norm = 0.99   # 仅拿最正常的1%（可选）
-        vote_hi = max(vote_thr, 0.7)
-        vote_lo = 0.3
-    elif args.mode == "balanced":
-        p_anom = 0.03
-        p_norm = 0.97
-        vote_hi = max(vote_thr, 0.6)
-        vote_lo = 0.4
-    else:  # aggressive
-        p_anom = 0.05
-        p_norm = 0.95
-        vote_hi = max(vote_thr, 0.5)
-        vote_lo = 0.5
+    df = pd.read_csv(path, encoding="utf-8")
+    if df.empty:
+        stats = annotation_summary() or {}
+        stats.update({"added_anomalies": 0, "added_normals": 0})
+        return stats
 
-    # 计算分位点，低分=更异常
-    q_anom = float(df[score_col].quantile(p_anom))
-    q_norm = float(df[score_col].quantile(p_norm))
+    vote = _pick_numeric(df, "vote_ratio", "vote", "vote_score")
 
-    # 高置信度恶意：明显低于训练阈值/分位点，且投票高
-    if vote_col:
-        mask_anom = (df[score_col] <= min(thr, q_anom)) & (df[vote_col] >= vote_hi)
+    risk_score = _pick_numeric(df, "risk_score")
+    anomaly_score = _pick_numeric(df, "anomaly_score")
+
+    if risk_score is not None and risk_score.notna().any():
+        score = risk_score
+        higher_is_more_anom = True
+    elif anomaly_score is not None and anomaly_score.notna().any():
+        score = anomaly_score
+        higher_is_more_anom = False
     else:
-        mask_anom = (df[score_col] <= min(thr, q_anom))
+        raise ValueError("预测结果缺少 anomaly_score 或 risk_score 列，无法自动打标签。")
 
-    # 高置信度正常（可选）：明显高分且投票低
-    if args.write_benign:
-        if vote_col:
-            mask_norm = (df[score_col] >= q_norm) & (df[vote_col] <= vote_lo)
+    size = len(df)
+    if mode not in {"conservative", "balanced"}:
+        mode = "conservative"
+
+    if mode == "conservative":
+        default_k = max(100, int(size * 0.01))
+        vote_threshold = 0.7
+        benign_quantile = 0.97
+    else:
+        default_k = max(300, int(size * 0.03))
+        vote_threshold = 0.6
+        benign_quantile = 0.95
+
+    if top_k is None:
+        top_k = default_k
+    top_k = max(0, int(top_k))
+
+    score_valid = score.dropna()
+    effective_k = min(len(score_valid), top_k)
+
+    if effective_k > 0:
+        if higher_is_more_anom:
+            mal_idx = score_valid.nlargest(effective_k).index
         else:
-            mask_norm = (df[score_col] >= q_norm)
+            mal_idx = score_valid.nsmallest(effective_k).index
     else:
-        mask_norm = pd.Series([False]*len(df))
+        mal_idx = pd.Index([])
 
-    n_pos = int(mask_anom.sum())
-    n_neg = int(mask_norm.sum())
+    mal_mask = df.index.isin(mal_idx)
+    if vote is not None:
+        vote_mask = vote.fillna(1.0) >= vote_threshold
+        mal_mask &= vote_mask
 
-    for _, row in df[mask_anom].iterrows():
-        upsert_annotation(row.to_dict(), label=1.0, annotator="auto", notes=f"auto:{args.mode}")
+    ben_mask = None
+    if write_benign:
+        base_series = anomaly_score if anomaly_score is not None else score
+        base_series = base_series.dropna()
+        if not base_series.empty:
+            if higher_is_more_anom:
+                cutoff = base_series.quantile(1 - benign_quantile)
+                if pd.isna(cutoff):
+                    ben_mask = pd.Series(False, index=df.index)
+                else:
+                    ben_mask = (base_series <= cutoff).reindex(df.index, fill_value=False)
+            else:
+                cutoff = base_series.quantile(benign_quantile)
+                if pd.isna(cutoff):
+                    ben_mask = pd.Series(False, index=df.index)
+                else:
+                    ben_mask = (base_series >= cutoff).reindex(df.index, fill_value=False)
+        else:
+            ben_mask = pd.Series(False, index=df.index)
 
-    for _, row in df[mask_norm].iterrows():
-        upsert_annotation(row.to_dict(), label=0.0, annotator="auto", notes=f"auto:{args.mode}")
+    added_pos = 0
+    added_neg = 0
+    if mal_mask.any():
+        for _, row in df[mal_mask].iterrows():
+            upsert_annotation(row.to_dict(), label=1.0, annotator="auto", notes=f"auto:{mode}")
+            added_pos += 1
 
-    print(f"[auto-annotate] positive={n_pos}, benign={n_neg}, total={n_pos+n_neg}")
+    if isinstance(ben_mask, pd.Series):
+        aligned_mask = ben_mask.reindex(df.index, fill_value=False)
+        for _, row in df[aligned_mask].iterrows():
+            upsert_annotation(row.to_dict(), label=0.0, annotator="auto", notes=f"auto:{mode}")
+            added_neg += 1
+
+    stats = annotation_summary() or {}
+    stats.update({"added_anomalies": added_pos, "added_normals": added_neg})
+    return stats
+
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Auto annotate prediction results.")
+    parser.add_argument("out_csv", help="Path to prediction output CSV")
+    parser.add_argument("--mode", default="conservative", choices=["conservative", "balanced"], help="Selection mode")
+    parser.add_argument("--write-benign", action="store_true", help="Also write high-confidence benign samples")
+    parser.add_argument("--top_k", type=int, help="Override number of anomaly samples to annotate")
+    args = parser.parse_args()
+
+    result = auto_annotate(args.out_csv, args.mode, args.write_benign, args.top_k)
+    print(result)
