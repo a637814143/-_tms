@@ -1,8 +1,102 @@
-from static_features import extract_pcap_features
+"""Command line utilities for PCAP feature extraction and ML workflows."""
 
-result = extract_pcap_features(r"D:\pythonProject8\data\split\22.pcapng")
-if result["success"]:
-    print(f"共解析到 {len(result['flows'])} 条流")
-    print(result["flows"][0])  # 示例：打印第一条流的全部特征
-else:
-    print("解析失败：", result["error"])
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+from typing import Sequence
+
+from .modeling import detect_pcap_with_model, train_hist_gradient_boosting
+from .vectorizer import vectorize_pcaps
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    vec_parser = subparsers.add_parser("vectorize", help="Extract and vectorize PCAP flows")
+    vec_parser.add_argument("output", type=Path, help="Destination npz file")
+    vec_parser.add_argument("pcaps", nargs="+", help="PCAP files to process")
+    vec_parser.add_argument(
+        "--label",
+        type=int,
+        default=None,
+        help="Optional label applied to all provided PCAP files",
+    )
+
+    train_parser = subparsers.add_parser("train", help="Train a tree-based classifier")
+    train_parser.add_argument("dataset", type=Path, help="Vectorized dataset (.npz)")
+    train_parser.add_argument("model", type=Path, help="Output model path (model.txt)")
+    train_parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="Override the default number of boosting iterations",
+    )
+
+    detect_parser = subparsers.add_parser("detect", help="Run inference on a PCAP file")
+    detect_parser.add_argument("model", type=Path, help="Trained model path")
+    detect_parser.add_argument("pcap", type=Path, help="PCAP file to analyse")
+
+    return parser
+
+
+def _handle_vectorize(output: Path, pcaps: Sequence[str], label: int | None) -> None:
+    items = [(pcap, label) for pcap in pcaps]
+    summary = vectorize_pcaps(items, output)
+    print(
+        f"Saved dataset to {summary.path} with {summary.flow_count} flows and {summary.feature_count} features"
+    )
+    if summary.has_labels:
+        print("Labels detected in dataset")
+    else:
+        print("Dataset saved without labels")
+
+
+def _handle_train(dataset: Path, model: Path, iterations: int | None) -> None:
+    kwargs = {}
+    if iterations is not None:
+        kwargs["max_iter"] = iterations
+    summary = train_hist_gradient_boosting(dataset, model, **kwargs)
+    print(
+        "Model trained on {flows} flows across {features} features. Classes: {classes}. Saved to {path}".format(
+            flows=summary.flow_count,
+            features=len(summary.feature_names),
+            classes=summary.classes,
+            path=summary.model_path,
+        )
+    )
+
+
+def _handle_detect(model: Path, pcap: Path) -> None:
+    result = detect_pcap_with_model(model, pcap)
+    if not result.success:
+        raise SystemExit(f"Detection failed: {result.error}")
+
+    suspicious = sum(1 for value in result.predictions if value != 0)
+    print(
+        "Analysed {flows} flows. Suspicious flows: {suspicious}.".format(
+            flows=result.flow_count, suspicious=suspicious
+        )
+    )
+    if result.flow_count:
+        top_score = max(result.scores)
+        print(f"Highest malicious score: {top_score:.3f}")
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command == "vectorize":
+        _handle_vectorize(args.output, args.pcaps, args.label)
+    elif args.command == "train":
+        _handle_train(args.dataset, args.model, args.iterations)
+    elif args.command == "detect":
+        _handle_detect(args.model, args.pcap)
+    else:  # pragma: no cover - defensive
+        parser.error(f"Unsupported command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()
