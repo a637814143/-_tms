@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import dpkt
+from dpkt import icmp, icmp6, udp
 import numpy as np
 import pandas as pd
 
@@ -29,6 +30,8 @@ TCP_FLAG_MAP = {
     "psh": dpkt.tcp.TH_PUSH,
     "ack": dpkt.tcp.TH_ACK,
     "urg": dpkt.tcp.TH_URG,
+    "cwr": getattr(dpkt.tcp, "TH_CWR", 0),
+    "ece": getattr(dpkt.tcp, "TH_ECE", 0),
 }
 
 logger = get_logger(__name__)
@@ -262,6 +265,60 @@ def _hist_features(values: List[float], bins: np.ndarray, prefix: str) -> Dict[s
     return {f"{prefix}_{i:03d}": int(hist[i]) for i in range(hist.size)}
 
 
+def _payload_length(transport) -> int:
+    if transport is None:
+        return 0
+    if isinstance(transport, dpkt.tcp.TCP):
+        data = transport.data or b""
+        return int(len(data))
+    if isinstance(transport, udp.UDP):
+        data = transport.data or b""
+        return int(len(data))
+    data = getattr(transport, "data", b"")
+    if isinstance(data, (bytes, bytearray)):
+        return int(len(data))
+    try:
+        return int(len(bytes(data)))
+    except Exception:
+        if hasattr(data, "pack"):
+            try:
+                return int(len(data.pack()))
+            except Exception:
+                return 0
+        return 0
+
+
+def _header_length(ip_layer, transport) -> int:
+    ip_header = 0
+    if isinstance(ip_layer, dpkt.ip.IP):
+        ip_header = int(getattr(ip_layer, "hl", 0)) * 4
+        if ip_header <= 0:
+            ip_header = 20
+    elif isinstance(ip_layer, dpkt.ip6.IP6):
+        ip_header = 40
+
+    transport_header = 0
+    if isinstance(transport, dpkt.tcp.TCP):
+        offset = int(getattr(transport, "off", 0))
+        transport_header = offset * 4 if offset else 20
+    elif isinstance(transport, udp.UDP):
+        transport_header = 8
+    elif isinstance(transport, (icmp.ICMP, icmp6.ICMP6)):
+        transport_header = 8
+    else:
+        try:
+            raw = bytes(transport)
+            data = getattr(transport, "data", b"")
+            payload_len = len(data) if isinstance(data, (bytes, bytearray)) else 0
+            if payload_len <= len(raw):
+                transport_header = len(raw) - payload_len
+        except Exception:
+            transport_header = 0
+
+    total = ip_header + transport_header
+    return int(total) if total > 0 else 0
+
+
 def _inter_arrivals(times: List[float]) -> np.ndarray:
     if len(times) < 2:
         return np.empty(0, dtype=float)
@@ -322,6 +379,56 @@ def _burst_statistics(arr: np.ndarray, threshold: float = 0.05) -> Dict[str, flo
     }
 
 
+def _duration_stats(values: List[float]) -> Dict[str, float]:
+    if not values:
+        return {"mean": 0.0, "std": 0.0, "max": 0.0, "min": 0.0}
+    arr = np.asarray(values, dtype=float)
+    return {
+        "mean": float(arr.mean()),
+        "std": float(arr.std(ddof=0)) if arr.size > 1 else 0.0,
+        "max": float(arr.max()),
+        "min": float(arr.min()),
+    }
+
+
+def _activity_idle_metrics(times: List[float], threshold: float = 1.0) -> Tuple[Dict[str, float], Dict[str, float]]:
+    if len(times) <= 1:
+        return _duration_stats([]), _duration_stats([])
+    arr = np.sort(np.asarray(times, dtype=float))
+    active_periods: List[float] = []
+    idle_periods: List[float] = []
+    start = float(arr[0])
+    last = float(arr[0])
+    for value in arr[1:]:
+        gap = float(max(value - last, 0.0))
+        if gap <= threshold:
+            last = float(value)
+            continue
+        active_periods.append(max(last - start, 0.0))
+        idle_periods.append(gap)
+        start = float(value)
+        last = float(value)
+    active_periods.append(max(last - start, 0.0))
+    return _duration_stats(active_periods), _duration_stats(idle_periods)
+
+
+def _bulk_metrics(lengths: List[int], times: List[float]) -> Dict[str, float]:
+    if not lengths:
+        return {"avg_bytes": 0.0, "avg_packets": 0.0, "avg_rate": 0.0}
+    total_bytes = float(sum(int(v) for v in lengths))
+    total_packets = float(len(lengths))
+    if len(times) >= 2:
+        duration = float(max(times) - min(times))
+    else:
+        duration = 0.0
+    avg_rate = total_bytes / duration if duration > 0 else 0.0
+    return {
+        "avg_bytes": total_bytes,
+        "avg_packets": total_packets,
+        "avg_rate": avg_rate,
+    }
+
+
 def _window_activity_metrics(times: List[float], window_size: float = 1.0) -> Dict[str, float]:
     if len(times) == 0:
         return {
@@ -377,6 +484,10 @@ class FlowAccumulator:
     backward_lengths: List[int] = field(default_factory=list)
     forward_times: List[float] = field(default_factory=list)
     backward_times: List[float] = field(default_factory=list)
+    forward_payload_lengths: List[int] = field(default_factory=list)
+    backward_payload_lengths: List[int] = field(default_factory=list)
+    forward_header_lengths: List[int] = field(default_factory=list)
+    backward_header_lengths: List[int] = field(default_factory=list)
     forward_flags: Counter = field(default_factory=Counter)
     backward_flags: Counter = field(default_factory=Counter)
     forward_windows: List[int] = field(default_factory=list)
@@ -391,6 +502,8 @@ class FlowAccumulator:
         direction: str,
         flags: Optional[int] = None,
         window: Optional[int] = None,
+        payload_length: Optional[int] = None,
+        header_length: Optional[int] = None,
     ) -> None:
         if self.truncated:
             return
@@ -403,6 +516,10 @@ class FlowAccumulator:
         if direction == "fwd":
             self.forward_lengths.append(length)
             self.forward_times.append(timestamp)
+            payload = int(payload_length or 0)
+            header = int(header_length or 0)
+            self.forward_payload_lengths.append(payload)
+            self.forward_header_lengths.append(header)
             if window is not None:
                 try:
                     self.forward_windows.append(int(window))
@@ -415,6 +532,10 @@ class FlowAccumulator:
         else:
             self.backward_lengths.append(length)
             self.backward_times.append(timestamp)
+            payload = int(payload_length or 0)
+            header = int(header_length or 0)
+            self.backward_payload_lengths.append(payload)
+            self.backward_header_lengths.append(header)
             if window is not None:
                 try:
                     self.backward_windows.append(int(window))
@@ -455,11 +576,57 @@ class FlowAccumulator:
         total_packets = fwd_stats["count"] + bwd_stats["count"]
         total_bytes = fwd_stats["total"] + bwd_stats["total"]
 
+        combined_lengths = self.forward_lengths + self.backward_lengths
+        combined_stats = _stats(combined_lengths)
+        combined_arr = (
+            np.asarray(combined_lengths, dtype=float)
+            if combined_lengths
+            else np.asarray([], dtype=float)
+        )
+        combined_var = float(np.var(combined_arr, ddof=0)) if combined_arr.size > 1 else 0.0
+
         all_times = self.forward_times + self.backward_times
+        flow_start_time = float(min(all_times)) if all_times else 0.0
+
+        active_stats, idle_stats = _activity_idle_metrics(all_times)
+
+        fwd_bulk = _bulk_metrics(self.forward_payload_lengths, self.forward_times)
+        bwd_bulk = _bulk_metrics(self.backward_payload_lengths, self.backward_times)
+
+        fwd_header_total = (
+            float(sum(self.forward_header_lengths))
+            if self.forward_header_lengths
+            else 0.0
+        )
+        bwd_header_total = (
+            float(sum(self.backward_header_lengths))
+            if self.backward_header_lengths
+            else 0.0
+        )
+
+        act_data_fwd = int(sum(1 for value in self.forward_payload_lengths if value > 0))
+        min_seg_fwd = float(
+            min((value for value in self.forward_payload_lengths if value > 0), default=0)
+        )
+        init_win_fwd = float(self.forward_windows[0]) if self.forward_windows else 0.0
+        init_win_bwd = float(self.backward_windows[0]) if self.backward_windows else 0.0
+
         if all_times:
             duration = float(max(all_times) - min(all_times))
         else:
             duration = 0.0
+
+        fwd_packets_per_s = (
+            float(fwd_stats["count"]) / duration if duration > 0 else 0.0
+        )
+        bwd_packets_per_s = (
+            float(bwd_stats["count"]) / duration if duration > 0 else 0.0
+        )
+        down_up_ratio = (
+            float(bwd_stats["total"]) / float(fwd_stats["total"])
+            if fwd_stats["total"] > 0
+            else float(bwd_stats["total"])
+        )
 
         fwd_intervals = _inter_arrivals(self.forward_times)
         bwd_intervals = _inter_arrivals(self.backward_times)
@@ -473,6 +640,7 @@ class FlowAccumulator:
                     "median": 0.0,
                     "p90": 0.0,
                     "p95": 0.0,
+                    "min": 0.0,
                     "max": 0.0,
                     "burstiness": 0.0,
                     "cv": 0.0,
@@ -489,6 +657,7 @@ class FlowAccumulator:
                 "median": float(np.quantile(arr, 0.5)),
                 "p90": float(np.quantile(arr, 0.9)),
                 "p95": float(np.quantile(arr, 0.95)),
+                "min": float(arr.min()),
                 "max": float(arr.max()),
                 "burstiness": _burstiness(arr),
                 "cv": float(np.clip(cv_val, 0.0, 1e3)),
@@ -508,6 +677,21 @@ class FlowAccumulator:
         bwd_bursts = _burst_statistics(bwd_intervals)
         combined_bursts = _burst_statistics(all_intervals)
         entropy_all = _temporal_entropy(all_intervals)
+
+        flow_iat_total = float(all_intervals.sum()) if all_intervals.size else 0.0
+        flow_iat_min = float(all_intervals.min()) if all_intervals.size else 0.0
+        flow_iat_max = float(all_intervals.max()) if all_intervals.size else 0.0
+        flow_iat_std = float(all_intervals.std(ddof=0)) if all_intervals.size > 1 else 0.0
+
+        fwd_iat_total = float(fwd_intervals.sum()) if fwd_intervals.size else 0.0
+        fwd_iat_min = float(fwd_intervals.min()) if fwd_intervals.size else 0.0
+        fwd_iat_max = float(fwd_intervals.max()) if fwd_intervals.size else 0.0
+        fwd_iat_std = float(fwd_intervals.std(ddof=0)) if fwd_intervals.size > 1 else 0.0
+
+        bwd_iat_total = float(bwd_intervals.sum()) if bwd_intervals.size else 0.0
+        bwd_iat_min = float(bwd_intervals.min()) if bwd_intervals.size else 0.0
+        bwd_iat_max = float(bwd_intervals.max()) if bwd_intervals.size else 0.0
+        bwd_iat_std = float(bwd_intervals.std(ddof=0)) if bwd_intervals.size > 1 else 0.0
 
         total_window_stats = _window_activity_metrics(all_times)
         fwd_window_activity = _window_activity_metrics(self.forward_times)
@@ -618,6 +802,51 @@ class FlowAccumulator:
             "window_packets_bwd_max": bwd_window_activity["max"],
             "window_activity_fwd": fwd_window_activity["active_ratio"],
             "window_activity_bwd": bwd_window_activity["active_ratio"],
+            "combined_pkt_len_mean": combined_stats["mean"],
+            "combined_pkt_len_std": combined_stats["std"],
+            "combined_pkt_len_max": combined_stats["max"],
+            "combined_pkt_len_min": combined_stats["min"],
+            "combined_pkt_len_var": combined_var,
+            "fwd_header_length_total": fwd_header_total,
+            "bwd_header_length_total": bwd_header_total,
+            "fwd_packets_per_second": fwd_packets_per_s,
+            "bwd_packets_per_second": bwd_packets_per_s,
+            "down_up_ratio": down_up_ratio,
+            "act_data_pkt_fwd": float(act_data_fwd),
+            "min_seg_size_forward": min_seg_fwd,
+            "init_win_bytes_forward": init_win_fwd,
+            "init_win_bytes_backward": init_win_bwd,
+            "active_mean": active_stats["mean"],
+            "active_std": active_stats["std"],
+            "active_max": active_stats["max"],
+            "active_min": active_stats["min"],
+            "idle_mean": idle_stats["mean"],
+            "idle_std": idle_stats["std"],
+            "idle_max": idle_stats["max"],
+            "idle_min": idle_stats["min"],
+            "flow_start_time": flow_start_time,
+            "flow_iat_total": flow_iat_total,
+            "flow_iat_min": flow_iat_min,
+            "flow_iat_max": flow_iat_max,
+            "flow_iat_std": flow_iat_std,
+            "fwd_iat_total": fwd_iat_total,
+            "fwd_iat_min": fwd_iat_min,
+            "fwd_iat_max": fwd_iat_max,
+            "fwd_iat_std": fwd_iat_std,
+            "bwd_iat_total": bwd_iat_total,
+            "bwd_iat_min": bwd_iat_min,
+            "bwd_iat_max": bwd_iat_max,
+            "bwd_iat_std": bwd_iat_std,
+            "fwd_bulk_avg_bytes": fwd_bulk["avg_bytes"],
+            "fwd_bulk_avg_packets": fwd_bulk["avg_packets"],
+            "fwd_bulk_avg_rate": fwd_bulk["avg_rate"],
+            "bwd_bulk_avg_bytes": bwd_bulk["avg_bytes"],
+            "bwd_bulk_avg_packets": bwd_bulk["avg_packets"],
+            "bwd_bulk_avg_rate": bwd_bulk["avg_rate"],
+            "subflow_fwd_packets": fwd_stats["count"],
+            "subflow_bwd_packets": bwd_stats["count"],
+            "subflow_fwd_bytes": fwd_stats["total"],
+            "subflow_bwd_bytes": bwd_stats["total"],
         }
 
         max_idle = max(fwd_interval_stats["max"], bwd_interval_stats["max"])
@@ -655,6 +884,12 @@ class FlowAccumulator:
         features["ack_to_packet_ratio"] = (
             float(ack_total) / float(total_packets) if total_packets else 0.0
         )
+        fin_total = self.forward_flags.get("fin", 0) + self.backward_flags.get("fin", 0)
+        syn_total = self.forward_flags.get("syn", 0) + self.backward_flags.get("syn", 0)
+        psh_total = self.forward_flags.get("psh", 0) + self.backward_flags.get("psh", 0)
+        urg_total = self.forward_flags.get("urg", 0) + self.backward_flags.get("urg", 0)
+        cwr_total = self.forward_flags.get("cwr", 0) + self.backward_flags.get("cwr", 0)
+        ece_total = self.forward_flags.get("ece", 0) + self.backward_flags.get("ece", 0)
 
         def _window_stats(values: List[int]) -> Dict[str, float]:
             if not values:
@@ -686,6 +921,95 @@ class FlowAccumulator:
         ) if base_mean else 0.0
 
         features["flow_truncated"] = int(self.truncated)
+
+        alias_features = {
+            "Flow ID": features["flow_id"],
+            "Source IP": self.src_ip,
+            "Source Port": int(self.src_port),
+            "Destination IP": self.dst_ip,
+            "Destination Port": int(self.dst_port),
+            "Protocol": self.protocol,
+            "Timestamp": flow_start_time,
+            "Flow Duration": duration,
+            "Total Fwd Packets": float(fwd_stats["count"]),
+            "Total Backward Packets": float(bwd_stats["count"]),
+            "Total Length of Fwd Packets": float(fwd_stats["total"]),
+            "Total Length of Bwd Packets": float(bwd_stats["total"]),
+            "Fwd Packet Length Max": float(fwd_stats["max"]),
+            "Fwd Packet Length Min": float(fwd_stats["min"]),
+            "Fwd Packet Length Mean": float(fwd_stats["mean"]),
+            "Fwd Packet Length Std": float(fwd_stats["std"]),
+            "Bwd Packet Length Max": float(bwd_stats["max"]),
+            "Bwd Packet Length Min": float(bwd_stats["min"]),
+            "Bwd Packet Length Mean": float(bwd_stats["mean"]),
+            "Bwd Packet Length Std": float(bwd_stats["std"]),
+            "Flow Bytes/s": features["throughput_bytes_s"],
+            "Flow Packets/s": features["packets_per_s"],
+            "Flow IAT Mean": combined_interval_stats["mean"],
+            "Flow IAT Std": combined_interval_stats["std"],
+            "Flow IAT Max": combined_interval_stats["max"],
+            "Flow IAT Min": combined_interval_stats["min"],
+            "Fwd IAT Total": fwd_iat_total,
+            "Fwd IAT Mean": fwd_interval_stats["mean"],
+            "Fwd IAT Std": fwd_iat_std,
+            "Fwd IAT Max": fwd_iat_max,
+            "Fwd IAT Min": fwd_iat_min,
+            "Bwd IAT Total": bwd_iat_total,
+            "Bwd IAT Mean": bwd_interval_stats["mean"],
+            "Bwd IAT Std": bwd_iat_std,
+            "Bwd IAT Max": bwd_iat_max,
+            "Bwd IAT Min": bwd_iat_min,
+            "Fwd PSH Flags": float(self.forward_flags.get("psh", 0)),
+            "Bwd PSH Flags": float(self.backward_flags.get("psh", 0)),
+            "Fwd URG Flags": float(self.forward_flags.get("urg", 0)),
+            "Bwd URG Flags": float(self.backward_flags.get("urg", 0)),
+            "Fwd Header Length": fwd_header_total,
+            "Bwd Header Length": bwd_header_total,
+            "Fwd Packets/s": fwd_packets_per_s,
+            "Bwd Packets/s": bwd_packets_per_s,
+            "Min Packet Length": float(combined_stats["min"]),
+            "Max Packet Length": float(combined_stats["max"]),
+            "Packet Length Mean": combined_stats["mean"],
+            "Packet Length Std": combined_stats["std"],
+            "Packet Length Variance": combined_var,
+            "FIN Flag Count": float(fin_total),
+            "SYN Flag Count": float(syn_total),
+            "RST Flag Count": float(rst_total),
+            "PSH Flag Count": float(psh_total),
+            "ACK Flag Count": float(ack_total),
+            "URG Flag Count": float(urg_total),
+            "CWE Flag Count": float(cwr_total),
+            "ECE Flag Count": float(ece_total),
+            "Down/Up Ratio": down_up_ratio,
+            "Average Packet Size": features["avg_pkt_size"],
+            "Avg Fwd Segment Size": float(fwd_stats["mean"]),
+            "Avg Bwd Segment Size": float(bwd_stats["mean"]),
+            "Fwd Avg Bytes/Bulk": fwd_bulk["avg_bytes"],
+            "Fwd Avg Packets/Bulk": fwd_bulk["avg_packets"],
+            "Fwd Avg Bulk Rate": fwd_bulk["avg_rate"],
+            "Bwd Avg Bytes/Bulk": bwd_bulk["avg_bytes"],
+            "Bwd Avg Packets/Bulk": bwd_bulk["avg_packets"],
+            "Bwd Avg Bulk Rate": bwd_bulk["avg_rate"],
+            "Subflow Fwd Packets": float(fwd_stats["count"]),
+            "Subflow Fwd Bytes": float(fwd_stats["total"]),
+            "Subflow Bwd Packets": float(bwd_stats["count"]),
+            "Subflow Bwd Bytes": float(bwd_stats["total"]),
+            "Init_Win_bytes_forward": init_win_fwd,
+            "Init_Win_bytes_backward": init_win_bwd,
+            "act_data_pkt_fwd": float(act_data_fwd),
+            "min_seg_size_forward": min_seg_fwd,
+            "Active Mean": active_stats["mean"],
+            "Active Std": active_stats["std"],
+            "Active Max": active_stats["max"],
+            "Active Min": active_stats["min"],
+            "Idle Mean": idle_stats["mean"],
+            "Idle Std": idle_stats["std"],
+            "Idle Max": idle_stats["max"],
+            "Idle Min": idle_stats["min"],
+            "Label": "",
+        }
+        for key, value in alias_features.items():
+            features[key] = value
 
         if PLUGIN_EXTRACTORS:
             base_snapshot = dict(features)
@@ -792,12 +1116,17 @@ def extract_features(
                     elif proto_name == "UDP":
                         window_size = None
 
+                    payload_length = _payload_length(transport)
+                    header_size = _header_length(ip_layer, transport)
+
                     acc.add_packet(
                         length=len(buf),
                         timestamp=float(ts),
                         direction=direction,
                         flags=flags,
                         window=window_size,
+                        payload_length=payload_length,
+                        header_length=header_size,
                     )
                 except Exception:
                     continue
