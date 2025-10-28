@@ -3,7 +3,7 @@
 from .modeling import DetectionResult, TrainingSummary, detect_pcap_with_model, train_hist_gradient_boosting
 from .static_features import extract_pcap_features
 from .vectorizer import (
-    NPZDatasetSummary,
+    CSVDatasetSummary,
     VectorizationResult,
     load_vectorized_dataset,
     vectorize_flows,
@@ -12,7 +12,7 @@ from .vectorizer import (
 
 __all__ = [
     "DetectionResult",
-    "NPZDatasetSummary",
+    "CSVDatasetSummary",
     "TrainingSummary",
     "VectorizationResult",
     "detect_pcap_with_model",

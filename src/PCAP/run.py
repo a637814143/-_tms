@@ -15,7 +15,7 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     vec_parser = subparsers.add_parser("vectorize", help="Extract and vectorize PCAP flows")
-    vec_parser.add_argument("output", type=Path, help="Destination npz file")
+    vec_parser.add_argument("output", type=Path, help="Destination CSV file")
     vec_parser.add_argument("pcaps", nargs="+", help="PCAP files to process")
     vec_parser.add_argument(
         "--label",
@@ -25,7 +25,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     train_parser = subparsers.add_parser("train", help="Train a tree-based classifier")
-    train_parser.add_argument("dataset", type=Path, help="Vectorized dataset (.npz)")
+    train_parser.add_argument("dataset", type=Path, help="Vectorized dataset (.csv)")
     train_parser.add_argument("model", type=Path, help="Output model path (model.txt)")
     train_parser.add_argument(
         "--iterations",
@@ -44,13 +44,9 @@ def _build_parser() -> argparse.ArgumentParser:
 def _handle_vectorize(output: Path, pcaps: Sequence[str], label: int | None) -> None:
     items = [(pcap, label) for pcap in pcaps]
     summary = vectorize_pcaps(items, output)
-    print(
-        f"Saved dataset to {summary.path} with {summary.flow_count} flows and {summary.feature_count} features"
-    )
-    if summary.has_labels:
-        print("Labels detected in dataset")
-    else:
-        print("Dataset saved without labels")
+    print(f"Saved dataset to {summary.path} with {summary.flow_count} flows")
+    label_note = "with labels" if summary.has_labels else "without labels"
+    print(f"CSV includes {summary.column_count} columns {label_note}.")
 
 
 def _handle_train(dataset: Path, model: Path, iterations: int | None) -> None:
