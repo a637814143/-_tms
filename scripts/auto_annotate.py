@@ -8,6 +8,7 @@ from typing import Optional
 import pandas as pd
 
 from src.functions.annotations import annotation_summary, upsert_annotation
+from src.functions.csv_utils import read_csv_flexible
 
 
 def _pick_numeric(df: pd.DataFrame, *names: str) -> Optional[pd.Series]:
@@ -30,7 +31,7 @@ def auto_annotate(
     if not path.exists():
         raise FileNotFoundError(f"未找到预测结果文件：{out_csv}")
 
-    df = pd.read_csv(path, encoding="utf-8")
+    df = read_csv_flexible(path)
     if df.empty:
         stats = annotation_summary() or {}
         stats.update({"added_anomalies": 0, "added_normals": 0})

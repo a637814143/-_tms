@@ -33,6 +33,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     extract_features_dir = None  # type: ignore
 from src.functions.logging_utils import get_logger, log_model_event
+from src.functions.csv_utils import read_csv_flexible
 try:
     from src.functions.unsupervised_train import (
         compute_risk_components,
@@ -112,7 +113,10 @@ def _run_prediction(
             )
 
         pipeline = joblib_load(pipeline_path)
-        df = pd.read_csv(feature_csv, encoding="utf-8")
+        try:
+            df = read_csv_flexible(feature_csv)
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"无法读取特征 CSV，请检查文件编码：{exc}") from exc
         if df.empty:
             raise RuntimeError("特征 CSV 为空，无法预测。")
 

@@ -21,6 +21,7 @@ from src.functions.feature_extractor import (
     extract_features_dir as fe_dir,
     get_loaded_plugin_info,
 )
+from src.functions.csv_utils import read_csv_flexible
 try:
     from src.functions.unsupervised_train import (
         META_COLUMNS as TRAIN_META_COLUMNS,
@@ -215,6 +216,7 @@ PATHS = get_paths(
         "results_abnormal": "results_abnormal_dir",
         "results": "results_dir",
         "logs": "logs_dir",
+        "settings": "settings_dir",
     }
 )
 if "results" in PATHS and "results_analysis" not in PATHS:
@@ -223,7 +225,17 @@ if "results" in PATHS and "results_pred" not in PATHS:
     PATHS["results_pred"] = PATHS["results"] / "modelprediction"
 if "results" in PATHS and "results_abnormal" not in PATHS:
     PATHS["results_abnormal"] = PATHS["results"] / "abnormal"
-for key in ("split", "csv_info", "csv_feature", "csv_preprocess", "models", "results_analysis", "results_pred", "results_abnormal"):
+for key in (
+    "split",
+    "csv_info",
+    "csv_feature",
+    "csv_preprocess",
+    "models",
+    "results_analysis",
+    "results_pred",
+    "results_abnormal",
+    "settings",
+):
     if key not in PATHS:
         PATHS[key] = DATA_BASE / {
             "split": "split",
@@ -234,6 +246,7 @@ for key in ("split", "csv_info", "csv_feature", "csv_preprocess", "models", "res
             "results_analysis": "results/analysis",
             "results_pred": "results/modelprediction",
             "results_abnormal": "results/abnormal",
+            "settings": "settings",
         }[key]
     PATHS[key].mkdir(parents=True, exist_ok=True)
 
@@ -241,7 +254,9 @@ default_logs = PATHS.get("logs", DATA_BASE / "logs")
 logs_env = os.getenv("MALDET_LOG_DIR")
 LOGS_DIR = Path(logs_env).expanduser().resolve() if logs_env else Path(default_logs).expanduser().resolve()
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
-SETTINGS_PATH = DATA_BASE / "settings.json"
+SETTINGS_DIR = PATHS.get("settings", DATA_BASE / "settings")
+SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+SETTINGS_PATH = SETTINGS_DIR / "settings.json"
 
 MODEL_SCHEMA_VERSION = "2025.10"
 
@@ -1766,7 +1781,7 @@ class Ui_MainWindow(object):
             progress_cb(55)
 
         try:
-            df = pd.read_csv(feature_csv, encoding="utf-8")
+            df = read_csv_flexible(feature_csv)
         except Exception as exc:
             raise RuntimeError(f"读取特征失败：{exc}") from exc
 
@@ -2390,7 +2405,11 @@ class Ui_MainWindow(object):
         page = max(1, min(total_pages, page))
         skip = (page - 1) * page_size
         try:
-            df = pd.read_csv(self._csv_paged_path, skiprows=range(1, 1 + skip), nrows=page_size, encoding="utf-8")
+            df = read_csv_flexible(
+                self._csv_paged_path,
+                skiprows=range(1, 1 + skip),
+                nrows=page_size,
+            )
         except Exception as e:
             QtWidgets.QMessageBox.critical(None, "分页读取失败", str(e)); return
         self._csv_current_page = page
@@ -2419,7 +2438,7 @@ class Ui_MainWindow(object):
         app = QtWidgets.QApplication.instance()
         app.setOverrideCursor(QtCore.Qt.WaitCursor)
         try:
-            df = pd.read_csv(csv_path, encoding="utf-8")
+            df = read_csv_flexible(csv_path)
             self.populate_table_from_df(df)
             self.display_result(f"[INFO] 已加载全部 {len(df)} 行。")
             self._csv_paged_path = None; self._csv_total_rows = None; self._csv_current_page = 1
@@ -2614,7 +2633,7 @@ class Ui_MainWindow(object):
 
         try:
             if self._last_out_csv and os.path.exists(self._last_out_csv):
-                df_full = pd.read_csv(self._last_out_csv, encoding="utf-8")
+                df_full = read_csv_flexible(self._last_out_csv)
                 labels = apply_annotations_to_frame(df_full)
                 if labels is not None:
                     df_full = df_full.copy()
@@ -3034,7 +3053,7 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 特征提取完成，CSV已保存: {csv}")
         self._add_output(csv)
         try:
-            df = pd.read_csv(csv, nrows=50, encoding="utf-8")
+            df = read_csv_flexible(csv, nrows=50)
             self.populate_table_from_df(df)
             self._last_out_csv = csv
             self._open_csv_paged(csv)
@@ -3052,7 +3071,7 @@ class Ui_MainWindow(object):
         if csv_list:
             first = csv_list[0]
             try:
-                df = pd.read_csv(first, nrows=50, encoding="utf-8")
+                df = read_csv_flexible(first, nrows=50)
                 self.populate_table_from_df(df)
                 self._last_out_csv = first
                 self._open_csv_paged(first)
@@ -3111,7 +3130,10 @@ class Ui_MainWindow(object):
             cmd.extend(["--metadata", str(meta_path)])
 
         self._set_action_buttons_enabled(False)
+        self.btn_auto_label.setEnabled(False)
+        self.set_button_progress(self.btn_auto_label, 5)
         cursor_applied = False
+        success = False
         try:
             try:
                 QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
@@ -3120,7 +3142,9 @@ class Ui_MainWindow(object):
                 cursor_applied = False
 
             try:
+                self.set_button_progress(self.btn_auto_label, 25)
                 subprocess.run(cmd, check=True)
+                self.set_button_progress(self.btn_auto_label, 55)
             except subprocess.CalledProcessError as exc:
                 QtWidgets.QMessageBox.critical(
                     None,
@@ -3144,7 +3168,9 @@ class Ui_MainWindow(object):
                 pass
 
             try:
+                self.set_button_progress(self.btn_auto_label, 80)
                 stats = auto_annotate(out_csv_str, mode="conservative", write_benign=True, top_k=300)
+                self.set_button_progress(self.btn_auto_label, 95)
             except Exception as exc:
                 QtWidgets.QMessageBox.critical(None, "自动打标签失败", str(exc))
                 self.display_result(f"[错误] 自动打标签失败：{exc}")
@@ -3166,6 +3192,7 @@ class Ui_MainWindow(object):
             self.display_result(
                 f"[INFO] 自动打标签完成：累计标签 {total} 条（异常 {anomalies}，正常 {normals}），本次新增异常 {added_a}，正常 {added_b}。"
             )
+            success = True
         finally:
             if cursor_applied:
                 try:
@@ -3173,6 +3200,12 @@ class Ui_MainWindow(object):
                 except Exception:
                     pass
             self._set_action_buttons_enabled(True)
+            self.btn_auto_label.setEnabled(True)
+            if success:
+                self.set_button_progress(self.btn_auto_label, 100)
+                QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_auto_label))
+            else:
+                self.reset_button_progress(self.btn_auto_label)
 
     # --------- 数据预处理（基于特征 CSV） ----------
     def _on_preprocess_features(self):
@@ -3225,7 +3258,7 @@ class Ui_MainWindow(object):
         if manifest:
             self._add_output(manifest)
             try:
-                df = pd.read_csv(manifest, nrows=50, encoding="utf-8")
+                df = read_csv_flexible(manifest, nrows=50)
                 self.populate_table_from_df(df)
                 self._last_out_csv = manifest
                 self._open_csv_paged(manifest)
@@ -3675,7 +3708,7 @@ class Ui_MainWindow(object):
             _mark(top20_csv)
             if pd is not None and os.path.exists(top20_csv):
                 try:
-                    df = pd.read_csv(top20_csv, encoding="utf-8")
+                    df = read_csv_flexible(top20_csv)
                     if not df.empty:
                         self.populate_table_from_df(df)
                         self._last_out_csv = top20_csv
@@ -3979,7 +4012,7 @@ class Ui_MainWindow(object):
             return
 
         try:
-            df = pd.read_csv(csv_path, encoding="utf-8")
+            df = read_csv_flexible(csv_path)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{exc}")
             return
