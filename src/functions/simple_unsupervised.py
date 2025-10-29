@@ -1,494 +1,404 @@
-"""Lightweight fallback implementations for training and inference.
+"""特征 CSV 数据预处理，将其整理成可直接用于模型训练的标准化数据集。"""
 
-This module is used when optional heavy dependencies such as ``numpy`` or
-``pandas`` are not available in the execution environment.  It implements a
-very small anomaly detection workflow based purely on the Python standard
-library so that the CLI ``train``/``predict`` commands continue to function
-for smoke tests.
-
-The detector is intentionally simple: features are z-scored using population
-statistics and the anomaly score is defined as the negative L1 distance from
-the centre.  Records in the contamination quantile are marked as anomalies.
-Metadata is persisted so that ``predict`` can reproduce the same behaviour.
-"""
-
-from __future__ import annotations
-
-import csv
+import glob
+import hashlib
 import json
 import math
 import os
-from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from datetime import datetime
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-from src.functions.logging_utils import get_logger, log_training_run
+import numpy as np
+import pandas as pd
+from pandas.api.types import (
+    is_bool_dtype,
+    is_categorical_dtype,
+    is_datetime64_any_dtype,
+    is_numeric_dtype,
+)
 
-logger = get_logger(__name__)
+ProgressCallback = Optional[Callable[[int], None]]
 
+# 在预处理后仍保留的原始元信息列，用于训练时按文件等维度汇总
+RESERVED_META_COLUMNS = [
+    "__source_file__",
+    "__source_path__",
+    "pcap_file",
+    "flow_id",
+    "src_ip",
+    "dst_ip",
+    "src_port",
+    "dst_port",
+    "protocol",
+    "label",
+]
 
-SIMPLE_MAX_FEATURES = 4_096
-SIMPLE_VARIANCE_SAMPLE_ROWS = 512
-
-
-@dataclass
-class _SimpleModel:
-    columns: List[str]
-    means: Dict[str, float]
-    stds: Dict[str, float]
-    threshold: float
-    contamination: float
-
-    @property
-    def vote_threshold(self) -> float:
-        # Binary votes in this simple detector -> threshold at 0.5
-        return 0.5
-
-    def score_row(self, row: Sequence[float]) -> float:
-        # Negative sum of absolute z-scores so that smaller values denote
-        # stronger anomalies (similar to IsolationForest behaviour).
-        total = 0.0
-        for name, value in zip(self.columns, row):
-            mean = self.means.get(name, 0.0)
-            std = self.stds.get(name, 1.0) or 1.0
-            total += abs((value - mean) / std)
-        return -total
+MISSING_TOKEN = "<MISSING>"
 
 
-def _read_csv_structure(path: str) -> Tuple[List[str], List[int]]:
-    """Return the sanitised column names and indices used for extraction."""
-
-    with open(path, "r", encoding="utf-8") as handle:
-        reader = csv.reader(handle)
-        try:
-            header = next(reader)
-        except StopIteration as exc:  # pragma: no cover - defensive
-            raise RuntimeError("训练数据为空。") from exc
-
-    columns: List[str] = []
-    indices: List[int] = []
-    for idx, raw in enumerate(header):
-        name = raw.strip()
-        if not name:
-            continue
-        columns.append(name)
-        indices.append(idx)
-
-    if not columns:
-        raise RuntimeError("未发现可用于训练的特征列。")
-
-    return columns, indices
+def _notify(cb: ProgressCallback, value: int) -> None:
+    if cb:
+        cb(max(0, min(100, int(value))))
 
 
-def _iter_numeric_rows(
-    path: str,
-    *,
-    source_indices: Sequence[int],
-    limit: Optional[int] = None,
-) -> Iterator[List[float]]:
-    """Yield numeric rows using the provided source column indices."""
-
-    if not source_indices:
-        raise RuntimeError("未发现可用于训练的特征列。")
-
-    max_required = max(source_indices)
-    emitted = 0
-    with open(path, "r", encoding="utf-8") as handle:
-        reader = csv.reader(handle)
-        next(reader, None)
-        for line_no, row in enumerate(reader, start=2):
-            if limit is not None and emitted >= limit:
-                break
-            if len(row) <= max_required:
-                logger.debug("Skipping row %d with insufficient columns", line_no)
-                continue
-            numeric: List[float] = []
-            try:
-                for idx in source_indices:
-                    value = float(row[idx])
-                    if not math.isfinite(value):
-                        value = 0.0
-                    numeric.append(value)
-            except ValueError:
-                logger.debug("Skipping non-numeric row %d", line_no)
-                continue
-            emitted += 1
-            yield numeric
+def _load_feature_csv(csv_path: str) -> pd.DataFrame:
+    try:
+        df = pd.read_csv(csv_path, encoding="utf-8")
+    except UnicodeDecodeError:
+        df = pd.read_csv(csv_path, encoding="gbk")
+    if df.empty:
+        raise ValueError(f"CSV 没有任何数据: {csv_path}")
+    return df
 
 
-def _select_feature_indices(
-    path: str,
-    columns: Sequence[str],
-    base_indices: Sequence[int],
-) -> Tuple[List[int], Optional[Dict[str, object]]]:
-    total_columns = len(columns)
-    if total_columns <= SIMPLE_MAX_FEATURES:
-        return list(range(total_columns)), None
+def _median_or_default(series: pd.Series) -> float:
+    non_na = series.dropna()
+    if non_na.empty:
+        return 0.0
+    median = float(non_na.median())
+    if math.isnan(median) or math.isinf(median):
+        median = float(non_na.iloc[0])
+    return median
 
-    sample_count = 0
-    coverage = [0] * total_columns
-    nonzero = [0] * total_columns
-    means = [0.0] * total_columns
-    m2 = [0.0] * total_columns
 
-    for row in _iter_numeric_rows(
-        path,
-        source_indices=base_indices,
-        limit=SIMPLE_VARIANCE_SAMPLE_ROWS,
-    ):
-        sample_count += 1
-        for idx, value in enumerate(row):
-            coverage[idx] += 1
-            if abs(value) > 1e-12:
-                nonzero[idx] += 1
-            delta = value - means[idx]
-            means[idx] += delta / coverage[idx]
-            delta2 = value - means[idx]
-            m2[idx] += delta * delta2
-
-    if sample_count == 0:
-        raise RuntimeError("训练数据为空，无法继续。")
-
-    scores = []
-    for idx in range(total_columns):
-        variance = m2[idx] / max(coverage[idx], 1)
-        variance = max(variance, 0.0)
-        coverage_ratio = coverage[idx] / sample_count
-        nonzero_ratio = nonzero[idx] / sample_count
-        score = variance * (0.2 + 0.5 * coverage_ratio + 0.3 * nonzero_ratio)
-        scores.append((idx, score))
-
-    scores.sort(key=lambda item: item[1], reverse=True)
-    keep_positions = {idx for idx, _ in scores[:SIMPLE_MAX_FEATURES]}
-    ordered_positions = [idx for idx in range(total_columns) if idx in keep_positions]
-    if not ordered_positions:
-        ordered_positions = list(range(min(SIMPLE_MAX_FEATURES, total_columns)))
-
-    logger.warning(
-        "检测到特征列数为 %d，超出回退模型的安全范围，将自动保留前 %d 列以降低内存消耗。",
-        total_columns,
-        len(ordered_positions),
+def _update_numeric_stats(name: str, values: pd.Series, store: Dict[str, Dict[str, float]]) -> None:
+    if values.empty:
+        return
+    arr = np.asarray(values, dtype=np.float64)
+    stats = store.setdefault(
+        name,
+        {"count": 0.0, "sum": 0.0, "sum_sq": 0.0, "min": None, "max": None},
     )
-
-    info = {
-        "original_features": total_columns,
-        "kept_features": len(ordered_positions),
-        "dropped_features": total_columns - len(ordered_positions),
-    }
-    return ordered_positions, info
-
-
-def _population_mean(values: Iterable[float]) -> float:
-    seq = list(values)
-    if not seq:
-        return 0.0
-    return sum(seq) / len(seq)
+    count = float(arr.size)
+    stats["count"] += count
+    stats["sum"] += float(arr.sum())
+    stats["sum_sq"] += float(np.multiply(arr, arr).sum())
+    current_min = float(arr.min())
+    current_max = float(arr.max())
+    stats["min"] = current_min if stats["min"] is None else min(stats["min"], current_min)
+    stats["max"] = current_max if stats["max"] is None else max(stats["max"], current_max)
 
 
-def _population_std(values: Iterable[float], mean: Optional[float] = None) -> float:
-    seq = list(values)
-    if not seq:
-        return 1.0
-    if mean is None:
-        mean = _population_mean(seq)
-    var = sum((val - mean) ** 2 for val in seq) / max(len(seq), 1)
-    return math.sqrt(var) if var > 0 else 1.0
+def _process_single_dataframe(
+    df: pd.DataFrame,
+    *,
+    fill_strategies: Dict[str, float],
+    categorical_maps: Dict[str, Dict[str, object]],
+    numeric_stats: Dict[str, Dict[str, float]],
+) -> Tuple[pd.DataFrame, List[str], List[str]]:
+    """处理单个特征表，返回预处理后的 DataFrame、元信息列和特征列顺序。"""
 
+    meta_cols = [col for col in RESERVED_META_COLUMNS if col in df.columns]
+    feature_columns: List[str] = []
+    processed_data: Dict[str, pd.Series] = {}
 
-def _quantile(values: Sequence[float], q: float) -> float:
-    if not values:
-        return 0.0
-    q = min(max(q, 0.0), 1.0)
-    ordered = sorted(values)
-    pos = q * (len(ordered) - 1)
-    lower = int(math.floor(pos))
-    upper = int(math.ceil(pos))
-    if lower == upper:
-        return ordered[lower]
-    weight = pos - lower
-    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+    for column in df.columns:
+        if column in meta_cols:
+            continue
 
+        series = df[column]
 
-def _ensure_dirs(*paths: str) -> None:
-    for path in paths:
-        os.makedirs(path, exist_ok=True)
+        if is_bool_dtype(series):
+            encoded = series.fillna(False).astype(bool).astype("int8")
+            fill_strategies.setdefault(column, 0.0)
+            _update_numeric_stats(column, encoded, numeric_stats)
+            processed_data[column] = encoded
+            feature_columns.append(column)
+        elif is_numeric_dtype(series):
+            numeric = pd.to_numeric(series, errors="coerce")
+            if column not in fill_strategies:
+                fill_strategies[column] = _median_or_default(numeric)
+            filled = numeric.fillna(fill_strategies[column]).astype("float32")
+            _update_numeric_stats(column, filled, numeric_stats)
+            processed_data[column] = filled
+            feature_columns.append(column)
+        else:
+            filled = series.fillna(MISSING_TOKEN)
+            if is_datetime64_any_dtype(filled):
+                filled = filled.astype(str)
+            elif not is_categorical_dtype(filled):
+                filled = filled.astype(str)
+            normalized = filled.str.strip().replace("", MISSING_TOKEN)
 
-
-def _dump_json(path: str, payload: Dict[str, object]) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-
-
-def _stream_export_results(
-    output_path: str,
-    columns: Sequence[str],
-    row_iter: Iterator[List[float]],
-    scores: Sequence[float],
-    votes: Sequence[float],
-    risk: Sequence[float],
-    predictions: Sequence[int],
-) -> None:
-    header = list(columns) + [
-        "anomaly_score",
-        "vote_ratio",
-        "risk_score",
-        "prediction",
-        "is_malicious",
-    ]
-    with open(output_path, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(header)
-        for row, score, vote, rk, pred in zip(row_iter, scores, votes, risk, predictions):
-            writer.writerow(
-                list(row)
-                + [
-                    f"{score:.6f}",
-                    f"{vote:.6f}",
-                    f"{rk:.6f}",
-                    pred,
-                    1 if pred == -1 else 0,
-                ]
+            encoded_name = f"{column}__code"
+            entry = categorical_maps.setdefault(
+                encoded_name,
+                {
+                    "source_column": column,
+                    "labels": [],
+                    "missing_token": MISSING_TOKEN,
+                    "mapping": {},
+                },
             )
+            mapping = entry["mapping"]
+            codes = normalized.map(mapping)
+            missing_mask = codes.isna()
+            if missing_mask.any():
+                for value in normalized[missing_mask].unique():
+                    label = str(value)
+                    if label not in mapping:
+                        mapping[label] = len(entry["labels"])
+                        entry["labels"].append(label)
+                codes = normalized.map(mapping)
+            encoded = codes.fillna(-1).astype("int32")
+            processed_data[encoded_name] = encoded
+            feature_columns.append(encoded_name)
+
+    if not processed_data:
+        raise RuntimeError("没有找到可用于训练的特征列。")
+
+    parts: List[pd.DataFrame] = []
+    if meta_cols:
+        parts.append(df.loc[:, meta_cols])
+    parts.append(pd.DataFrame(processed_data, index=df.index))
+    processed_df = pd.concat(parts, axis=1)
+    return processed_df, meta_cols, feature_columns
 
 
-def compute_risk_components(
-    scores: Sequence[float],
-    vote_ratio: Sequence[float],
-    threshold: float,
-    vote_threshold: float,
-    score_std: float,
-) -> Tuple[List[float], List[float], List[float]]:
-    score_std = float(score_std or 1.0)
-    vote_threshold = float(vote_threshold or 0.5)
-    result_risk: List[float] = []
-    result_score: List[float] = []
-    result_vote: List[float] = []
-    for score, vote in zip(scores, vote_ratio):
-        # Logistic shaping so that scores far below the threshold approach 1.
-        z = (score - threshold) / score_std
-        score_component = 1.0 / (1.0 + math.exp(z))
-        vote_component = 1.0 if vote >= vote_threshold else vote / max(vote_threshold, 1e-6)
-        risk = 0.6 * score_component + 0.4 * vote_component
-        result_risk.append(max(0.0, min(1.0, risk)))
-        result_score.append(max(0.0, min(1.0, score_component)))
-        result_vote.append(max(0.0, min(1.0, vote_component)))
-    return result_risk, result_score, result_vote
+FeatureSource = Union[str, Sequence[str]]
 
 
-def _export_results(
-    output_path: str,
-    columns: Sequence[str],
-    rows: Sequence[Sequence[float]],
-    scores: Sequence[float],
-    votes: Sequence[float],
-    risk: Sequence[float],
-    predictions: Sequence[int],
-) -> None:
-    _stream_export_results(output_path, columns, iter(rows), scores, votes, risk, predictions)
-
-
-def _resolve_dataset_path(split_dir: str) -> str:
-    if os.path.isfile(split_dir):
-        return split_dir
-    if os.path.isdir(split_dir):
-        for candidate in sorted(os.listdir(split_dir)):
-            if candidate.lower().endswith(".csv"):
-                return os.path.join(split_dir, candidate)
-    raise FileNotFoundError(f"未找到可用的训练数据: {split_dir}")
-
-
-def train_unsupervised_on_split(
-    split_dir: str,
-    results_dir: str,
-    models_dir: str,
-    contamination: float = 0.05,
-    base_estimators: int = 50,  # unused, kept for signature compatibility
-    progress_cb=None,
-    workers: int = 4,
-    rbf_components: Optional[int] = None,
-    rbf_gamma: Optional[float] = None,
-    fusion_alpha: float = 0.5,
-    enable_supervised_fusion: bool = True,
-    feature_selection_ratio: Optional[float] = None,
-    pipeline_components: Optional[Dict[str, bool]] = None,
-    memory_budget_bytes: Optional[int] = None,
-    speed_config: Optional[Dict[str, object]] = None,
+def preprocess_feature_dir(
+    feature_dir: FeatureSource,
+    output_dir: str,
+    *,
+    progress_cb: ProgressCallback = None,
 ) -> Dict[str, object]:
-    dataset_path = _resolve_dataset_path(split_dir)
-    _ensure_dirs(results_dir, models_dir)
+    """批量读取特征 CSV，执行数据预处理并输出统一的训练数据集。"""
 
-    columns, base_indices = _read_csv_structure(dataset_path)
-    keep_positions, reduction_info = _select_feature_indices(dataset_path, columns, base_indices)
-    selected_columns = [columns[idx] for idx in keep_positions]
-    selected_indices = [base_indices[idx] for idx in keep_positions]
+    resolved_source: Union[str, None] = None
+    csv_files: List[str] = []
 
-    feature_count = len(selected_columns)
-    means_arr = [0.0] * feature_count
-    m2_arr = [0.0] * feature_count
-    sample_count = 0
-    for row in _iter_numeric_rows(dataset_path, source_indices=selected_indices, limit=None):
-        sample_count += 1
-        for idx, value in enumerate(row):
-            delta = value - means_arr[idx]
-            means_arr[idx] += delta / sample_count
-            delta2 = value - means_arr[idx]
-            m2_arr[idx] += delta * delta2
+    if isinstance(feature_dir, (list, tuple, set)):
+        for entry in feature_dir:
+            if not isinstance(entry, str):
+                continue
+            path = os.path.abspath(entry)
+            if os.path.isfile(path):
+                csv_files.append(path)
+        if not csv_files:
+            raise RuntimeError("没有选择任何有效的特征 CSV 文件。")
+        try:
+            resolved_source = os.path.commonpath(csv_files)
+        except ValueError:
+            resolved_source = os.path.dirname(csv_files[0])
+    else:
+        resolved = os.path.abspath(str(feature_dir))
+        if os.path.isdir(resolved):
+            patterns = ["*.csv", "*.CSV"]
+            for pattern in patterns:
+                csv_files.extend(glob.glob(os.path.join(resolved, pattern)))
+            csv_files = sorted(set(csv_files))
+            resolved_source = resolved
+        elif os.path.isfile(resolved):
+            csv_files = [resolved]
+            resolved_source = os.path.dirname(resolved)
+        else:
+            raise FileNotFoundError(f"未找到特征数据来源: {feature_dir}")
 
-    if sample_count == 0:
-        raise RuntimeError("训练数据为空，无法继续。")
+    if not csv_files:
+        raise RuntimeError("未能在所选路径中找到特征 CSV 文件。")
 
-    if sample_count < 10:
-        logger.warning(
-            "检测到样本量仅 %d 条，建议至少提供 10 条记录以获得稳定阈值。继续训练以便调试。",
-            sample_count,
+    os.makedirs(output_dir, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = f"dataset_preprocessed_{timestamp}"
+    dataset_path = os.path.join(output_dir, f"{base_name}.npy")
+    manifest_path = os.path.join(output_dir, f"{base_name}_manifest.csv")
+    meta_path = os.path.join(output_dir, f"{base_name}_meta.json")
+    feature_list_path = os.path.join(output_dir, f"{base_name}_feature_list.json")
+
+    counter = 1
+    while os.path.exists(dataset_path):
+        base_name = f"dataset_preprocessed_{timestamp}_{counter}"
+        dataset_path = os.path.join(output_dir, f"{base_name}.npy")
+        manifest_path = os.path.join(output_dir, f"{base_name}_manifest.csv")
+        meta_path = os.path.join(output_dir, f"{base_name}_meta.json")
+        feature_list_path = os.path.join(output_dir, f"{base_name}_feature_list.json")
+        counter += 1
+
+    fill_strategies: Dict[str, float] = {}
+    categorical_maps: Dict[str, Dict[str, object]] = {}
+    numeric_stats: Dict[str, Dict[str, float]] = {}
+
+    manifest_rows: List[Dict[str, object]] = []
+    total_rows = 0
+    total_files = len(csv_files)
+    meta_columns_global: List[str] = []
+    feature_columns_global: List[str] = []
+    first_chunk = True
+    feature_parts: List[np.ndarray] = []
+    meta_accumulator: Dict[str, List[object]] = {}
+
+    for idx, csv_path in enumerate(csv_files, start=1):
+        df = _load_feature_csv(csv_path)
+        df = df.copy()
+        df["__source_file__"] = os.path.basename(csv_path)
+        df["__source_path__"] = os.path.abspath(csv_path)
+
+        processed_df, meta_cols, feature_columns = _process_single_dataframe(
+            df,
+            fill_strategies=fill_strategies,
+            categorical_maps=categorical_maps,
+            numeric_stats=numeric_stats,
         )
 
-    stds_arr = []
-    for idx in range(feature_count):
-        variance = m2_arr[idx] / max(sample_count, 1)
-        stds_arr.append(math.sqrt(variance) if variance > 0 else 1.0)
+        if first_chunk:
+            meta_columns_global = meta_cols
+            feature_columns_global = feature_columns
+        else:
+            if meta_cols != meta_columns_global:
+                raise RuntimeError(
+                    f"文件 {os.path.basename(csv_path)} 的元信息列与之前不一致。"
+                )
+            if feature_columns != feature_columns_global:
+                missing = [c for c in feature_columns_global if c not in feature_columns]
+                extra = [c for c in feature_columns if c not in feature_columns_global]
+                if missing or extra:
+                    raise RuntimeError(
+                        f"文件 {os.path.basename(csv_path)} 的特征列与之前不一致。"
+                    )
 
-    means_map = {name: means_arr[idx] for idx, name in enumerate(selected_columns)}
-    stds_map = {name: stds_arr[idx] for idx, name in enumerate(selected_columns)}
+        full_column_order = list(meta_columns_global) + feature_columns_global
+        processed_df = processed_df.loc[:, full_column_order]
 
-    model = _SimpleModel(
-        columns=list(selected_columns),
-        means=means_map,
-        stds=stds_map,
-        threshold=0.0,
-        contamination=float(min(max(contamination, 0.001), 0.4)),
-    )
+        feature_values = processed_df.loc[:, feature_columns_global]
+        feature_parts.append(feature_values.to_numpy(dtype=np.float32, copy=False))
 
-    scores: List[float] = []
-    for row in _iter_numeric_rows(dataset_path, source_indices=selected_indices, limit=None):
-        scores.append(model.score_row(row))
-    threshold = _quantile(scores, model.contamination)
-    model.threshold = threshold
-    score_std = _population_std(scores)
+        if meta_columns_global:
+            for col in meta_columns_global:
+                values = processed_df[col].tolist()
+                meta_accumulator.setdefault(col, []).extend(values)
 
-    predictions = [-1 if score <= threshold else 1 for score in scores]
-    votes = [1.0 if pred == -1 else 0.0 for pred in predictions]
-    risk, score_component, vote_component = compute_risk_components(
-        scores, votes, threshold, model.vote_threshold, score_std
-    )
+        rows = int(len(processed_df))
+        manifest_rows.append(
+            {
+                "source_file": os.path.basename(csv_path),
+                "source_path": os.path.abspath(csv_path),
+                "start_index": total_rows,
+                "end_index": total_rows + rows,
+                "rows": rows,
+            }
+        )
+        total_rows += rows
+        first_chunk = False
 
-    base_name = os.path.splitext(os.path.basename(dataset_path))[0]
-    results_csv = os.path.join(results_dir, f"{base_name}_results.csv")
-    metadata_path = os.path.join(results_dir, f"{base_name}_metadata.json")
-    model_path = os.path.join(models_dir, f"{base_name}_model.json")
+        _notify(progress_cb, 10 + int(80 * idx / total_files))
 
-    export_rows = _iter_numeric_rows(dataset_path, source_indices=selected_indices, limit=None)
-    _stream_export_results(
-        results_csv,
-        selected_columns,
-        export_rows,
-        scores,
-        votes,
-        risk,
-        predictions,
-    )
+    if first_chunk:
+        raise RuntimeError("未能生成任何预处理数据。")
 
-    metadata = {
-        "type": "simple_zscore",
-        "columns": selected_columns,
-        "means": means_map,
-        "stds": stds_map,
-        "threshold": threshold,
-        "vote_threshold": model.vote_threshold,
-        "score_std": score_std,
-        "contamination": model.contamination,
-        "samples": sample_count,
-        "anomaly_count": int(sum(1 for pred in predictions if pred == -1)),
-    }
-    if reduction_info:
-        metadata["feature_reduction"] = reduction_info
-    _dump_json(metadata_path, metadata)
-    _dump_json(model_path, metadata)
+    manifest_df = pd.DataFrame(manifest_rows)
+    manifest_df.to_csv(manifest_path, index=False, encoding="utf-8")
 
-    log_training_run(
-        {
-            "strategy": "simple_zscore",
-            "dataset": dataset_path,
-            "samples": sample_count,
-            "features": len(selected_columns),
-            "contamination": model.contamination,
+    feature_columns = feature_columns_global
+
+    column_profiles: List[Dict[str, object]] = []
+    for column in feature_columns:
+        if column in numeric_stats:
+            stats = numeric_stats[column]
+            count = stats["count"] or 0.0
+            if count:
+                mean = stats["sum"] / count
+                variance = max(stats["sum_sq"] / count - mean * mean, 0.0)
+                std = math.sqrt(variance)
+            else:
+                mean = 0.0
+                std = 0.0
+            column_profiles.append(
+                {
+                    "name": column,
+                    "kind": "numeric",
+                    "min": float(stats["min"] if stats["min"] is not None else 0.0),
+                    "max": float(stats["max"] if stats["max"] is not None else 0.0),
+                    "mean": float(mean),
+                    "std": float(std),
+                }
+            )
+        else:
+            meta = categorical_maps.get(column, {})
+            column_profiles.append(
+                {
+                    "name": column,
+                    "kind": "categorical_encoded",
+                    "source_column": meta.get("source_column"),
+                    "unique": len(meta.get("labels", [])),
+                }
+            )
+
+    categorical_serializable = {}
+    for key, meta in categorical_maps.items():
+        categorical_serializable[key] = {
+            "source_column": meta.get("source_column"),
+            "labels": list(meta.get("labels", [])),
+            "missing_token": meta.get("missing_token", MISSING_TOKEN),
         }
-    )
 
-    if progress_cb:
-        progress_cb(100)
+    if not feature_parts:
+        raise RuntimeError("未能生成任何特征矩阵。")
+
+    feature_matrix = np.vstack(feature_parts).astype(np.float32, copy=False)
+
+    feature_hash = hashlib.sha256("\n".join(feature_columns).encode("utf-8")).hexdigest()
+
+    meta_payload = {
+        "type": "preprocessed_dataset",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "source_feature_dir": os.path.abspath(resolved_source) if resolved_source else "",
+        "rows": int(total_rows),
+        "feature_columns": feature_columns,
+        "meta_columns": meta_columns_global,
+        "fill_values": fill_strategies,
+        "categorical_maps": categorical_serializable,
+        "column_profiles": column_profiles,
+        "files": [os.path.abspath(p) for p in csv_files],
+        "dataset_format": "npy",
+        "feature_list_path": feature_list_path,
+        "feature_hash": feature_hash,
+    }
+
+    meta_arrays: Dict[str, np.ndarray] = {}
+    for col in meta_columns_global:
+        values = meta_accumulator.get(col, [])
+        if values and len(values) != feature_matrix.shape[0]:
+            raise RuntimeError(
+                f"元信息列 {col} 的长度与特征矩阵不一致 ({len(values)} != {feature_matrix.shape[0]})"
+            )
+        meta_arrays[col] = np.asarray(values, dtype=object) if values else np.asarray([], dtype=object)
+
+    dataset_payload = {
+        "X": feature_matrix,
+        "columns": np.asarray(feature_columns, dtype=object),
+    }
+    if meta_arrays:
+        dataset_payload["meta_columns"] = np.asarray(meta_columns_global, dtype=object)
+        dataset_payload["meta_data"] = {col: arr for col, arr in meta_arrays.items()}
+
+    with open(meta_path, "w", encoding="utf-8") as fh:
+        json.dump(meta_payload, fh, ensure_ascii=False, indent=2)
+
+    feature_list_payload = {
+        "schema_version": "2025.10",
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "feature_columns": feature_columns,
+        "feature_hash": feature_hash,
+        "source": os.path.abspath(resolved_source) if resolved_source else "",
+    }
+    with open(feature_list_path, "w", encoding="utf-8") as fh:
+        json.dump(feature_list_payload, fh, ensure_ascii=False, indent=2)
+
+    np.save(dataset_path, dataset_payload, allow_pickle=True)
+
+    _notify(progress_cb, 100)
 
     return {
-        "results_csv": results_csv,
-        "metadata_path": metadata_path,
-        "pipeline_path": model_path,
-        "packets": sample_count,
-        "score_component": score_component,
-        "vote_component": vote_component,
+        "dataset_path": dataset_path,
+        "manifest_path": manifest_path,
+        "meta_path": meta_path,
+        "total_rows": int(total_rows),
+        "total_cols": int(len(feature_columns)),
+        "feature_columns": feature_columns,
+        "files": csv_files,
+        "feature_list_path": feature_list_path,
+        "feature_hash": feature_hash,
     }
-
-
-def load_simple_model(path: str) -> _SimpleModel:
-    with open(path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict) or payload.get("type") != "simple_zscore":
-        raise RuntimeError("不支持的简单模型格式。")
-    return _SimpleModel(
-        columns=list(payload.get("columns", [])),
-        means={str(k): float(v) for k, v in dict(payload.get("means", {})).items()},
-        stds={str(k): float(v) for k, v in dict(payload.get("stds", {})).items()},
-        threshold=float(payload.get("threshold", 0.0)),
-        contamination=float(payload.get("contamination", 0.05)),
-    )
-
-
-def simple_predict(
-    model: _SimpleModel,
-    feature_csv: str,
-    *,
-    output_path: Optional[str] = None,
-) -> Tuple[str, Dict[str, object]]:
-    file_columns, base_indices = _read_csv_structure(feature_csv)
-    index_map = {name: idx for name, idx in zip(file_columns, base_indices)}
-    missing = [name for name in model.columns if name not in index_map]
-    if missing:
-        raise RuntimeError("特征 CSV 缺少训练时的列: " + ", ".join(missing))
-
-    selected_indices = [index_map[name] for name in model.columns]
-
-    scores: List[float] = []
-    for row in _iter_numeric_rows(feature_csv, source_indices=selected_indices, limit=None):
-        scores.append(model.score_row(row))
-
-    if not scores:
-        raise RuntimeError("特征 CSV 为空，无法预测。")
-    predictions = [-1 if score <= model.threshold else 1 for score in scores]
-    votes = [1.0 if pred == -1 else 0.0 for pred in predictions]
-    score_std = _population_std(scores)
-    risk, score_component, vote_component = compute_risk_components(
-        scores, votes, model.threshold, model.vote_threshold, score_std
-    )
-
-    if output_path is None:
-        base = os.path.splitext(feature_csv)[0]
-        output_path = f"{base}_predictions.csv"
-
-    export_iter = _iter_numeric_rows(feature_csv, source_indices=selected_indices, limit=None)
-    _stream_export_results(
-        output_path,
-        model.columns,
-        export_iter,
-        scores,
-        votes,
-        risk,
-        predictions,
-    )
-
-    details = {
-        "threshold": model.threshold,
-        "vote_threshold": model.vote_threshold,
-        "score_std": score_std,
-        "risk_score": risk,
-        "score_component": score_component,
-        "vote_component": vote_component,
-    }
-    return output_path, details

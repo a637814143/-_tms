@@ -1,367 +1,495 @@
 # -*- coding: utf-8 -*-
-"""
-极速查看流量信息（保持功能与列不变）
-- 解析层：RawPcapReader/RawPcapNgReader + struct，避免构造庞大的 Scapy 包对象
-- 支持：IPv4/IPv6 的 TCP/UDP（常见扩展头已跳过）
-- 并行：每个 pcap 一个进程，聚合回收后再拼接
-- UI 兼容：返回 DataFrame（UI 预览前 50 行），attrs['out_csv'] 指向全量 CSV
-"""
+"""从 PCAP 文件提取简化的流量特征。"""
 
+import argparse
+import glob
+import importlib
+import importlib.util
 import os
-import math
-import struct
+import tempfile
+import threading
+import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Dict, Tuple, Optional, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from types import ModuleType
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-import pandas as pd
 
-try:
-    from scapy.all import RawPcapReader  # pcap
-except Exception:
-    RawPcapReader = None
+def _load_module(module_path: str, friendly_name: Optional[str] = None) -> ModuleType:
+    """Load a module dynamically and provide a clear error message when missing."""
 
-try:
-    from scapy.utils import RawPcapNgReader  # pcapng
-except Exception:
-    RawPcapNgReader = None
+    spec = importlib.util.find_spec(module_path)
+    if spec is None:
+        display = friendly_name or module_path
+        raise ImportError(f"缺少依赖: 请先安装 {display}")
+    return importlib.import_module(module_path)
 
-# ---------------------- 文件类型检测 ----------------------
-_PC_MAGS = {0xA1B2C3D4, 0xD4C3B2A1, 0xA1B23C4D, 0x4D3CB2A1}
-_PNG_MAG = 0x0A0D0D0A
 
-def _detect_type(path: str) -> str:
-    with open(path, "rb") as f:
-        b = f.read(4)
-    if len(b) < 4:
-        return "unknown"
-    be = struct.unpack(">I", b)[0]
-    le = struct.unpack("<I", b)[0]
-    if be in _PC_MAGS or le in _PC_MAGS:
-        return "pcap"
-    if be == _PNG_MAG or le == _PNG_MAG:
-        return "pcapng"
-    return "unknown"
+pd: Any = _load_module("pandas", friendly_name="pandas")
+_scapy: Any = _load_module("scapy.all", friendly_name="scapy")
+IP = _scapy.IP
+TCP = _scapy.TCP
+UDP = _scapy.UDP
+PcapReader = _scapy.PcapReader
 
-# ---------------------- 会话键与累加器 ----------------------
-def _flow_key_canonical(src: str, dst: str, sport: int, dport: int, proto: int) -> Tuple[Tuple, int]:
-    a = (src, int(sport)); b = (dst, int(dport))
-    if a <= b:
-        return (src, int(sport), dst, int(dport), int(proto)), +1
+FlowKey = Tuple[str, str, int, int, str]
+
+
+@dataclass
+class FlowStats:
+    """记录单条网络流的基础统计信息。"""
+
+    forward_packets: int = 0
+    backward_packets: int = 0
+    forward_bytes: int = 0
+    backward_bytes: int = 0
+    min_time: Optional[float] = None
+    max_time: Optional[float] = None
+
+    def add_packet(
+        self,
+        *,
+        length: int,
+        timestamp: float,
+        direction: str,
+    ) -> None:
+        if direction == "fwd":
+            self.forward_packets += 1
+            self.forward_bytes += length
+        else:
+            self.backward_packets += 1
+            self.backward_bytes += length
+
+        if self.min_time is None or timestamp < self.min_time:
+            self.min_time = timestamp
+        if self.max_time is None or timestamp > self.max_time:
+            self.max_time = timestamp
+
+
+def _iter_packets(path: str) -> Iterable:
+    with PcapReader(path) as reader:
+        for packet in reader:
+            yield packet
+
+
+def _count_packets(path: str) -> int:
+    total = 0
+    with PcapReader(path) as reader:
+        for _ in reader:
+            total += 1
+    return total
+
+
+def _list_pcap_files(directory: str) -> List[str]:
+    patterns = [os.path.join(directory, "*.pcap"), os.path.join(directory, "*.pcapng")]
+    files: List[str] = []
+    for pattern in patterns:
+        files.extend(glob.glob(pattern))
+    return sorted(files)
+
+
+def _parse_ports(text: str) -> Set[int]:
+    ports: Set[int] = set()
+    for part in text.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = int(part)
+        except ValueError:
+            continue
+        if 0 <= value <= 65535:
+            ports.add(value)
+    return ports
+
+
+def _select_files(
+    path: str,
+    *,
+    mode: str,
+    files: Optional[Sequence[str]],
+    batch_size: int,
+    start_index: int,
+) -> List[str]:
+    provided_files = bool(files)
+    if provided_files:
+        candidates = [f for f in files if os.path.isfile(f)]
+    elif os.path.isdir(path):
+        candidates = _list_pcap_files(path)
     else:
-        return (dst, int(dport), src, int(sport), int(proto)), -1
+        candidates = [path]
 
-def _new_acc():
-    return dict(
-        a_ip=None, a_port=0, b_ip=None, b_port=0, proto=0,
-        first_ts=None, last_ts=None, bytes=0, pkt_count=0,
-        sum_len=0.0, sumsq_len=0.0, min_len=float("inf"), max_len=float("-inf"),
-        pkts_fwd=0, pkts_bwd=0, bytes_fwd=0, bytes_bwd=0,
-        last_ts_fwd=None, last_ts_bwd=None,
-        iat_fwd_sum=0.0, iat_fwd_sumsq=0.0, iat_fwd_cnt=0,
-        iat_bwd_sum=0.0, iat_bwd_sumsq=0.0, iat_bwd_cnt=0,
+    if not candidates:
+        raise FileNotFoundError("未在指定路径中找到 pcap/pcapng 文件")
+
+    if mode == "batch":
+        if batch_size <= 0:
+            raise ValueError("batch_size 必须为正整数")
+        if not provided_files:
+            start = max(0, start_index)
+            end = start + batch_size
+            candidates = candidates[start:end]
+    elif mode == "file":
+        if provided_files:
+            candidates = candidates[:1]
+        else:
+            start = max(0, start_index)
+            if start < len(candidates):
+                candidates = [candidates[start]]
+            else:
+                candidates = [candidates[-1]]
+    elif mode == "all":
+        pass
+    else:  # auto
+        if os.path.isdir(path):
+            # 目录按照 all 处理
+            pass
+        else:
+            candidates = candidates[:1]
+
+    return candidates
+
+
+def _write_temp_csv(df: pd.DataFrame) -> Optional[str]:
+    if df.empty:
+        return None
+    fd, temp_path = tempfile.mkstemp(prefix="pcap_info_", suffix=".csv")
+    os.close(fd)
+    df.to_csv(temp_path, index=False, encoding="utf-8")
+    return temp_path
+
+
+def _flows_to_records(flows_map: Dict[FlowKey, FlowStats], *, file_name: str) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+
+    for (src_ip, dst_ip, src_port, dst_port, proto), stats in flows_map.items():
+        if stats.min_time is None or stats.max_time is None:
+            continue
+
+        duration = stats.max_time - stats.min_time
+        total_fwd = stats.forward_bytes
+        total_bwd = stats.backward_bytes
+        total_packets_flow = stats.forward_packets + stats.backward_packets
+
+        records.append(
+            {
+                "pcap_file": file_name,
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "protocol": proto,
+                "flow_duration": duration,
+                "total_fwd_pkts": stats.forward_packets,
+                "total_bwd_pkts": stats.backward_packets,
+                "total_len_fwd_pkts": total_fwd,
+                "total_len_bwd_pkts": total_bwd,
+                "flow_byts_per_s": (total_fwd + total_bwd) / duration if duration > 0 else 0.0,
+                "flow_pkts_per_s": total_packets_flow / duration if duration > 0 else 0.0,
+            }
+        )
+
+    return records
+
+
+def _process_file(
+    file_path: str,
+    *,
+    proto_filter: str,
+    whitelist: Set[int],
+    blacklist: Set[int],
+    cancel_cb: Optional[Callable[[], bool]],
+    cancel_event: threading.Event,
+    progress_hook: Optional[Callable[[int], None]],
+) -> Tuple[List[Dict[str, object]], int, Optional[str], bool]:
+    flows_map: Dict[FlowKey, FlowStats] = defaultdict(FlowStats)
+    processed = 0
+    last_reported = 0
+    cancelled = False
+
+    try:
+        for pkt in _iter_packets(file_path):
+            if cancel_event.is_set() or (cancel_cb and cancel_cb()):
+                cancel_event.set()
+                cancelled = True
+                break
+
+            keys = _flow_key(pkt)
+            if keys is None:
+                continue
+
+            key_fwd, key_bwd = keys
+            proto = key_fwd[4]
+            if proto_filter == "tcp" and proto.upper() != "TCP":
+                continue
+            if proto_filter == "udp" and proto.upper() != "UDP":
+                continue
+
+            src_port, dst_port = key_fwd[2], key_fwd[3]
+            if whitelist and (src_port not in whitelist and dst_port not in whitelist):
+                continue
+            if blacklist and (src_port in blacklist or dst_port in blacklist):
+                continue
+
+            timestamp = float(pkt.time)
+            length = len(pkt)
+
+            if key_fwd in flows_map:
+                flows_map[key_fwd].add_packet(
+                    length=length,
+                    timestamp=timestamp,
+                    direction="fwd",
+                )
+            elif key_bwd in flows_map:
+                flows_map[key_bwd].add_packet(
+                    length=length,
+                    timestamp=timestamp,
+                    direction="bwd",
+                )
+            else:
+                flows_map[key_fwd].add_packet(
+                    length=length,
+                    timestamp=timestamp,
+                    direction="fwd",
+                )
+
+            processed += 1
+            if progress_hook and processed - last_reported >= 200:
+                progress_hook(processed - last_reported)
+                last_reported = processed
+
+        if progress_hook and processed > last_reported:
+            progress_hook(processed - last_reported)
+
+    except Exception as exc:
+        return [], processed, f"[ERROR] 解析失败 {file_path}: {exc}", cancelled
+
+    file_name = os.path.basename(file_path)
+    records = _flows_to_records(flows_map, file_name=file_name)
+    return records, processed, None, cancelled
+
+
+def _flow_key(pkt) -> Optional[Tuple[FlowKey, FlowKey]]:
+    if IP not in pkt:
+        return None
+
+    layer = None
+    proto = ""
+    src_port = 0
+    dst_port = 0
+
+    if TCP in pkt:
+        layer = pkt[TCP]
+        proto = "TCP"
+    elif UDP in pkt:
+        layer = pkt[UDP]
+        proto = "UDP"
+
+    if layer is None:
+        return None
+
+    src_port = int(layer.sport)
+    dst_port = int(layer.dport)
+    forward = (pkt[IP].src, pkt[IP].dst, src_port, dst_port, proto)
+    backward = (pkt[IP].dst, pkt[IP].src, dst_port, src_port, proto)
+    return forward, backward
+
+
+def get_pcap_features(
+    path: str,
+    *,
+    workers: int = 1,
+    mode: str = "auto",
+    batch_size: int = 1,
+    start_index: int = 0,
+    files: Optional[Sequence[str]] = None,
+    proto_filter: str = "both",
+    port_whitelist_text: str = "",
+    port_blacklist_text: str = "",
+    fast: bool = False,
+    progress_cb: Optional[Callable[[int], None]] = None,
+    cancel_cb: Optional[Callable[[], bool]] = None,
+) -> pd.DataFrame:
+    """提取一个或多个 PCAP 文件的流量统计信息，兼容 GUI 所需的参数。"""
+
+    if not path and not files:
+        raise ValueError("必须提供有效的文件路径或文件列表")
+
+    target_files = _select_files(
+        path,
+        mode=mode,
+        files=files,
+        batch_size=batch_size,
+        start_index=start_index,
     )
 
-def _agg_update(acc: Dict, length: int, ts: float, direction: int,
-                a_ip: str, a_port: int, b_ip: str, b_port: int, proto: int):
-    acc["a_ip"] = a_ip; acc["a_port"] = a_port
-    acc["b_ip"] = b_ip; acc["b_port"] = b_port
-    acc["proto"] = proto
-    acc["pkt_count"] += 1
-    acc["bytes"] += length
-    acc["sum_len"] += length
-    acc["sumsq_len"] += (length * length)
-    if length < acc["min_len"]: acc["min_len"] = length
-    if length > acc["max_len"]: acc["max_len"] = length
-    if acc["first_ts"] is None or ts < acc["first_ts"]: acc["first_ts"] = ts
-    if acc["last_ts"] is None or ts > acc["last_ts"]: acc["last_ts"] = ts
+    whitelist = _parse_ports(port_whitelist_text)
+    blacklist = _parse_ports(port_blacklist_text)
 
-    if direction >= 0:
-        acc["pkts_fwd"] += 1; acc["bytes_fwd"] += length
-        if acc["last_ts_fwd"] is not None:
-            diff = ts - acc["last_ts_fwd"]
-            if diff >= 0:
-                acc["iat_fwd_sum"] += diff
-                acc["iat_fwd_sumsq"] += diff * diff
-                acc["iat_fwd_cnt"] += 1
-        acc["last_ts_fwd"] = ts
-    else:
-        acc["pkts_bwd"] += 1; acc["bytes_bwd"] += length
-        if acc["last_ts_bwd"] is not None:
-            diff = ts - acc["last_ts_bwd"]
-            if diff >= 0:
-                acc["iat_bwd_sum"] += diff
-                acc["iat_bwd_sumsq"] += diff * diff
-                acc["iat_bwd_cnt"] += 1
-        acc["last_ts_bwd"] = ts
+    if proto_filter not in {"both", "tcp", "udp"}:
+        proto_filter = "both"
 
-# ---------------------- 端口白/黑名单 ----------------------
-def _parse_ports(s: str) -> set:
-    s = (s or "").strip()
-    if not s: return set()
-    out = set()
-    for p in s.split(","):
-        p = p.strip()
-        if not p: continue
-        try: out.add(int(p))
-        except Exception: pass
-    return out
-
-# ---------------------- 快速解析工具 ----------------------
-_ETH_HLEN = 14
-_ETH_TYPE_IPV4 = 0x0800
-_ETH_TYPE_IPV6 = 0x86DD
-_IP_PROTO_TCP = 6
-_IP_PROTO_UDP = 17
-
-def _inet_ntoa4(b: bytes) -> str:
-    return ".".join(str(x) for x in b)
-
-def _inet_ntoa6(b: bytes) -> str:
-    words = struct.unpack("!8H", b)
-    best_base = -1; best_len = 0; cur_base = -1; cur_len = 0
-    for i in range(8):
-        if words[i] == 0:
-            if cur_base == -1: cur_base = i; cur_len = 1
-            else: cur_len += 1
-        else:
-            if cur_len > best_len: best_base, best_len = cur_base, cur_len
-            cur_base = -1; cur_len = 0
-    if cur_len > best_len: best_base, best_len = cur_base, cur_len
-    if best_len <= 1: best_base = -1
-    parts = []; i = 0
-    while i < 8:
-        if i == best_base:
-            parts.append(""); i += best_len
-            if i >= 8: parts.append("")
-            continue
-        parts.append(hex(words[i])[2:]); i += 1
-    return ":".join(parts)
-
-def _parse_ipv4(pkt: bytes, off_ip: int):
-    if len(pkt) < off_ip + 20: return None
-    vihl = pkt[off_ip]; ihl = (vihl & 0x0F) * 4
-    if ihl < 20 or len(pkt) < off_ip + ihl: return None
-    proto = pkt[off_ip + 9]
-    src = _inet_ntoa4(pkt[off_ip + 12: off_ip + 16])
-    dst = _inet_ntoa4(pkt[off_ip + 16: off_ip + 20])
-    return proto, src, dst, off_ip + ihl
-
-def _parse_ipv6(pkt: bytes, off_ip: int):
-    if len(pkt) < off_ip + 40: return None
-    nh = pkt[off_ip + 6]
-    src = _inet_ntoa6(pkt[off_ip + 8: off_ip + 24])
-    dst = _inet_ntoa6(pkt[off_ip + 24: off_ip + 40])
-    l4_off = off_ip + 40
-    hop = 0
-    while nh in (0, 43, 44, 60) and hop < 3:
-        if len(pkt) < l4_off + 2: return None
-        next_nh = pkt[l4_off]
-        hdr_len = (pkt[l4_off + 1] + 1) * 8
-        nh = next_nh; l4_off += hdr_len; hop += 1
-    return nh, src, dst, l4_off
-
-def _parse_tcp_udp_ports(pkt: bytes, off_l4: int):
-    if len(pkt) < off_l4 + 4: return 0, 0
-    sport, dport = struct.unpack_from("!HH", pkt, off_l4)
-    return int(sport), int(dport)
-
-# ---------------------- 单文件解析（快速路径） ----------------------
-def _process_one_pcap_fast(pcap_path: str, proto_filter: str,
-                           wl: set, bl: set) -> pd.DataFrame:
-    """
-    原地解析一个 pcap/pcapng，返回会话聚合表（列保持与旧版一致）
-    """
-    if RawPcapReader is None and RawPcapNgReader is None:
-        raise RuntimeError("缺少 scapy，无法读取 pcap。请安装：pip install scapy")
-
-    flows: Dict[Tuple, Dict] = defaultdict(_new_acc)
-
-    ftype = _detect_type(pcap_path)
-    if ftype == "pcapng" and RawPcapNgReader is None:
-        # 没有 pcapng reader 的环境
-        raise RuntimeError("当前环境不支持 pcapng，请安装 scapy 完整版本或先转换为 pcap。")
-
-    try:
-        # 选择合适的 reader
-        reader = RawPcapNgReader(pcap_path) if ftype == "pcapng" else RawPcapReader(pcap_path)
-        for pkt_data, meta in reader:
-            length = len(pkt_data)
-            sec = getattr(meta, "sec", 0)
-            usec = getattr(meta, "usec", 0)
-            ts = float(sec) + float(usec) / 1e6
-
-            if length < _ETH_HLEN:
-                continue
-            eth_type = struct.unpack_from("!H", pkt_data, 12)[0]
-
-            proto = None; src = ""; dst = ""; l4_off = 0
-            if eth_type == _ETH_TYPE_IPV4:
-                parsed = _parse_ipv4(pkt_data, _ETH_HLEN)
-                if not parsed: continue
-                proto, src, dst, l4_off = parsed
-            elif eth_type == _ETH_TYPE_IPV6:
-                parsed = _parse_ipv6(pkt_data, _ETH_HLEN)
-                if not parsed: continue
-                proto, src, dst, l4_off = parsed
-            else:
-                continue  # 非 IP
-
-            # 协议过滤
-            if proto_filter == "tcp" and proto != _IP_PROTO_TCP: continue
-            if proto_filter == "udp" and proto != _IP_PROTO_UDP: continue
-
-            sport = dport = 0
-            if proto in (_IP_PROTO_TCP, _IP_PROTO_UDP):
-                sport, dport = _parse_tcp_udp_ports(pkt_data, l4_off)
-
-            # 端口白/黑名单
-            if wl and (sport not in wl and dport not in wl): continue
-            if bl and (sport in bl or dport in bl): continue
-
-            key, dir_flag = _flow_key_canonical(src, dst, sport, dport, proto)
-            a_ip, a_port, b_ip, b_port, pr_ = key
-            _agg_update(flows[key], length, ts, dir_flag, a_ip, a_port, b_ip, b_port, pr_)
-
-    except Exception as e:
-        print(f"[WARN] 读取失败: {pcap_path} ({e})")
-        return pd.DataFrame()
-
-    # 汇总
-    recs: List[Dict] = []
-    for _, acc in flows.items():
-        cnt = acc["pkt_count"]
-        if cnt <= 0: continue
-        duration = 0.0
-        if (acc["first_ts"] is not None) and (acc["last_ts"] is not None):
-            duration = max(0.0, float(acc["last_ts"]) - float(acc["first_ts"]))
-
-        mean_len = acc["sum_len"] / cnt
-        var_len = (acc["sumsq_len"] / cnt) - (mean_len * mean_len)
-        if var_len < 0: var_len = 0.0
-        std_len = math.sqrt(var_len)
-
-        dur = duration if duration > 0 else 0.0
-        pps = (cnt / dur) if dur > 0 else 0.0
-        bps = (acc["bytes"] * 8 / dur) if dur > 0 else 0.0
-        pps_fwd = (acc["pkts_fwd"] / dur) if dur > 0 else 0.0
-        pps_bwd = (acc["pkts_bwd"] / dur) if dur > 0 else 0.0
-        fwd_bwd_ratio = (acc["bytes_fwd"] / float(acc["bytes_bwd"])) if (acc["bytes_bwd"] > 0) else 0.0
-
-        recs.append({
-            "file": os.path.basename(pcap_path),
-            "a_ip": acc["a_ip"], "a_port": acc["a_port"],
-            "b_ip": acc["b_ip"], "b_port": acc["b_port"],
-            "protocol": acc["proto"],
-            "pkt_count": cnt, "bytes": acc["bytes"],
-            "pkt_len_mean": round(mean_len, 3),
-            "pkt_len_std": round(std_len, 3),
-            "pkt_len_min": 0 if acc["min_len"] == float("inf") else int(acc["min_len"]),
-            "pkt_len_max": 0 if acc["max_len"] == float("-inf") else int(acc["max_len"]),
-            "start_ts": acc["first_ts"], "end_ts": acc["last_ts"],
-            "duration": round(duration, 6),
-            "pps": round(pps, 3), "bps": round(bps, 3),
-            "pkts_fwd": acc["pkts_fwd"], "pkts_bwd": acc["pkts_bwd"],
-            "bytes_fwd": acc["bytes_fwd"], "bytes_bwd": acc["bytes_bwd"],
-            "pps_fwd": round(pps_fwd, 3), "pps_bwd": round(pps_bwd, 3),
-            "fwd_bwd_ratio": round(fwd_bwd_ratio, 6),
-            "iat_fwd_mean": round((acc['iat_fwd_sum']/acc['iat_fwd_cnt']) if acc['iat_fwd_cnt'] else 0.0, 6),
-            "iat_fwd_std":  round(math.sqrt(max(0.0,
-                                (acc['iat_fwd_sumsq']/acc['iat_fwd_cnt']) -
-                                ((acc['iat_fwd_sum']/acc['iat_fwd_cnt'])**2)
-                              )) if acc['iat_fwd_cnt'] else 0.0, 6),
-            "iat_bwd_mean": round((acc['iat_bwd_sum']/acc['iat_bwd_cnt']) if acc['iat_bwd_cnt'] else 0.0, 6),
-            "iat_bwd_std":  round(math.sqrt(max(0.0,
-                                (acc['iat_bwd_sumsq']/acc['iat_bwd_cnt']) -
-                                ((acc['iat_bwd_sum']/acc['iat_bwd_cnt'])**2)
-                              )) if acc['iat_bwd_cnt'] else 0.0, 6),
-        })
-
-    return pd.DataFrame.from_records(recs)
-
-# ---------------------- 对外主函数 ----------------------
-def get_pcap_features(path: str,
-                      workers: Optional[int] = None,
-                      progress_cb=None,
-                      mode: str = "auto",
-                      batch_size: int = 10,
-                      start_index: int = 0,
-                      files: Optional[List[str]] = None,
-                      proto_filter: str = "both",
-                      port_whitelist_text: str = "",
-                      port_blacklist_text: str = "",
-                      fast: bool = True,
-                      cancel_cb=None) -> pd.DataFrame:
-    """
-    参数/返回与旧版完全一致。
-    - 返回 df 仅用于预览；全量 CSV 写在 <项目根>/results/pcap_info_all.csv，路径放在 attrs['out_csv']
-    """
-    if workers is None:
-        import os as _os
-        cpu = _os.cpu_count() or 4
-        workers = min(max(4, cpu), 16)
-
-    wl = _parse_ports(port_whitelist_text)
-    bl = _parse_ports(port_blacklist_text)
-
-    if files:
-        file_list = [f for f in files if os.path.isfile(f)]
-    elif os.path.isdir(path):
-        names = [n for n in os.listdir(path) if n.lower().endswith((".pcap", ".pcapng"))]
-        names.sort()
-        allf = [os.path.join(path, n) for n in names]
-        if mode == "batch":
-            s = max(0, int(start_index)); e = min(len(allf), s + max(1, int(batch_size)))
-            file_list = allf[s:e]
-        elif mode in ("all", "auto"):
-            file_list = allf
-        else:
-            file_list = allf[:1] if allf else []
-    else:
-        file_list = [path]
-
-    if not file_list:
-        raise FileNotFoundError(f"未找到 pcap 文件: {path}")
-
-    results, errors = [], []
-    total = len(file_list); done = 0
-
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_process_one_pcap_fast, f, proto_filter, wl, bl): f for f in file_list}
-        for fut in as_completed(futs):
+    total_packets = 0
+    if not fast:
+        for file_path in target_files:
             try:
-                df = fut.result()
-            except Exception as e:
-                errors.append(f"[WARN] 解析失败: {futs[fut]} ({e})")
-                df = pd.DataFrame()
-            if not df.empty:
-                results.append(df)
+                total_packets += _count_packets(file_path)
+            except Exception:
+                # 如果计数失败，退化为 fast 模式
+                total_packets = 0
+                break
 
-            done += 1
-            if progress_cb: progress_cb(int(done / total * 100))
-            if cancel_cb and cancel_cb(): break
+    workers = max(1, int(workers))
+    file_errors: List[str] = []
+    cancel_event = threading.Event()
+    processed_packets = 0
+    last_emit_pct = -1
+    completed_files = 0
+    progress_lock = threading.Lock()
 
-    if results:
-        out = pd.concat(results, ignore_index=True)
+    def _packet_progress(delta: int) -> None:
+        nonlocal processed_packets, last_emit_pct
+        if not progress_cb or total_packets <= 0:
+            return
+        if delta <= 0:
+            return
+        with progress_lock:
+            processed_packets += delta
+            pct = min(99, int(processed_packets * 100 / total_packets)) if total_packets else 0
+            if pct != last_emit_pct:
+                last_emit_pct = pct
+                progress_cb(pct)
+
+    def _file_progress() -> None:
+        nonlocal completed_files
+        if not progress_cb or total_packets > 0:
+            return
+        with progress_lock:
+            completed_files += 1
+            pct = min(99, int(completed_files * 100 / max(1, len(target_files))))
+            progress_cb(pct)
+
+    start_time = time.time()
+    records: List[Dict[str, object]] = []
+
+    use_pool = workers > 1 and len(target_files) > 1
+
+    if use_pool:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_file = {
+                executor.submit(
+                    _process_file,
+                    file_path,
+                    proto_filter=proto_filter,
+                    whitelist=whitelist,
+                    blacklist=blacklist,
+                    cancel_cb=cancel_cb,
+                    cancel_event=cancel_event,
+                    progress_hook=_packet_progress if total_packets and not fast else None,
+                ): file_path
+                for file_path in target_files
+            }
+
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                try:
+                    recs, processed, err, cancelled = future.result()
+                    if recs:
+                        records.extend(recs)
+                    if err:
+                        file_errors.append(err)
+                    if total_packets <= 0 or fast:
+                        _file_progress()
+                    if cancelled:
+                        cancel_event.set()
+                        break
+                except Exception as exc:
+                    file_errors.append(f"[ERROR] 解析失败 {file_path}: {exc}")
+                    if total_packets <= 0 or fast:
+                        _file_progress()
+                if cancel_event.is_set():
+                    break
     else:
-        out = pd.DataFrame(columns=[
-            "file", "a_ip", "a_port", "b_ip", "b_port", "protocol",
-            "pkt_count", "bytes", "pkt_len_mean", "pkt_len_std", "pkt_len_min", "pkt_len_max",
-            "start_ts", "end_ts", "duration", "pps", "bps",
-            "pkts_fwd", "pkts_bwd", "bytes_fwd", "bytes_bwd", "pps_fwd", "pps_bwd",
-            "fwd_bwd_ratio", "iat_fwd_mean", "iat_fwd_std", "iat_bwd_mean", "iat_bwd_std"
-        ])
+        for file_path in target_files:
+            if cancel_event.is_set() or (cancel_cb and cancel_cb()):
+                cancel_event.set()
+                break
 
-    try:
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        results_dir = os.path.join(project_root, "results")
-        os.makedirs(results_dir, exist_ok=True)
-        out_csv = os.path.join(results_dir, "pcap_info_all.csv")
-        out.to_csv(out_csv, index=False, encoding="utf-8")
-        out.attrs["out_csv"] = out_csv
-    except Exception:
-        pass
+            recs, processed, err, cancelled = _process_file(
+                file_path,
+                proto_filter=proto_filter,
+                whitelist=whitelist,
+                blacklist=blacklist,
+                cancel_cb=cancel_cb,
+                cancel_event=cancel_event,
+                progress_hook=_packet_progress if total_packets and not fast else None,
+            )
+            if recs:
+                records.extend(recs)
+            if err:
+                file_errors.append(err)
+            if total_packets <= 0 or fast:
+                _file_progress()
+            if cancelled:
+                cancel_event.set()
+                break
 
-    out.attrs["files_total"] = total
-    if errors: out.attrs["errors"] = "\n".join(errors)
-    return out
+    df = pd.DataFrame.from_records(records)
+
+    out_csv = _write_temp_csv(df)
+    df.attrs["out_csv"] = out_csv
+    df.attrs["files_total"] = len(target_files)
+    df.attrs["errors"] = "\n".join(file_errors)
+
+    if progress_cb:
+        progress_cb(100)
+
+    elapsed = time.time() - start_time
+    print(f"[INFO] 提取完成: {len(df)} 条流, 耗时 {elapsed:.2f}s")
+
+    return df
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Extract simplified flow features from a PCAP/PCAPNG file.",
+    )
+    parser.add_argument("pcap", help="Path to the input PCAP/PCAPNG file")
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Optional CSV output path (defaults to <pcap>.csv)",
+        default=None,
+    )
+    parser.add_argument(
+        "--head",
+        type=int,
+        default=5,
+        help="Preview the first N rows when no output file is specified",
+    )
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    if not os.path.exists(args.pcap):
+        parser.error(f"文件不存在: {args.pcap}")
+
+    df = get_pcap_features(args.pcap)
+
+    if args.output:
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
+        df.to_csv(args.output, index=False, encoding="utf-8")
+        print(f"[+] 已写入 CSV: {args.output}")
+    else:
+        preview_rows = df.head(args.head)
+        if not preview_rows.empty:
+            print(preview_rows.to_string(index=False))
+        print(f"[INFO] 预览 {min(args.head, len(df))} / {len(df)} 条记录")
+
+
+if __name__ == "__main__":
+    main()
