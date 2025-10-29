@@ -23,12 +23,12 @@ def _safe_export(module_name: str, symbols: Sequence[str]) -> None:
 
 
 _safe_export(
-    "modeling",
+    "unsupervised_train",
     (
         "DetectionResult",
         "TrainingSummary",
         "detect_pcap_with_model",
-        "train_hist_gradient_boosting",
+        "train_unsupervised_on_split",
     ),
 )
 
