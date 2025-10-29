@@ -1,514 +1,616 @@
-"""Simple preprocessing utilities to align flow features across train/infer stages."""
+"""Utilities for exporting PCAP flow features to CSV and ML matrices."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union, overload
+from typing import Literal
 
+import csv
+import json
 import numpy as np
-import pandas as pd
-from pandas.api.types import is_numeric_dtype
-from sklearn.base import BaseEstimator, TransformerMixin
 
-try:  # optional GPU acceleration backend
-    import torch
-    from torch import nn
-    from torch.utils.data import DataLoader, TensorDataset
-except Exception:  # pragma: no cover - optional dependency may be absent
-    torch = None  # type: ignore[assignment]
-    nn = None  # type: ignore[assignment]
-    DataLoader = None  # type: ignore[assignment]
-    TensorDataset = None  # type: ignore[assignment]
+from .static_features import extract_pcap_features
+
+try:  # Optional dependency for command-line progress bars.
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional at runtime
+    tqdm = None  # type: ignore
 
 
-def _maybe_float(value: object) -> object:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return value
+# Ordered CSV header mandated by the downstream pipeline.
+CSV_COLUMNS: Sequence[str] = (
+    "Flow ID",
+    "Source IP",
+    "Source Port",
+    "Destination IP",
+    "Destination Port",
+    "Protocol",
+    "Timestamp",
+    "Flow Duration",
+    "Total Fwd Packets",
+    "Total Backward Packets",
+    "Total Length of Fwd Packets",
+    "Total Length of Bwd Packets",
+    "Fwd Packet Length Max",
+    "Fwd Packet Length Min",
+    "Fwd Packet Length Mean",
+    "Fwd Packet Length Std",
+    "Bwd Packet Length Max",
+    "Bwd Packet Length Min",
+    "Bwd Packet Length Mean",
+    "Bwd Packet Length Std",
+    "Flow Bytes/s",
+    "Flow Packets/s",
+    "Flow IAT Mean",
+    "Flow IAT Std",
+    "Flow IAT Max",
+    "Flow IAT Min",
+    "Fwd IAT Total",
+    "Fwd IAT Mean",
+    "Fwd IAT Std",
+    "Fwd IAT Max",
+    "Fwd IAT Min",
+    "Bwd IAT Total",
+    "Bwd IAT Mean",
+    "Bwd IAT Std",
+    "Bwd IAT Max",
+    "Bwd IAT Min",
+    "Fwd PSH Flags",
+    "Bwd PSH Flags",
+    "Fwd URG Flags",
+    "Bwd URG Flags",
+    "Fwd Header Length",
+    "Bwd Header Length",
+    "Fwd Packets/s",
+    "Bwd Packets/s",
+    "Min Packet Length",
+    "Max Packet Length",
+    "Packet Length Mean",
+    "Packet Length Std",
+    "Packet Length Variance",
+    "FIN Flag Count",
+    "SYN Flag Count",
+    "RST Flag Count",
+    "PSH Flag Count",
+    "ACK Flag Count",
+    "URG Flag Count",
+    "CWE Flag Count",
+    "ECE Flag Count",
+    "Down/Up Ratio",
+    "Average Packet Size",
+    "Avg Fwd Segment Size",
+    "Avg Bwd Segment Size",
+    "Fwd Header Length",
+    "Fwd Avg Bytes/Bulk",
+    "Fwd Avg Packets/Bulk",
+    "Fwd Avg Bulk Rate",
+    "Bwd Avg Bytes/Bulk",
+    "Bwd Avg Packets/Bulk",
+    "Bwd Avg Bulk Rate",
+    "Subflow Fwd Packets",
+    "Subflow Fwd Bytes",
+    "Subflow Bwd Packets",
+    "Subflow Bwd Bytes",
+    "Init_Win_bytes_forward",
+    "Init_Win_bytes_backward",
+    "act_data_pkt_fwd",
+    "min_seg_size_forward",
+    "Active Mean",
+    "Active Std",
+    "Active Max",
+    "Active Min",
+    "Idle Mean",
+    "Idle Std",
+    "Idle Max",
+    "Idle Min",
+    "Label",
+)
+
+_STRING_COLUMNS = {"Flow ID", "Source IP", "Destination IP", "Timestamp"}
+_LABEL_COLUMN = "Label"
+_CSV_READ_ENCODINGS: Sequence[str] = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
 
 
-class FeatureAligner(BaseEstimator, TransformerMixin):
-    """Ensure a deterministic column order and fill missing columns."""
+def _resolve_actual_key(column: str, occurrence: int) -> str:
+    """Translate a CSV column to the underlying flow dictionary key."""
 
-    def __init__(
-        self,
-        feature_order: Iterable[str],
-        fill_value: float = 0.0,
-        column_fill_values: Optional[Dict[str, object]] = None,
-    ) -> None:
-        self.feature_order = list(feature_order)
-        self.fill_value = float(fill_value)
-        self.column_fill_values: Dict[str, object] = {
-            str(k): v for k, v in (column_fill_values or {}).items()
-        }
-
-    def fit(self, X, y: Optional[object] = None):  # noqa: D401 - sklearn signature
-        return self
-
-    def transform(self, X) -> pd.DataFrame:  # noqa: D401 - sklearn signature
-        if not isinstance(X, pd.DataFrame):
-            raise TypeError("FeatureAligner 仅支持 pandas DataFrame 输入。")
-        Xc = X.copy()
-        for col in self.feature_order:
-            if col not in Xc.columns:
-                fill = self.column_fill_values.get(col, self.fill_value)
-                Xc[col] = fill
-        return Xc[self.feature_order].copy()
-
-    # metadata helpers -------------------------------------------------
-    def to_metadata(self) -> Dict[str, object]:
-        return {
-            "feature_order": list(self.feature_order),
-            "fill_value": float(self.fill_value),
-            "column_fill_values": self.column_fill_values,
-        }
-
-    @classmethod
-    def from_metadata(cls, payload: Dict[str, object]) -> "FeatureAligner":
-        feature_order = payload.get("feature_order") or []
-        fill_value = payload.get("fill_value", 0.0)
-        column_fill_values = payload.get("column_fill_values") or {}
-        return cls(
-            feature_order=feature_order,
-            fill_value=float(fill_value),
-            column_fill_values=dict(column_fill_values),
-        )
+    if column == "Fwd Header Length" and occurrence == 1:
+        return "Fwd Header Length.1"
+    return column
 
 
-class SimpleImputerByDtype(BaseEstimator, TransformerMixin):
-    """Fill numeric columns with median and categorical with mode/empty string."""
+def _numeric_feature_metadata() -> List[str]:
+    """Return the ordered keys used for numeric model input."""
 
-    def __init__(
-        self,
-        preset_numeric: Optional[Dict[str, object]] = None,
-        preset_categorical: Optional[Dict[str, object]] = None,
-    ) -> None:
-        self._preset_numeric = {
-            str(k): _maybe_float(v) for k, v in (preset_numeric or {}).items()
-        }
-        self._preset_categorical = {
-            str(k): v for k, v in (preset_categorical or {}).items()
-        }
-        self.num_median_: Dict[str, float] = {
-            k: float(v)
-            for k, v in self._preset_numeric.items()
-            if isinstance(v, (int, float))
-        }
-        self.cat_mode_: Dict[str, Any] = dict(self._preset_categorical)
+    feature_keys: List[str] = []
+    counts: Dict[str, int] = defaultdict(int)
 
-    def fit(self, X: pd.DataFrame, y: Optional[object] = None):  # noqa: D401
-        if not isinstance(X, pd.DataFrame):
-            raise TypeError("SimpleImputerByDtype 仅支持 pandas DataFrame 输入。")
-        for col in X.columns:
-            series = X[col]
-            if is_numeric_dtype(series):
-                if col in self._preset_numeric:
-                    value = self._preset_numeric[col]
-                    try:
-                        self.num_median_[col] = float(value)
-                        continue
-                    except (TypeError, ValueError):
-                        pass
-                numeric = pd.to_numeric(series, errors="coerce")
-                self.num_median_[col] = float(numeric.median()) if not numeric.dropna().empty else 0.0
-            else:
-                if col in self._preset_categorical:
-                    self.cat_mode_[col] = self._preset_categorical[col]
-                    continue
-                mode_series = series.mode(dropna=True)
-                if not mode_series.empty:
-                    self.cat_mode_[col] = mode_series.iloc[0]
-                else:
-                    self.cat_mode_[col] = ""
-        return self
+    for column in CSV_COLUMNS:
+        occurrence = counts[column]
+        counts[column] += 1
 
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:  # noqa: D401
-        if not isinstance(X, pd.DataFrame):
-            raise TypeError("SimpleImputerByDtype 仅支持 pandas DataFrame 输入。")
-        Xc = X.copy()
-        for col in Xc.columns:
-            if col in self.num_median_:
-                numeric = pd.to_numeric(Xc[col], errors="coerce")
-                Xc[col] = numeric.fillna(self.num_median_[col])
-            elif col in self.cat_mode_:
-                Xc[col] = Xc[col].fillna(self.cat_mode_[col])
-        return Xc
+        if column in _STRING_COLUMNS or column == _LABEL_COLUMN:
+            continue
 
-    def to_metadata(self) -> Dict[str, object]:
-        return {
-            "num_median": {k: float(v) for k, v in self.num_median_.items()},
-            "cat_mode": {k: ("" if v is None else v) for k, v in self.cat_mode_.items()},
-        }
+        actual_key = _resolve_actual_key(column, occurrence)
+        feature_keys.append(actual_key)
 
-    @classmethod
-    def from_metadata(cls, payload: Dict[str, object]) -> "SimpleImputerByDtype":
-        num_meta = {k: _maybe_float(v) for k, v in (payload.get("num_median") or {}).items()}
-        cat_meta = dict(payload.get("cat_mode") or {})
-        inst = cls(preset_numeric=num_meta, preset_categorical=cat_meta)
-        inst.num_median_ = {k: float(v) for k, v in num_meta.items() if isinstance(v, (int, float))}
-        inst.cat_mode_ = dict(cat_meta)
-        return inst
+    return feature_keys
 
 
-class PreprocessPipeline(BaseEstimator, TransformerMixin):
-    """Compose FeatureAligner and SimpleImputer for reuse between train/infer."""
-
-    def __init__(
-        self,
-        feature_order: Iterable[str],
-        fill_value: float = 0.0,
-        *,
-        fill_values: Optional[Dict[str, object]] = None,
-        categorical_maps: Optional[Dict[str, Dict[str, object]]] = None,
-        aligner_in_pipeline: bool = False,
-    ) -> None:
-        self.feature_order = list(feature_order)
-        self.fill_value = float(fill_value)
-        self.fill_values = {
-            str(k): _maybe_float(v) for k, v in (fill_values or {}).items()
-        }
-        self.categorical_maps = {
-            str(k): dict(v) for k, v in (categorical_maps or {}).items()
-        }
-        categorical_fill = {
-            key: -1 for key in self.categorical_maps.keys()
-        }
-        column_fill_values = dict(categorical_fill)
-        column_fill_values.update(self.fill_values)
-
-        self.column_fill_values = column_fill_values
-        self.aligner_in_pipeline = bool(aligner_in_pipeline)
-        self.aligner = FeatureAligner(
-            self.feature_order,
-            self.fill_value,
-            column_fill_values=self.column_fill_values,
-        )
-        self.imputer = SimpleImputerByDtype(preset_numeric=self.fill_values)
-
-    def fit(self, X, y: Optional[object] = None):  # noqa: D401
-        if not isinstance(X, pd.DataFrame):
-            raise TypeError("PreprocessPipeline 仅支持 pandas DataFrame 输入。")
-        aligned = X if self.aligner_in_pipeline else self.aligner.transform(X)
-        self.imputer.fit(aligned)
-        return self
-
-    def transform(self, X):  # noqa: D401
-        if not isinstance(X, pd.DataFrame):
-            raise TypeError("PreprocessPipeline 仅支持 pandas DataFrame 输入。")
-        aligned = X if self.aligner_in_pipeline else self.aligner.transform(X)
-        return self.imputer.transform(aligned)
-
-    # metadata helpers -------------------------------------------------
-    def to_metadata(self) -> Dict[str, object]:
-        return {
-            "feature_order": list(self.feature_order),
-            "fill_value": float(self.fill_value),
-            "fill_values": self.fill_values,
-            "categorical_maps": self.categorical_maps,
-            "column_fill_values": self.column_fill_values,
-            "aligner_in_pipeline": self.aligner_in_pipeline,
-            "input_columns": list(self.feature_order),
-            "imputer": self.imputer.to_metadata(),
-        }
-
-    @classmethod
-    def from_metadata(cls, payload: Dict[str, object]) -> "PreprocessPipeline":
-        feature_order = payload.get("feature_order") or payload.get("input_columns") or []
-        fill_value = payload.get("fill_value", 0.0)
-        fill_values = payload.get("fill_values") or {}
-        categorical_maps = payload.get("categorical_maps") or {}
-        aligner_in_pipeline = bool(payload.get("aligner_in_pipeline", False))
-        inst = cls(
-            feature_order=feature_order,
-            fill_value=float(fill_value),
-            fill_values=fill_values,
-            categorical_maps=categorical_maps,
-            aligner_in_pipeline=aligner_in_pipeline,
-        )
-        imputer_meta = payload.get("imputer") or {}
-        inst.imputer = SimpleImputerByDtype.from_metadata(imputer_meta)
-        # 覆盖 aligner 的列填充值，确保与训练阶段保持一致
-        column_fill_values = payload.get("column_fill_values") or {}
-        if column_fill_values:
-            inst.column_fill_values = dict(column_fill_values)
-            inst.aligner.column_fill_values = dict(column_fill_values)
-        return inst
+_NUMERIC_FEATURE_KEYS = _numeric_feature_metadata()
+_NUMERIC_FEATURE_NAMES = list(_NUMERIC_FEATURE_KEYS)
 
 
-class FeatureWeighter(BaseEstimator, TransformerMixin):
-    """Apply per-feature weights to attenuate low-importance columns."""
+@dataclass
+class VectorizationResult:
+    """Container describing the numeric representation of flow records."""
 
-    def __init__(self, weights: Optional[Dict[str, float]] = None) -> None:
-        self.weights = {str(k): float(v) for k, v in (weights or {}).items()}
-        self._columns_: List[str] = []
+    matrix: np.ndarray
+    labels: Optional[np.ndarray]
+    feature_names: List[str]
 
-    def set_weights(self, weights: Dict[str, float]) -> None:
-        self.weights = {str(k): float(v) for k, v in weights.items()}
+    @property
+    def flow_count(self) -> int:
+        return int(self.matrix.shape[0])
 
-    def fit(self, X, y: Optional[object] = None):  # noqa: D401
-        if not isinstance(X, pd.DataFrame):
-            raise TypeError("FeatureWeighter 仅支持 pandas DataFrame 输入。")
-        self._columns_ = list(X.columns)
-        return self
-
-    def transform(self, X):  # noqa: D401
-        if not isinstance(X, pd.DataFrame):
-            raise TypeError("FeatureWeighter 仅支持 pandas DataFrame 输入。")
-        if not self.weights:
-            return X.copy()
-        Xc = X.copy()
-        for col, weight in self.weights.items():
-            if col in Xc.columns:
-                try:
-                    Xc[col] = pd.to_numeric(Xc[col], errors="coerce").fillna(0.0) * float(weight)
-                except Exception:
-                    Xc[col] = Xc[col]
-        return Xc
-
-    def to_metadata(self) -> Dict[str, float]:
-        return dict(self.weights)
+    @property
+    def feature_count(self) -> int:
+        return int(self.matrix.shape[1])
 
 
-if torch is not None:  # pragma: no cover - optional backend container
+@dataclass
+class CSVDatasetSummary:
+    """Summary describing a CSV export produced from PCAP flows."""
 
-    class _TorchAutoencoder(nn.Module):
-        def __init__(self, input_dim: int, latent_dim: int) -> None:
-            super().__init__()
-            self.encoder = nn.Sequential(nn.Linear(input_dim, latent_dim), nn.Tanh())
-            self.decoder = nn.Sequential(nn.Linear(latent_dim, input_dim))
-
-        def forward(self, x):  # type: ignore[override]
-            latent = self.encoder(x)
-            recon = self.decoder(latent)
-            return latent, recon
+    path: Path
+    flow_count: int
+    column_count: int
+    has_labels: bool
 
 
-class DeepFeatureExtractor(BaseEstimator, TransformerMixin):
-    """Lightweight autoencoder-style projector with reconstruction error output."""
+@dataclass
+class LoadedDatasetStats:
+    """Metadata describing dataset composition during CSV loading."""
 
-    def __init__(
-        self,
-        latent_dim: int = 32,
-        *,
-        max_epochs: int = 20,
-        batch_size: int = 256,
-        learning_rate: float = 1e-2,
-        max_samples: int = 20000,
-        random_state: int = 42,
-    ) -> None:
-        self.latent_dim = int(max(2, latent_dim))
-        self.max_epochs = int(max(1, max_epochs))
-        self.batch_size = int(max(8, batch_size))
-        self.learning_rate = float(max(1e-5, learning_rate))
-        self.max_samples = int(max(500, max_samples))
-        self.random_state = int(random_state)
+    total_rows: int
+    labeled_rows: int
+    dropped_rows: int
 
-        self.input_dim_: Optional[int] = None
-        self.latent_dim_: Optional[int] = None
-        self.training_loss_: Optional[float] = None
-        self.encoder_weights_: Optional[np.ndarray] = None
-        self.encoder_bias_: Optional[np.ndarray] = None
-        self.decoder_weights_: Optional[np.ndarray] = None
-        self.decoder_bias_: Optional[np.ndarray] = None
-        self.latent_slice_: Optional[slice] = None
-        self.error_index_: Optional[int] = None
-        self.device_: str = "cpu"
-        self.training_backend_: str = "numpy"
-        self.actual_batch_size_: int = self.batch_size
-        self.last_reconstruction_error_: Optional[np.ndarray] = None
 
-    def _init_parameters(self, input_dim: int) -> None:
-        rng = np.random.default_rng(self.random_state)
-        latent = max(1, min(self.latent_dim, max(2, input_dim // 2)))
-        latent = min(latent, input_dim)
-        limit = 1.0 / max(1.0, np.sqrt(input_dim))
-        self.encoder_weights_ = rng.uniform(-limit, limit, size=(input_dim, latent))
-        self.encoder_bias_ = np.zeros(latent, dtype=float)
-        self.decoder_weights_ = rng.uniform(-limit, limit, size=(latent, input_dim))
-        self.decoder_bias_ = np.zeros(input_dim, dtype=float)
-        self.input_dim_ = input_dim
-        self.latent_dim_ = latent
-        self.latent_slice_ = slice(input_dim, input_dim + latent)
-        self.error_index_ = input_dim + latent
+@dataclass
+class LoadedDataset:
+    """Container returned when parsing a vectorized CSV dataset."""
 
-    def _encode(self, X: np.ndarray) -> np.ndarray:
-        hidden = X @ self.encoder_weights_ + self.encoder_bias_
-        return np.tanh(hidden)
+    matrix: np.ndarray
+    labels: Optional[np.ndarray]
+    feature_names: List[str]
+    label_mapping: Optional[Dict[int, str]]
+    stats: LoadedDatasetStats
 
-    def _decode(self, H: np.ndarray) -> np.ndarray:
-        return H @ self.decoder_weights_ + self.decoder_bias_
 
-    def _forward(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        latent = self._encode(X)
-        recon = self._decode(latent)
-        return latent, recon
+def _iter_jsonl_records(path: Union[str, Path]) -> Iterator[Dict[str, object]]:
+    """Yield parsed JSON objects from a JSONL file."""
 
-    def fit(self, X, y: Optional[object] = None):  # noqa: D401
-        arr = np.asarray(X, dtype=float)
-        if arr.ndim != 2:
-            raise ValueError("DeepFeatureExtractor 需要二维输入矩阵。")
-
-        n_samples, n_features = arr.shape
-        self._init_parameters(n_features)
-
-        rng = np.random.default_rng(self.random_state)
-        if n_samples > self.max_samples:
-            idx = rng.choice(n_samples, size=self.max_samples, replace=False)
-            train_arr = arr[idx]
-        else:
-            train_arr = arr
-
-        self.training_backend_ = "numpy"
-        self.device_ = "cpu"
-        self.actual_batch_size_ = self.batch_size
-
-        use_torch = False
-        device = None
-        if torch is not None:
+    jsonl_path = Path(path)
+    with jsonl_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw_line in enumerate(handle, 1):
+            text = raw_line.strip()
+            if not text:
+                continue
             try:
-                if torch.cuda.is_available():
-                    device = torch.device("cuda")
-                elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                    device = torch.device("mps")
-            except Exception:
-                device = None
-            if device is not None:
-                use_torch = True
+                yield json.loads(text)
+            except json.JSONDecodeError as exc:  # pragma: no cover - invalid data
+                raise ValueError(
+                    f"Invalid JSON in {jsonl_path} at line {line_number}: {exc}"
+                ) from exc
 
-        if use_torch:
-            self.training_backend_ = "torch"
-            self.device_ = str(device)
-            best_loss = self._fit_with_torch(train_arr, device)
+
+def _iter_flows_from_jsonl(
+    inputs: Sequence[Union[str, Path]]
+) -> Iterator[Tuple[Dict[str, object], Optional[int]]]:
+    """Iterate over all flows contained in one or more JSONL extraction files."""
+
+    for jsonl_path in inputs:
+        for record in _iter_jsonl_records(jsonl_path):
+            if not record.get("success", False):
+                source = record.get("path", str(jsonl_path))
+                error = record.get("error", "unknown error")
+                raise RuntimeError(f"Extraction failed for {source}: {error}")
+            record_label: Optional[int]
+            try:
+                record_label = int(record.get("label")) if record.get("label") is not None else None
+            except (TypeError, ValueError):
+                record_label = None
+            for flow in record.get("flows", []):
+                yield flow, record_label
+
+
+def _format_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (float, int, np.integer, np.floating)):
+        return str(value)
+    return str(value)
+
+
+def _flow_to_csv_row(flow: Dict[str, object], label_override: Optional[int]) -> List[str]:
+    row: List[str] = []
+    counts: Dict[str, int] = defaultdict(int)
+
+    for column in CSV_COLUMNS:
+        occurrence = counts[column]
+        counts[column] += 1
+
+        if column == _LABEL_COLUMN:
+            value = label_override if label_override is not None else flow.get("Label")
         else:
-            best_loss = self._fit_with_numpy(train_arr)
+            key = _resolve_actual_key(column, occurrence)
+            value = flow.get(key)
 
-        self.training_loss_ = float(best_loss if np.isfinite(best_loss) else 0.0)
-        return self
+        row.append(_format_value(value))
 
-    def transform(self, X):  # noqa: D401
-        arr = np.asarray(X, dtype=float)
-        if arr.ndim != 2:
-            raise ValueError("DeepFeatureExtractor 需要二维输入矩阵。")
-        if self.encoder_weights_ is None or self.decoder_weights_ is None:
-            raise RuntimeError("DeepFeatureExtractor 尚未拟合。")
+    return row
 
-        latent, recon = self._forward(arr)
-        error = np.mean((recon - arr) ** 2, axis=1)
-        error = error.reshape(-1, 1)
-        output = np.hstack([arr, latent, error])
-        self.last_reconstruction_error_ = error.ravel()
-        return output
 
-    # Internal helpers -------------------------------------------------
+def vectorize_flows(
+    flows: Iterable[Dict[str, object]],
+    *,
+    feature_names: Optional[Sequence[str]] = None,
+    default_label: Optional[int] = None,
+    dtype: np.dtype = np.float32,
+    include_labels: bool = True,
+) -> VectorizationResult:
+    """Convert flow dictionaries into a numeric matrix for modeling."""
 
-    def _fit_with_numpy(self, train_arr: np.ndarray) -> float:
-        rng = np.random.default_rng(self.random_state)
-        patience = 3
-        stalled = 0
-        best_loss = np.inf
-        self.actual_batch_size_ = self.batch_size
-        for _epoch in range(self.max_epochs):
-            idx = rng.permutation(len(train_arr))
-            shuffled = train_arr[idx]
-            epoch_loss = 0.0
-            steps = 0
-            for start in range(0, len(shuffled), self.batch_size):
-                end = start + self.batch_size
-                batch = shuffled[start:end]
-                if batch.size == 0:
-                    continue
-                steps += 1
-                latent, recon = self._forward(batch)
-                error = recon - batch
-                loss = float(np.mean(error**2))
-                epoch_loss += loss
+    flow_list = [dict(flow) for flow in flows]
+    feature_keys = list(feature_names) if feature_names is not None else list(_NUMERIC_FEATURE_KEYS)
+    matrix = np.zeros((len(flow_list), len(feature_keys)), dtype=dtype)
+    label_values: List[int] = []
+    has_missing_labels = not include_labels
 
-                grad_recon = error / max(1, batch.shape[0])
-                grad_W2 = latent.T @ grad_recon
-                grad_b2 = grad_recon.sum(axis=0)
-                grad_hidden = grad_recon @ self.decoder_weights_.T
-                grad_hidden *= (1.0 - latent**2)
-                grad_W1 = batch.T @ grad_hidden
-                grad_b1 = grad_hidden.sum(axis=0)
+    for row_index, flow in enumerate(flow_list):
+        for col_index, key in enumerate(feature_keys):
+            value = flow.get(key, 0.0)
+            try:
+                matrix[row_index, col_index] = float(value)
+            except (TypeError, ValueError):
+                matrix[row_index, col_index] = 0.0
 
-                self.decoder_weights_ -= self.learning_rate * grad_W2
-                self.decoder_bias_ -= self.learning_rate * grad_b2
-                self.encoder_weights_ -= self.learning_rate * grad_W1
-                self.encoder_bias_ -= self.learning_rate * grad_b1
+        if include_labels:
+            label = flow.get("Label")
+            if label is None and default_label is not None:
+                label = default_label
+                flow["Label"] = default_label
 
-            epoch_loss /= max(1, steps)
-            if epoch_loss < best_loss - 1e-6:
-                best_loss = epoch_loss
-                stalled = 0
+            if label is None:
+                has_missing_labels = True
             else:
-                stalled += 1
-                if stalled >= patience:
-                    break
-        return float(best_loss)
+                try:
+                    label_values.append(int(label))
+                except (TypeError, ValueError):
+                    has_missing_labels = True
 
-    def _fit_with_torch(self, train_arr: np.ndarray, device) -> float:
-        if torch is None or nn is None or DataLoader is None or TensorDataset is None:
-            return self._fit_with_numpy(train_arr)
+    labels: Optional[np.ndarray]
+    if has_missing_labels:
+        labels = None
+    else:
+        labels = np.asarray(label_values, dtype=np.int64)
+        if labels.size != matrix.shape[0]:
+            labels = None
 
-        torch.manual_seed(self.random_state)
-        tensor = torch.from_numpy(train_arr.astype(np.float32))
-        dataset = TensorDataset(tensor)
-        max_batch = max(self.batch_size, self.batch_size * 4)
-        self.actual_batch_size_ = int(min(len(dataset), max_batch)) or self.batch_size
-        batch_size = max(8, self.actual_batch_size_)
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            drop_last=False,
-        )
-        model = _TorchAutoencoder(self.input_dim_, self.latent_dim_).to(device)
-        optimiser = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
-        loss_fn = torch.nn.MSELoss()
+    return VectorizationResult(matrix=matrix, labels=labels, feature_names=list(feature_keys))
 
-        patience = 3
-        stalled = 0
-        best_loss = float("inf")
 
-        for _epoch in range(self.max_epochs):
-            epoch_loss = 0.0
-            total = 0
-            for (batch,) in loader:
-                batch = batch.to(device)
-                optimiser.zero_grad()
-                latent, recon = model(batch)
-                loss = loss_fn(recon, batch)
-                loss.backward()
-                optimiser.step()
-                batch_loss = float(loss.item())
-                epoch_loss += batch_loss * batch.shape[0]
-                total += batch.shape[0]
+def _create_progress_bar(desc: str, unit: str, show: bool):
+    if not show or tqdm is None:
+        return None
+    return tqdm(desc=desc, unit=unit, leave=False)
 
-            if total:
-                epoch_loss /= float(total)
-            if epoch_loss < best_loss - 1e-6:
-                best_loss = epoch_loss
-                stalled = 0
-            else:
-                stalled += 1
-                if stalled >= patience:
-                    break
 
-        with torch.no_grad():
-            encoder = model.encoder[0]
-            decoder = model.decoder[0]
-            self.encoder_weights_ = encoder.weight.detach().cpu().numpy().T
-            self.encoder_bias_ = encoder.bias.detach().cpu().numpy()
-            self.decoder_weights_ = decoder.weight.detach().cpu().numpy().T
-            self.decoder_bias_ = decoder.bias.detach().cpu().numpy()
+def vectorize_pcaps(
+    inputs: Sequence[Tuple[Union[str, Path], Optional[int]]],
+    output_path: Union[str, Path],
+    *,
+    show_progress: bool = False,
+) -> CSVDatasetSummary:
+    """Extract flow features from PCAP files and export them as CSV."""
 
-        return float(best_loss)
+    path = Path(output_path)
+    flow_count = 0
+    labels_present = False
 
-    def get_feature_names_out(self, input_features=None):
-        if input_features is None:
-            input_features = [f"f{i}" for i in range(self.input_dim_ or 0)]
-        base = list(input_features)
-        latent_dim = self.latent_dim_ or 0
-        base.extend([f"deep_latent_{i}" for i in range(latent_dim)])
-        base.append("deep_recon_error")
-        return np.array(base, dtype=object)
+    progress = _create_progress_bar("Vectorizing flows", "flow", show_progress)
+
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(CSV_COLUMNS)
+
+        for pcap_path, label in inputs:
+            result = extract_pcap_features(pcap_path)
+            if not result.get("success", False):
+                raise RuntimeError(
+                    f"Failed to extract features from {pcap_path}: {result.get('error', 'unknown error')}"
+                )
+
+            for flow in result.get("flows", []):
+                row = _flow_to_csv_row(flow, label)
+                writer.writerow(row)
+                flow_count += 1
+                if len(row) >= 1 and row[-1].strip() != "":
+                    labels_present = True
+                if progress is not None:
+                    progress.update(1)
+
+    if progress is not None:
+        progress.close()
+
+    return CSVDatasetSummary(
+        path=path,
+        flow_count=flow_count,
+        column_count=len(CSV_COLUMNS),
+        has_labels=labels_present,
+    )
+
+
+def vectorize_jsonl_files(
+    inputs: Sequence[Union[str, Path]],
+    output_path: Union[str, Path],
+    *,
+    label_override: Optional[int] = None,
+    show_progress: bool = False,
+) -> CSVDatasetSummary:
+    """Convert JSONL extraction results into the mandated CSV format."""
+
+    jsonl_paths = [Path(item) for item in inputs]
+    path = Path(output_path)
+    flow_count = 0
+    labels_present = False
+
+    progress = _create_progress_bar("Vectorizing flows", "flow", show_progress)
+
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(CSV_COLUMNS)
+
+        for flow, record_label in _iter_flows_from_jsonl(jsonl_paths):
+            effective_label = label_override if label_override is not None else record_label
+            row = _flow_to_csv_row(flow, effective_label)
+            writer.writerow(row)
+            flow_count += 1
+            if row and row[-1].strip():
+                labels_present = True
+            if progress is not None:
+                progress.update(1)
+
+    if progress is not None:
+        progress.close()
+
+    return CSVDatasetSummary(
+        path=path,
+        flow_count=flow_count,
+        column_count=len(CSV_COLUMNS),
+        has_labels=labels_present,
+    )
+
+
+def _load_dataset_from_reader(
+    reader: Iterator[List[str]],
+    *,
+    progress=None,
+) -> LoadedDataset:
+    """Parse a CSV dataset reader into numeric arrays and label metadata."""
+
+    feature_rows: List[List[float]] = []
+    row_labels: List[Optional[str]] = []
+
+    header = next(reader, None)
+    if header is None:
+        empty = np.zeros((0, len(_NUMERIC_FEATURE_KEYS)), dtype=np.float32)
+        stats = LoadedDatasetStats(total_rows=0, labeled_rows=0, dropped_rows=0)
+        return LoadedDataset(empty, None, list(_NUMERIC_FEATURE_NAMES), None, stats)
+
+    normalized_header = [column.strip() for column in header]
+    expected_header = list(CSV_COLUMNS)
+    if normalized_header != expected_header:
+        raise ValueError("CSV dataset header does not match the expected format")
+
+    counts: Dict[str, int] = defaultdict(int)
+    feature_indices: List[int] = []
+    label_index = -1
+
+    for index, column in enumerate(normalized_header):
+        occurrence = counts[column]
+        counts[column] += 1
+        if column == _LABEL_COLUMN:
+            label_index = index
+            continue
+        if column in _STRING_COLUMNS:
+            continue
+        feature_indices.append(index)
+
+    if len(feature_indices) != len(_NUMERIC_FEATURE_KEYS):
+        raise ValueError("CSV dataset feature count mismatch")
+
+    for row in reader:
+        if not row:
+            continue
+        feature_row: List[float] = []
+        for index in feature_indices:
+            value = row[index].strip()
+            try:
+                feature_row.append(float(value) if value else 0.0)
+            except ValueError:
+                feature_row.append(0.0)
+        feature_rows.append(feature_row)
+
+        if label_index >= 0 and label_index < len(row):
+            label_value = row[label_index].strip()
+            row_labels.append(label_value if label_value else None)
+        else:
+            row_labels.append(None)
+
+        if progress is not None:
+            progress.update(1)
+
+    total_rows = len(feature_rows)
+    matrix_rows = feature_rows
+    y: Optional[np.ndarray] = None
+    label_mapping: Optional[Dict[int, str]] = None
+
+    labeled_rows = 0
+    dropped_rows = 0
+
+    if label_index >= 0 and row_labels:
+        labeled_pairs = [
+            (features, label)
+            for features, label in zip(feature_rows, row_labels)
+            if label is not None
+        ]
+
+        labeled_rows = len(labeled_pairs)
+        dropped_rows = total_rows - labeled_rows
+
+        if labeled_pairs:
+            matrix_rows = [features for features, _ in labeled_pairs]
+            raw_labels = [label for _, label in labeled_pairs]
+        else:
+            raw_labels = []
+    else:
+        raw_labels = []
+
+    X = np.asarray(matrix_rows, dtype=np.float32)
+
+    if raw_labels:
+        numeric_labels: List[int] = []
+        numeric_mapping: Dict[int, str] = {}
+        all_numeric = True
+
+        for value in raw_labels:
+            try:
+                numeric_value = int(value)
+            except ValueError:
+                all_numeric = False
+                break
+            numeric_labels.append(numeric_value)
+            if numeric_value not in numeric_mapping:
+                numeric_mapping[numeric_value] = str(value)
+
+        if all_numeric:
+            y = np.asarray(numeric_labels, dtype=np.int64)
+            label_mapping = numeric_mapping or None
+        else:
+            string_to_index: Dict[str, int] = {}
+            numeric_labels = []
+            for value in raw_labels:
+                if value not in string_to_index:
+                    string_to_index[value] = len(string_to_index)
+                numeric_labels.append(string_to_index[value])
+            y = np.asarray(numeric_labels, dtype=np.int64)
+            label_mapping = {index: label for label, index in string_to_index.items()}
+
+    if label_mapping is None and y is not None:
+        # Preserve numeric class names for downstream reporting.
+        unique = dict.fromkeys(int(value) for value in y.tolist())
+        label_mapping = {int(value): str(value) for value in unique}
+
+    stats = LoadedDatasetStats(
+        total_rows=total_rows,
+        labeled_rows=labeled_rows,
+        dropped_rows=dropped_rows,
+    )
+
+    return LoadedDataset(X, y, list(_NUMERIC_FEATURE_NAMES), label_mapping, stats)
+
+
+@overload
+def load_vectorized_dataset(
+    path: Union[str, Path],
+    *,
+    show_progress: bool = ...,
+    return_stats: Literal[False] = ...,
+) -> Tuple[
+    np.ndarray,
+    Optional[np.ndarray],
+    List[str],
+    Optional[Dict[int, str]],
+]:
+    ...
+
+
+@overload
+def load_vectorized_dataset(
+    path: Union[str, Path],
+    *,
+    show_progress: bool = ...,
+    return_stats: Literal[True],
+) -> Tuple[
+    np.ndarray,
+    Optional[np.ndarray],
+    List[str],
+    Optional[Dict[int, str]],
+    LoadedDatasetStats,
+]:
+    ...
+
+
+def load_vectorized_dataset(
+    path: Union[str, Path],
+    *,
+    show_progress: bool = False,
+    return_stats: bool = False,
+) -> Union[
+    Tuple[
+        np.ndarray,
+        Optional[np.ndarray],
+        List[str],
+        Optional[Dict[int, str]],
+    ],
+    Tuple[
+        np.ndarray,
+        Optional[np.ndarray],
+        List[str],
+        Optional[Dict[int, str]],
+        LoadedDatasetStats,
+    ],
+]:
+    """Load a CSV dataset created by :func:`vectorize_pcaps`."""
+
+    dataset_path = Path(path)
+    last_error: Optional[UnicodeDecodeError] = None
+
+    for encoding in _CSV_READ_ENCODINGS:
+        progress = None
+        try:
+            with dataset_path.open("r", newline="", encoding=encoding) as handle:
+                reader = csv.reader(handle)
+                progress = _create_progress_bar("Loading dataset", "row", show_progress)
+                loaded = _load_dataset_from_reader(reader, progress=progress)
+                if return_stats:
+                    return (
+                        loaded.matrix,
+                        loaded.labels,
+                        loaded.feature_names,
+                        loaded.label_mapping,
+                        loaded.stats,
+                    )
+                return (
+                    loaded.matrix,
+                    loaded.labels,
+                    loaded.feature_names,
+                    loaded.label_mapping,
+                )
+        except UnicodeDecodeError as exc:  # pragma: no cover - environment specific
+            last_error = exc
+            continue
+        finally:
+            if progress is not None:
+                progress.close()
+
+    raise ValueError(
+        "Unable to decode CSV dataset using supported encodings: "
+        + ", ".join(_CSV_READ_ENCODINGS)
+    ) from last_error
