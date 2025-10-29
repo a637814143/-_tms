@@ -5,13 +5,19 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union, overload
+from typing import Literal
 
 import csv
 import json
 import numpy as np
 
 from .static_features import extract_pcap_features
+
+try:  # Optional dependency for command-line progress bars.
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional at runtime
+    tqdm = None  # type: ignore
 
 
 # Ordered CSV header mandated by the downstream pipeline.
@@ -166,6 +172,26 @@ class CSVDatasetSummary:
     has_labels: bool
 
 
+@dataclass
+class LoadedDatasetStats:
+    """Metadata describing dataset composition during CSV loading."""
+
+    total_rows: int
+    labeled_rows: int
+    dropped_rows: int
+
+
+@dataclass
+class LoadedDataset:
+    """Container returned when parsing a vectorized CSV dataset."""
+
+    matrix: np.ndarray
+    labels: Optional[np.ndarray]
+    feature_names: List[str]
+    label_mapping: Optional[Dict[int, str]]
+    stats: LoadedDatasetStats
+
+
 def _iter_jsonl_records(path: Union[str, Path]) -> Iterator[Dict[str, object]]:
     """Yield parsed JSON objects from a JSONL file."""
 
@@ -279,15 +305,25 @@ def vectorize_flows(
     return VectorizationResult(matrix=matrix, labels=labels, feature_names=list(feature_keys))
 
 
+def _create_progress_bar(desc: str, unit: str, show: bool):
+    if not show or tqdm is None:
+        return None
+    return tqdm(desc=desc, unit=unit, leave=False)
+
+
 def vectorize_pcaps(
     inputs: Sequence[Tuple[Union[str, Path], Optional[int]]],
     output_path: Union[str, Path],
+    *,
+    show_progress: bool = False,
 ) -> CSVDatasetSummary:
     """Extract flow features from PCAP files and export them as CSV."""
 
     path = Path(output_path)
     flow_count = 0
     labels_present = False
+
+    progress = _create_progress_bar("Vectorizing flows", "flow", show_progress)
 
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -306,6 +342,11 @@ def vectorize_pcaps(
                 flow_count += 1
                 if len(row) >= 1 and row[-1].strip() != "":
                     labels_present = True
+                if progress is not None:
+                    progress.update(1)
+
+    if progress is not None:
+        progress.close()
 
     return CSVDatasetSummary(
         path=path,
@@ -320,6 +361,7 @@ def vectorize_jsonl_files(
     output_path: Union[str, Path],
     *,
     label_override: Optional[int] = None,
+    show_progress: bool = False,
 ) -> CSVDatasetSummary:
     """Convert JSONL extraction results into the mandated CSV format."""
 
@@ -327,6 +369,8 @@ def vectorize_jsonl_files(
     path = Path(output_path)
     flow_count = 0
     labels_present = False
+
+    progress = _create_progress_bar("Vectorizing flows", "flow", show_progress)
 
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -339,6 +383,11 @@ def vectorize_jsonl_files(
             flow_count += 1
             if row and row[-1].strip():
                 labels_present = True
+            if progress is not None:
+                progress.update(1)
+
+    if progress is not None:
+        progress.close()
 
     return CSVDatasetSummary(
         path=path,
@@ -350,16 +399,19 @@ def vectorize_jsonl_files(
 
 def _load_dataset_from_reader(
     reader: Iterator[List[str]],
-) -> Tuple[np.ndarray, Optional[np.ndarray], List[str], Optional[Dict[int, str]]]:
+    *,
+    progress=None,
+) -> LoadedDataset:
     """Parse a CSV dataset reader into numeric arrays and label metadata."""
 
-    matrix: List[List[float]] = []
-    raw_labels: List[str] = []
+    feature_rows: List[List[float]] = []
+    row_labels: List[Optional[str]] = []
 
     header = next(reader, None)
     if header is None:
         empty = np.zeros((0, len(_NUMERIC_FEATURE_KEYS)), dtype=np.float32)
-        return empty, None, list(_NUMERIC_FEATURE_NAMES), None
+        stats = LoadedDatasetStats(total_rows=0, labeled_rows=0, dropped_rows=0)
+        return LoadedDataset(empty, None, list(_NUMERIC_FEATURE_NAMES), None, stats)
 
     normalized_header = [column.strip() for column in header]
     expected_header = list(CSV_COLUMNS)
@@ -393,18 +445,46 @@ def _load_dataset_from_reader(
                 feature_row.append(float(value) if value else 0.0)
             except ValueError:
                 feature_row.append(0.0)
-        matrix.append(feature_row)
+        feature_rows.append(feature_row)
 
         if label_index >= 0 and label_index < len(row):
             label_value = row[label_index].strip()
-            if label_value:
-                raw_labels.append(label_value)
+            row_labels.append(label_value if label_value else None)
+        else:
+            row_labels.append(None)
 
-    X = np.asarray(matrix, dtype=np.float32)
+        if progress is not None:
+            progress.update(1)
+
+    total_rows = len(feature_rows)
+    matrix_rows = feature_rows
     y: Optional[np.ndarray] = None
     label_mapping: Optional[Dict[int, str]] = None
 
-    if raw_labels and len(raw_labels) == len(matrix):
+    labeled_rows = 0
+    dropped_rows = 0
+
+    if label_index >= 0 and row_labels:
+        labeled_pairs = [
+            (features, label)
+            for features, label in zip(feature_rows, row_labels)
+            if label is not None
+        ]
+
+        labeled_rows = len(labeled_pairs)
+        dropped_rows = total_rows - labeled_rows
+
+        if labeled_pairs:
+            matrix_rows = [features for features, _ in labeled_pairs]
+            raw_labels = [label for _, label in labeled_pairs]
+        else:
+            raw_labels = []
+    else:
+        raw_labels = []
+
+    X = np.asarray(matrix_rows, dtype=np.float32)
+
+    if raw_labels:
         numeric_labels: List[int] = []
         numeric_mapping: Dict[int, str] = {}
         all_numeric = True
@@ -437,16 +517,65 @@ def _load_dataset_from_reader(
         unique = dict.fromkeys(int(value) for value in y.tolist())
         label_mapping = {int(value): str(value) for value in unique}
 
-    return X, y, list(_NUMERIC_FEATURE_NAMES), label_mapping
+    stats = LoadedDatasetStats(
+        total_rows=total_rows,
+        labeled_rows=labeled_rows,
+        dropped_rows=dropped_rows,
+    )
+
+    return LoadedDataset(X, y, list(_NUMERIC_FEATURE_NAMES), label_mapping, stats)
 
 
+@overload
 def load_vectorized_dataset(
-    path: Union[str, Path]
+    path: Union[str, Path],
+    *,
+    show_progress: bool = ...,
+    return_stats: Literal[False] = ...,
 ) -> Tuple[
     np.ndarray,
     Optional[np.ndarray],
     List[str],
     Optional[Dict[int, str]],
+]:
+    ...
+
+
+@overload
+def load_vectorized_dataset(
+    path: Union[str, Path],
+    *,
+    show_progress: bool = ...,
+    return_stats: Literal[True],
+) -> Tuple[
+    np.ndarray,
+    Optional[np.ndarray],
+    List[str],
+    Optional[Dict[int, str]],
+    LoadedDatasetStats,
+]:
+    ...
+
+
+def load_vectorized_dataset(
+    path: Union[str, Path],
+    *,
+    show_progress: bool = False,
+    return_stats: bool = False,
+) -> Union[
+    Tuple[
+        np.ndarray,
+        Optional[np.ndarray],
+        List[str],
+        Optional[Dict[int, str]],
+    ],
+    Tuple[
+        np.ndarray,
+        Optional[np.ndarray],
+        List[str],
+        Optional[Dict[int, str]],
+        LoadedDatasetStats,
+    ],
 ]:
     """Load a CSV dataset created by :func:`vectorize_pcaps`."""
 
@@ -454,13 +583,32 @@ def load_vectorized_dataset(
     last_error: Optional[UnicodeDecodeError] = None
 
     for encoding in _CSV_READ_ENCODINGS:
+        progress = None
         try:
             with dataset_path.open("r", newline="", encoding=encoding) as handle:
                 reader = csv.reader(handle)
-                return _load_dataset_from_reader(reader)
+                progress = _create_progress_bar("Loading dataset", "row", show_progress)
+                loaded = _load_dataset_from_reader(reader, progress=progress)
+                if return_stats:
+                    return (
+                        loaded.matrix,
+                        loaded.labels,
+                        loaded.feature_names,
+                        loaded.label_mapping,
+                        loaded.stats,
+                    )
+                return (
+                    loaded.matrix,
+                    loaded.labels,
+                    loaded.feature_names,
+                    loaded.label_mapping,
+                )
         except UnicodeDecodeError as exc:  # pragma: no cover - environment specific
             last_error = exc
             continue
+        finally:
+            if progress is not None:
+                progress.close()
 
     raise ValueError(
         "Unable to decode CSV dataset using supported encodings: "

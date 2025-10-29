@@ -11,6 +11,11 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from feature_utils import extract_flow_features
 
+try:  # Optional dependency used for user-facing progress bars.
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional at runtime
+    tqdm = None  # type: ignore
+
 __all__ = [
     "ThreadSafeProgressTracker",
     "ThreadSafeFileWriter",
@@ -170,6 +175,7 @@ def _write_results_to_jsonl(
     max_workers: Optional[int] = None,
     progress_callback=None,
     text_callback=None,
+    show_progress: bool = False,
 ) -> ExtractionSummary:
     """Helper that streams extraction results to a JSONL file."""
 
@@ -177,6 +183,12 @@ def _write_results_to_jsonl(
     writer = ThreadSafeFileWriter(output_path, text_callback)
     total_records = 0
     success_count = 0
+
+    progress = (
+        tqdm(total=len(inputs), desc="Extracting PCAPs", unit="file", leave=False)
+        if show_progress and tqdm is not None
+        else None
+    )
 
     try:
         for result in extract_pcap_features_batch(
@@ -189,8 +201,12 @@ def _write_results_to_jsonl(
             total_records += 1
             if result.get("success", False):
                 success_count += 1
+            if progress is not None:
+                progress.update(1)
     finally:
         writer.close()
+        if progress is not None:
+            progress.close()
 
     return ExtractionSummary(
         path=output_path,
@@ -207,6 +223,7 @@ def extract_pcap_features_to_file(
     max_workers: Optional[int] = None,
     progress_callback=None,
     text_callback=None,
+    show_progress: bool = False,
 ) -> Path:
     """Extract features for multiple PCAP files and write them as JSON lines."""
 
@@ -217,6 +234,7 @@ def extract_pcap_features_to_file(
         max_workers=max_workers,
         progress_callback=progress_callback,
         text_callback=text_callback,
+        show_progress=show_progress,
     )
     return summary.path
 
@@ -228,6 +246,7 @@ def extract_sources_to_jsonl(
     max_workers: Optional[int] = None,
     progress_callback=None,
     text_callback=None,
+    show_progress: bool = False,
 ) -> ExtractionSummary:
     """Extract features from a path or PCAP file directly into JSONL output."""
 
@@ -238,4 +257,5 @@ def extract_sources_to_jsonl(
         max_workers=max_workers,
         progress_callback=progress_callback,
         text_callback=text_callback,
+        show_progress=show_progress,
     )

@@ -23,6 +23,7 @@ class TrainingSummary:
     feature_names: List[str]
     flow_count: int
     label_mapping: Optional[Dict[int, str]] = None
+    dropped_flows: int = 0
 
 
 @dataclass
@@ -56,8 +57,14 @@ def train_hist_gradient_boosting(
 ) -> TrainingSummary:
     """Train a tree-based classifier similar to the EMBER pipeline."""
 
-    X, y, feature_names, label_mapping = load_vectorized_dataset(dataset_path)
+    X, y, feature_names, label_mapping, stats = load_vectorized_dataset(
+        dataset_path, show_progress=True, return_stats=True
+    )
     if y is None or y.size == 0:
+        if stats.total_rows and not stats.labeled_rows:
+            raise ValueError(
+                "Dataset includes a label column but no non-empty labels; cannot train a classifier."
+            )
         raise ValueError("Dataset does not contain labels; cannot train a classifier.")
 
     params = DEFAULT_MODEL_PARAMS.copy()
@@ -84,6 +91,7 @@ def train_hist_gradient_boosting(
         feature_names=feature_names,
         flow_count=X.shape[0],
         label_mapping=label_mapping,
+        dropped_flows=int(stats.dropped_rows),
     )
 
 

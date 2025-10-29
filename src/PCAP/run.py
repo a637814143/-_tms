@@ -55,7 +55,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _handle_extract(source: Path, output: Path, workers: int | None) -> None:
-    summary = extract_sources_to_jsonl(source, output, max_workers=workers)
+    summary = extract_sources_to_jsonl(
+        source,
+        output,
+        max_workers=workers,
+        show_progress=True,
+    )
     print(
         "Extracted features for {count} files (success: {success}) into {path}".format(
             count=summary.record_count,
@@ -69,7 +74,12 @@ def _handle_extract(source: Path, output: Path, workers: int | None) -> None:
 
 
 def _handle_vectorize(output: Path, jsonl_paths: Sequence[Path], label: int | None) -> None:
-    summary = vectorize_jsonl_files(jsonl_paths, output, label_override=label)
+    summary = vectorize_jsonl_files(
+        jsonl_paths,
+        output,
+        label_override=label,
+        show_progress=True,
+    )
     print(f"Saved dataset to {summary.path} with {summary.flow_count} flows")
     label_note = "with labels" if summary.has_labels else "without labels"
     print(f"CSV includes {summary.column_count} columns {label_note}.")
@@ -90,6 +100,8 @@ def _handle_train(dataset: Path, model: Path, iterations: int | None) -> None:
     )
     if summary.label_mapping:
         print(f"Label mapping: {summary.label_mapping}")
+    if summary.dropped_flows:
+        print(f"Dropped {summary.dropped_flows} unlabeled rows prior to training.")
 
 
 def _handle_detect(model: Path, pcap: Path) -> None:
