@@ -4,23 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
-      <change afterPath="$PROJECT_DIR$/src/functions/__init__.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/functions/feature_utils.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/PCAP/__init__.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/PCAP/feature_utils.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/PCAP/modeling.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/PCAP/run.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/PCAP/static_features.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/PCAP/vectorizer.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/csv_utils.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/feature_extractor.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/feature_extractor.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/predict_unsupervised.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/predict_unsupervised.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/simple_unsupervised.py" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/transformers.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/transformers.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/unsupervised_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/unsupervised_train.py" afterDir="false" />
-    </list>
+    <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -267,7 +251,15 @@
       <option name="project" value="LOCAL" />
       <updated>1761742122731</updated>
     </task>
-    <option name="localTasksCounter" value="6" />
+    <task id="LOCAL-00006" summary="8888">
+      <option name="closed" value="true" />
+      <created>1761744087551</created>
+      <option name="number" value="00006" />
+      <option name="presentableId" value="LOCAL-00006" />
+      <option name="project" value="LOCAL" />
+      <updated>1761744087551</updated>
+    </task>
+    <option name="localTasksCounter" value="7" />
     <servers />
   </component>
   <component name="UnknownFeatures">
