@@ -10,8 +10,8 @@ import numpy as np
 from joblib import dump, load
 from sklearn.ensemble import HistGradientBoostingClassifier
 
-from src.PCAP.static_features import extract_pcap_features
-from src.PCAP.vectorizer import VectorizationResult, load_vectorized_dataset, vectorize_flows
+from .static_features import extract_pcap_features
+from .vectorizer import VectorizationResult, load_vectorized_dataset, vectorize_flows
 
 
 @dataclass
