@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
-from feature_utils import extract_flow_features
+from .feature_utils import extract_flow_features
 
 __all__ = [
     "ThreadSafeProgressTracker",
