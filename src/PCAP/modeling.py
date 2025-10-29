@@ -19,9 +19,10 @@ class TrainingSummary:
     """Metadata describing a completed training run."""
 
     model_path: Path
-    classes: List[int]
+    classes: List[str]
     feature_names: List[str]
     flow_count: int
+    label_mapping: Optional[Dict[int, str]] = None
 
 
 @dataclass
@@ -36,6 +37,7 @@ class DetectionResult:
     scores: List[float]
     flows: List[Dict[str, object]]
     error: Optional[str] = None
+    prediction_labels: Optional[List[str]] = None
 
 
 DEFAULT_MODEL_PARAMS: Dict[str, Union[int, float, None]] = {
@@ -54,7 +56,7 @@ def train_hist_gradient_boosting(
 ) -> TrainingSummary:
     """Train a tree-based classifier similar to the EMBER pipeline."""
 
-    X, y, feature_names = load_vectorized_dataset(dataset_path)
+    X, y, feature_names, label_mapping = load_vectorized_dataset(dataset_path)
     if y is None or y.size == 0:
         raise ValueError("Dataset does not contain labels; cannot train a classifier.")
 
@@ -67,24 +69,34 @@ def train_hist_gradient_boosting(
     artifact = {
         "model": clf,
         "feature_names": feature_names,
+        "label_mapping": label_mapping,
     }
     dump(artifact, model_path)
 
+    if label_mapping:
+        classes_display = [label_mapping.get(int(cls), str(cls)) for cls in clf.classes_]
+    else:
+        classes_display = [str(cls) for cls in clf.classes_]
+
     return TrainingSummary(
         model_path=Path(model_path),
-        classes=[int(cls) for cls in clf.classes_],
+        classes=classes_display,
         feature_names=feature_names,
         flow_count=X.shape[0],
+        label_mapping=label_mapping,
     )
 
 
-def _load_model_artifact(model_path: Union[str, Path]) -> Tuple[HistGradientBoostingClassifier, List[str]]:
+def _load_model_artifact(
+    model_path: Union[str, Path]
+) -> Tuple[HistGradientBoostingClassifier, List[str], Optional[Dict[int, str]]]:
     artifact = load(model_path)
     model = artifact.get("model")
     feature_names = artifact.get("feature_names")
+    label_mapping = artifact.get("label_mapping")
     if model is None or feature_names is None:
         raise ValueError("Model artifact is missing required data")
-    return model, list(feature_names)
+    return model, list(feature_names), label_mapping if label_mapping else None
 
 
 def detect_pcap_with_model(
@@ -93,7 +105,7 @@ def detect_pcap_with_model(
 ) -> DetectionResult:
     """Vectorize a PCAP file and run inference using a trained model."""
 
-    model, feature_names = _load_model_artifact(model_path)
+    model, feature_names, label_mapping = _load_model_artifact(model_path)
     result = extract_pcap_features(pcap_path)
 
     if not result.get("success", False):
@@ -106,6 +118,7 @@ def detect_pcap_with_model(
             scores=[],
             flows=[],
             error=result.get("error"),
+            prediction_labels=None,
         )
 
     flows = [dict(flow) for flow in result.get("flows", [])]
@@ -122,17 +135,13 @@ def detect_pcap_with_model(
             predictions=[],
             scores=[],
             flows=[],
+            prediction_labels=[],
         )
 
     X = vectorized.matrix
     if hasattr(model, "predict_proba"):
         proba = model.predict_proba(X)
-        classes = list(model.classes_)
-        if len(classes) == 2 and 1 in classes:
-            positive_index = classes.index(1)
-        else:
-            positive_index = -1
-        scores = proba[:, positive_index] if positive_index >= 0 else proba[:, -1]
+        scores = proba.max(axis=1)
     elif hasattr(model, "decision_function"):
         decision = model.decision_function(X)
         if decision.ndim == 1:
@@ -143,11 +152,18 @@ def detect_pcap_with_model(
         scores = model.predict(X)
 
     predictions = model.predict(X)
+    prediction_labels: List[str] = []
+    if label_mapping:
+        for value in predictions:
+            prediction_labels.append(label_mapping.get(int(value), str(value)))
+    else:
+        prediction_labels = [str(value) for value in predictions]
 
     annotated_flows: List[Dict[str, object]] = []
-    for flow, label, score in zip(flows, predictions, scores):
+    for flow, label, label_name, score in zip(flows, predictions, prediction_labels, scores):
         annotated = dict(flow)
         annotated["prediction"] = int(label)
+        annotated["prediction_label"] = label_name
         annotated["malicious_score"] = float(score)
         annotated_flows.append(annotated)
 
@@ -159,4 +175,5 @@ def detect_pcap_with_model(
         predictions=[int(value) for value in predictions],
         scores=[float(value) for value in scores],
         flows=annotated_flows,
+        prediction_labels=prediction_labels,
     )

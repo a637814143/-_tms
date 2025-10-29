@@ -347,29 +347,36 @@ def vectorize_jsonl_files(
     )
 
 
-def load_vectorized_dataset(path: Union[str, Path]) -> Tuple[np.ndarray, Optional[np.ndarray], List[str]]:
+def load_vectorized_dataset(
+    path: Union[str, Path]
+) -> Tuple[
+    np.ndarray,
+    Optional[np.ndarray],
+    List[str],
+    Optional[Dict[int, str]],
+]:
     """Load a CSV dataset created by :func:`vectorize_pcaps`."""
 
     matrix: List[List[float]] = []
-    labels: List[int] = []
+    raw_labels: List[str] = []
 
     with Path(path).open("r", newline="", encoding="utf-8") as handle:
         reader = csv.reader(handle)
         header = next(reader, None)
         if header is None:
-            return np.zeros((0, len(_NUMERIC_FEATURE_KEYS)), dtype=np.float32), None, list(
-                _NUMERIC_FEATURE_NAMES
-            )
+            empty = np.zeros((0, len(_NUMERIC_FEATURE_KEYS)), dtype=np.float32)
+            return empty, None, list(_NUMERIC_FEATURE_NAMES), None
 
+        normalized_header = [column.strip() for column in header]
         expected_header = list(CSV_COLUMNS)
-        if list(header) != expected_header:
+        if normalized_header != expected_header:
             raise ValueError("CSV dataset header does not match the expected format")
 
         counts: Dict[str, int] = defaultdict(int)
         feature_indices: List[int] = []
         label_index = -1
 
-        for index, column in enumerate(header):
+        for index, column in enumerate(normalized_header):
             occurrence = counts[column]
             counts[column] += 1
             if column == _LABEL_COLUMN:
@@ -397,13 +404,43 @@ def load_vectorized_dataset(path: Union[str, Path]) -> Tuple[np.ndarray, Optiona
             if label_index >= 0 and label_index < len(row):
                 label_value = row[label_index].strip()
                 if label_value:
-                    labels.append(int(label_value))
+                    raw_labels.append(label_value)
 
     X = np.asarray(matrix, dtype=np.float32)
-    y: Optional[np.ndarray]
-    if labels and len(labels) == len(matrix):
-        y = np.asarray(labels, dtype=np.int64)
-    else:
-        y = None
+    y: Optional[np.ndarray] = None
+    label_mapping: Optional[Dict[int, str]] = None
 
-    return X, y, list(_NUMERIC_FEATURE_NAMES)
+    if raw_labels and len(raw_labels) == len(matrix):
+        numeric_labels: List[int] = []
+        numeric_mapping: Dict[int, str] = {}
+        all_numeric = True
+
+        for value in raw_labels:
+            try:
+                numeric_value = int(value)
+            except ValueError:
+                all_numeric = False
+                break
+            numeric_labels.append(numeric_value)
+            if numeric_value not in numeric_mapping:
+                numeric_mapping[numeric_value] = str(value)
+
+        if all_numeric:
+            y = np.asarray(numeric_labels, dtype=np.int64)
+            label_mapping = numeric_mapping or None
+        else:
+            string_to_index: Dict[str, int] = {}
+            numeric_labels = []
+            for value in raw_labels:
+                if value not in string_to_index:
+                    string_to_index[value] = len(string_to_index)
+                numeric_labels.append(string_to_index[value])
+            y = np.asarray(numeric_labels, dtype=np.int64)
+            label_mapping = {index: label for label, index in string_to_index.items()}
+
+    if label_mapping is None and y is not None:
+        # Preserve numeric class names for downstream reporting.
+        unique = dict.fromkeys(int(value) for value in y.tolist())
+        label_mapping = {int(value): str(value) for value in unique}
+
+    return X, y, list(_NUMERIC_FEATURE_NAMES), label_mapping

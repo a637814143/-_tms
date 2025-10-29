@@ -88,6 +88,8 @@ def _handle_train(dataset: Path, model: Path, iterations: int | None) -> None:
             path=summary.model_path,
         )
     )
+    if summary.label_mapping:
+        print(f"Label mapping: {summary.label_mapping}")
 
 
 def _handle_detect(model: Path, pcap: Path) -> None:
@@ -104,6 +106,8 @@ def _handle_detect(model: Path, pcap: Path) -> None:
     if result.flow_count:
         top_score = max(result.scores)
         print(f"Highest malicious score: {top_score:.3f}")
+        if result.prediction_labels:
+            print(f"Predicted labels: {result.prediction_labels[:5]}")
 
 
 def main(argv: Sequence[str] | None = None) -> None:
