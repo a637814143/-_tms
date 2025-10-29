@@ -105,6 +105,7 @@ CSV_COLUMNS: Sequence[str] = (
 
 _STRING_COLUMNS = {"Flow ID", "Source IP", "Destination IP", "Timestamp"}
 _LABEL_COLUMN = "Label"
+_CSV_READ_ENCODINGS: Sequence[str] = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
 
 
 def _resolve_actual_key(column: str, occurrence: int) -> str:
@@ -347,64 +348,57 @@ def vectorize_jsonl_files(
     )
 
 
-def load_vectorized_dataset(
-    path: Union[str, Path]
-) -> Tuple[
-    np.ndarray,
-    Optional[np.ndarray],
-    List[str],
-    Optional[Dict[int, str]],
-]:
-    """Load a CSV dataset created by :func:`vectorize_pcaps`."""
+def _load_dataset_from_reader(
+    reader: Iterator[List[str]],
+) -> Tuple[np.ndarray, Optional[np.ndarray], List[str], Optional[Dict[int, str]]]:
+    """Parse a CSV dataset reader into numeric arrays and label metadata."""
 
     matrix: List[List[float]] = []
     raw_labels: List[str] = []
 
-    with Path(path).open("r", newline="", encoding="utf-8") as handle:
-        reader = csv.reader(handle)
-        header = next(reader, None)
-        if header is None:
-            empty = np.zeros((0, len(_NUMERIC_FEATURE_KEYS)), dtype=np.float32)
-            return empty, None, list(_NUMERIC_FEATURE_NAMES), None
+    header = next(reader, None)
+    if header is None:
+        empty = np.zeros((0, len(_NUMERIC_FEATURE_KEYS)), dtype=np.float32)
+        return empty, None, list(_NUMERIC_FEATURE_NAMES), None
 
-        normalized_header = [column.strip() for column in header]
-        expected_header = list(CSV_COLUMNS)
-        if normalized_header != expected_header:
-            raise ValueError("CSV dataset header does not match the expected format")
+    normalized_header = [column.strip() for column in header]
+    expected_header = list(CSV_COLUMNS)
+    if normalized_header != expected_header:
+        raise ValueError("CSV dataset header does not match the expected format")
 
-        counts: Dict[str, int] = defaultdict(int)
-        feature_indices: List[int] = []
-        label_index = -1
+    counts: Dict[str, int] = defaultdict(int)
+    feature_indices: List[int] = []
+    label_index = -1
 
-        for index, column in enumerate(normalized_header):
-            occurrence = counts[column]
-            counts[column] += 1
-            if column == _LABEL_COLUMN:
-                label_index = index
-                continue
-            if column in _STRING_COLUMNS:
-                continue
-            feature_indices.append(index)
+    for index, column in enumerate(normalized_header):
+        occurrence = counts[column]
+        counts[column] += 1
+        if column == _LABEL_COLUMN:
+            label_index = index
+            continue
+        if column in _STRING_COLUMNS:
+            continue
+        feature_indices.append(index)
 
-        if len(feature_indices) != len(_NUMERIC_FEATURE_KEYS):
-            raise ValueError("CSV dataset feature count mismatch")
+    if len(feature_indices) != len(_NUMERIC_FEATURE_KEYS):
+        raise ValueError("CSV dataset feature count mismatch")
 
-        for row in reader:
-            if not row:
-                continue
-            feature_row: List[float] = []
-            for index in feature_indices:
-                value = row[index].strip()
-                try:
-                    feature_row.append(float(value) if value else 0.0)
-                except ValueError:
-                    feature_row.append(0.0)
-            matrix.append(feature_row)
+    for row in reader:
+        if not row:
+            continue
+        feature_row: List[float] = []
+        for index in feature_indices:
+            value = row[index].strip()
+            try:
+                feature_row.append(float(value) if value else 0.0)
+            except ValueError:
+                feature_row.append(0.0)
+        matrix.append(feature_row)
 
-            if label_index >= 0 and label_index < len(row):
-                label_value = row[label_index].strip()
-                if label_value:
-                    raw_labels.append(label_value)
+        if label_index >= 0 and label_index < len(row):
+            label_value = row[label_index].strip()
+            if label_value:
+                raw_labels.append(label_value)
 
     X = np.asarray(matrix, dtype=np.float32)
     y: Optional[np.ndarray] = None
@@ -444,3 +438,31 @@ def load_vectorized_dataset(
         label_mapping = {int(value): str(value) for value in unique}
 
     return X, y, list(_NUMERIC_FEATURE_NAMES), label_mapping
+
+
+def load_vectorized_dataset(
+    path: Union[str, Path]
+) -> Tuple[
+    np.ndarray,
+    Optional[np.ndarray],
+    List[str],
+    Optional[Dict[int, str]],
+]:
+    """Load a CSV dataset created by :func:`vectorize_pcaps`."""
+
+    dataset_path = Path(path)
+    last_error: Optional[UnicodeDecodeError] = None
+
+    for encoding in _CSV_READ_ENCODINGS:
+        try:
+            with dataset_path.open("r", newline="", encoding=encoding) as handle:
+                reader = csv.reader(handle)
+                return _load_dataset_from_reader(reader)
+        except UnicodeDecodeError as exc:  # pragma: no cover - environment specific
+            last_error = exc
+            continue
+
+    raise ValueError(
+        "Unable to decode CSV dataset using supported encodings: "
+        + ", ".join(_CSV_READ_ENCODINGS)
+    ) from last_error
