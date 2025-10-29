@@ -4,27 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="">
-      <change afterPath="$PROJECT_DIR$/src/functions/export_results.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/functions/predict_unsupervised.py" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/src/functions/risk_rules.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/pythonProject8.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/pythonProject8.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/scripts/ROOT.py" beforeDir="false" afterPath="$PROJECT_DIR$/scripts/ROOT.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/analyze_results.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/analyze_results.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/feature_extractor.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/feature_extractor.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/info.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/info.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/split.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/split.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/unsupervised_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/unsupervised_train.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/learn.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/learn.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/main.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ui/ui_main.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/ui_main.py" afterDir="false" />
-    </list>
+    <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="Changes" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -216,9 +196,30 @@
       <option name="presentableId" value="Default" />
       <updated>1754543842572</updated>
     </task>
+    <task id="LOCAL-00001" summary="Changes">
+      <option name="closed" value="true" />
+      <created>1761739840694</created>
+      <option name="number" value="00001" />
+      <option name="presentableId" value="LOCAL-00001" />
+      <option name="project" value="LOCAL" />
+      <updated>1761739840694</updated>
+    </task>
+    <task id="LOCAL-00002" summary="Changes">
+      <option name="closed" value="true" />
+      <created>1761739932540</created>
+      <option name="number" value="00002" />
+      <option name="presentableId" value="LOCAL-00002" />
+      <option name="project" value="LOCAL" />
+      <updated>1761739932540</updated>
+    </task>
+    <option name="localTasksCounter" value="3" />
     <servers />
   </component>
   <component name="UnknownFeatures">
     <option featureType="com.intellij.fileTypeFactory" implementationName="*.csv" />
+  </component>
+  <component name="VcsManagerConfiguration">
+    <MESSAGE value="Changes" />
+    <option name="LAST_COMMIT_MESSAGE" value="Changes" />
   </component>
 </project>
