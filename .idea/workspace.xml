@@ -4,15 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="Changes">
-      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
+    <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/analyze_results.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/analyze_results.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/feature_extractor.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/feature_extractor.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/info.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/info.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/simple_unsupervised.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/simple_unsupervised.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/split.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/split.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/unsupervised_train.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/unsupervised_train.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/scripts/auto_annotate.py" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -29,6 +23,18 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
+  <component name="GitHubPullRequestSearchHistory"><![CDATA[{
+  "lastFilter": {
+    "state": "OPEN",
+    "assignee": "a637814143"
+  }
+}]]></component>
+  <component name="GithubPullRequestsUISettings"><![CDATA[{
+  "selectedUrlAndAccountId": {
+    "url": "https://github.com/a637814143/-_tms.git",
+    "accountId": "adc68872-7154-4e1f-9d7d-93e44376621a"
+  }
+}]]></component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 1
 }</component>
@@ -52,6 +58,7 @@
     "Python.ui_main.executor": "Run",
     "Python.unsupervised_train.executor": "Run",
     "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
     "RunOnceActivity.git.unshallow": "true",
     "git-widget-placeholder": "main",
     "settings.editor.selected.configurable": "org.jetbrains.plugins.github.ui.GithubSettingsConfigurable"
@@ -230,7 +237,15 @@
       <option name="project" value="LOCAL" />
       <updated>1761740066809</updated>
     </task>
-    <option name="localTasksCounter" value="4" />
+    <task id="LOCAL-00004" summary="8888">
+      <option name="closed" value="true" />
+      <created>1761740881328</created>
+      <option name="number" value="00004" />
+      <option name="presentableId" value="LOCAL-00004" />
+      <option name="project" value="LOCAL" />
+      <updated>1761740881328</updated>
+    </task>
+    <option name="localTasksCounter" value="5" />
     <servers />
   </component>
   <component name="UnknownFeatures">
@@ -238,6 +253,7 @@
   </component>
   <component name="VcsManagerConfiguration">
     <MESSAGE value="Changes" />
-    <option name="LAST_COMMIT_MESSAGE" value="Changes" />
+    <MESSAGE value="8888" />
+    <option name="LAST_COMMIT_MESSAGE" value="8888" />
   </component>
 </project>

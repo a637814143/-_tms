@@ -48,7 +48,6 @@ from src.functions.annotations import (
     annotation_summary,
     apply_annotations_to_frame,
 )
-from scripts.auto_annotate import auto_annotate
 
 try:
     import pandas as pd
@@ -454,39 +453,6 @@ class PandasFrameModel(QtCore.QAbstractTableModel):
             except Exception:
                 return str(sec)
         return str(sec)
-
-
-class RowHighlighter(QtWidgets.QStyledItemDelegate):
-    def __init__(self, df_provider, parent=None):
-        super().__init__(parent)
-        self.df_provider = df_provider
-
-    def paint(self, painter, option, index):
-        df = self.df_provider()
-        if df is not None and "__TAG__" in df.columns:
-            r = index.row()
-            try:
-                tag = str(df.iloc[r].get("__TAG__", "")).strip()
-            except Exception:
-                tag = ""
-            if tag:
-                painter.save()
-                painter.fillRect(option.rect, QtGui.QColor(255, 204, 204))
-                painter.restore()
-        super().paint(painter, option, index)
-
-    def helpEvent(self, event, view, option, index):
-        df = self.df_provider()
-        if df is not None and "__TAG__" in df.columns:
-            r = index.row()
-            try:
-                tag = str(df.iloc[r].get("__TAG__", "")).strip()
-            except Exception:
-                tag = ""
-            if tag:
-                QtWidgets.QToolTip.showText(event.globalPos(), f"自动标注：{tag}")
-                return True
-        return super().helpEvent(event, view, option, index)
 
 
 # =============== 后台线程 ===============
@@ -1272,7 +1238,6 @@ class Ui_MainWindow(object):
             for btn in (
                 getattr(self, "btn_view", None),
                 getattr(self, "btn_fe", None),
-                getattr(self, "btn_auto_label", None),
                 getattr(self, "btn_vector", None),
                 getattr(self, "btn_train", None),
                 getattr(self, "btn_analysis", None),
@@ -1407,7 +1372,6 @@ class Ui_MainWindow(object):
 
         self.btn_view = QtWidgets.QPushButton("查看流量信息")
         self.btn_fe = QtWidgets.QPushButton("提取特征")
-        self.btn_auto_label = QtWidgets.QPushButton("自动打标签")
         self.btn_vector = QtWidgets.QPushButton("数据预处理")
         self.btn_train = QtWidgets.QPushButton("训练模型")
         self.btn_analysis = QtWidgets.QPushButton("运行分析")
@@ -1422,7 +1386,6 @@ class Ui_MainWindow(object):
         for btn in (
             self.btn_view,
             self.btn_fe,
-            self.btn_auto_label,
             self.btn_vector,
             self.btn_train,
             self.btn_analysis,
@@ -1440,7 +1403,6 @@ class Ui_MainWindow(object):
         data_group, data_layout = self._create_collapsible_group("数据阶段")
         data_layout.addWidget(self.btn_view)
         data_layout.addWidget(self.btn_fe)
-        data_layout.addWidget(self.btn_auto_label)
         data_layout.addWidget(self.btn_vector)
         data_layout.addStretch(1)
         self.right_layout.addWidget(data_group)
@@ -1866,7 +1828,6 @@ class Ui_MainWindow(object):
         self.btn_export.clicked.connect(self._on_export_results)
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_fe.clicked.connect(self._on_extract_features)
-        self.btn_auto_label.clicked.connect(self.on_auto_label_clicked)
         self.btn_vector.clicked.connect(self._on_preprocess_features)
         self.btn_train.clicked.connect(self._on_train_model)
         self.btn_analysis.clicked.connect(self._on_run_analysis)
@@ -2447,118 +2408,9 @@ class Ui_MainWindow(object):
             app.restoreOverrideCursor()
 
     # --------- 表格渲染 ----------
-    def _auto_tag_dataframe(self, df: "pd.DataFrame"):
-        if pd is None or df is None:
-            return df
-        if df.empty:
-            return df
-
-        tag_col = "__TAG__"
-        df[tag_col] = ""
-
-        def _ensure_mask(mask):
-            if isinstance(mask, pd.Series):
-                return mask.fillna(False)
-            return pd.Series(mask, index=df.index).fillna(False)
-
-        def _append_reason(mask, reason: str):
-            mask = _ensure_mask(mask)
-            if not mask.any():
-                return
-            current = df.loc[mask, tag_col].astype(str)
-            df.loc[mask, tag_col] = [
-                reason if not s or not s.strip() else f"{s};{reason}"
-                for s in current
-            ]
-
-        def _append_reason_from_values(mask, values: "pd.Series", prefix: str):
-            mask = _ensure_mask(mask)
-            if not mask.any():
-                return
-            if not isinstance(values, pd.Series):
-                values = pd.Series(values, index=df.index)
-            vals = values.loc[mask].astype(str).str.strip().str[:40]
-            current = df.loc[mask, tag_col].astype(str)
-            df.loc[mask, tag_col] = [
-                (f"{prefix}{val}" if not s or not s.strip() else f"{s};{prefix}{val}")
-                for s, val in zip(current, vals)
-            ]
-
-        if "prediction" in df.columns:
-            series = df["prediction"]
-            try:
-                if pd.api.types.is_numeric_dtype(series):
-                    mask_pred = pd.to_numeric(series, errors="coerce").fillna(0) < 0
-                else:
-                    text = series.astype(str).str.lower()
-                    mask_pred = text.isin({"-1", "anomaly", "abnormal", "malicious", "恶意", "异常"}) | text.str.contains(
-                        "attack|threat|anomaly|异常|恶意", case=False, na=False
-                    )
-            except Exception:
-                mask_pred = pd.Series(False, index=df.index)
-            _append_reason(mask_pred, "模型预测异常")
-
-        if "anomaly_score" in df.columns:
-            series = pd.to_numeric(df["anomaly_score"], errors="coerce")
-            finite = series.dropna()
-            if not finite.empty:
-                if (finite <= 0).any() and (finite >= 0).any():
-                    threshold = 0
-                else:
-                    threshold = finite.quantile(0.98) if len(finite) > 10 else finite.max()
-                mask_score = series > threshold
-                _append_reason(mask_score, "异常得分偏高")
-
-        bool_like_names = {
-            "is_anomaly",
-            "anomaly",
-            "is_attack",
-            "is_malicious",
-            "malicious",
-            "threat",
-        }
-        for col in df.columns:
-            if str(col).lower() in bool_like_names:
-                series = df[col].astype(str).str.strip().str.lower()
-                mask_bool = series.isin({"1", "true", "yes", "y", "异常", "恶意", "attack", "malicious", "是"})
-                _append_reason(mask_bool, f"{col} 指示异常")
-
-        suspicious_column_keywords = ("label", "result", "status", "type", "attack", "threat", "alert", "category", "tag")
-        safe_values = {"", "normal", "benign", "none", "ok", "-", "合法", "正常", "无"}
-        safe_values = {s.lower() for s in safe_values}
-        suspicious_values = [
-            "异常", "攻击", "恶意", "malicious", "threat", "suspicious", "可疑", "beacon", "flood",
-            "bot", "c2", "command", "shell", "scan", "exploit", "入侵", "泄露", "exfil"
-        ]
-
-        for col in df.columns:
-            lower = str(col).lower()
-            if lower == tag_col.lower():
-                continue
-            if any(key in lower for key in suspicious_column_keywords):
-                try:
-                    text_series = df[col].astype(str).str.strip()
-                except Exception:
-                    continue
-
-                def _is_suspicious(value: str) -> bool:
-                    if not value:
-                        return False
-                    lv = value.lower()
-                    if lv in safe_values:
-                        return False
-                    return any(keyword in lv for keyword in suspicious_values)
-
-                mask = text_series.apply(_is_suspicious)
-                _append_reason_from_values(mask, text_series, f"{col}: ")
-
-        return df
-
     def populate_table_from_df(self, df: "pd.DataFrame"):
         if pd is None:
             raise RuntimeError("pandas required")
-        if pd is not None and isinstance(df, pd.DataFrame):
-            df = self._auto_tag_dataframe(df)
         self._last_preview_df = df
         show_df = df.head(PREVIEW_LIMIT_FOR_TABLE).copy() if (len(df) > PREVIEW_LIMIT_FOR_TABLE and not self._csv_paged_path) else df
         self.table_view.setUpdatesEnabled(False)
@@ -2570,12 +2422,6 @@ class Ui_MainWindow(object):
             self.table_view.setModel(proxy)
             self.table_view.setSortingEnabled(True)
             self.table_view.resizeColumnsToContents()
-
-            def _current_df():
-                src = proxy.sourceModel()
-                return getattr(src, "_df", None)
-
-            self.table_view.setItemDelegate(RowHighlighter(_current_df, self.table_view))
             self.display_tabs.setCurrentWidget(self.table_widget)
         finally:
             self.table_view.setUpdatesEnabled(True)
@@ -3083,129 +2929,6 @@ class Ui_MainWindow(object):
         self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "特征提取失败", msg)
         self.display_result(f"[错误] 特征提取失败: {msg}")
-
-    def on_auto_label_clicked(self) -> None:
-        start_dir = self._default_csv_feature_dir()
-        feat_csv, _ = QtWidgets.QFileDialog.getOpenFileName(
-            None,
-            "选择特征CSV",
-            start_dir,
-            "CSV (*.csv);;所有文件 (*)",
-        )
-        if not feat_csv:
-            return
-
-        self._remember_path(feat_csv)
-
-        models_dir = Path(self._default_models_dir())
-        meta_path = models_dir / "latest_iforest_metadata.json"
-        pipe_path = models_dir / "latest_iforest_pipeline.joblib"
-
-        if not pipe_path.exists():
-            candidates = sorted(models_dir.glob("iforest_pipeline_*.joblib"), key=lambda p: p.stat().st_mtime)
-            if not candidates:
-                QtWidgets.QMessageBox.critical(None, "错误", "未找到模型，请先训练。")
-                return
-            pipe_path = candidates[-1]
-
-        if not meta_path.exists():
-            meta_candidates = sorted(models_dir.glob("iforest_metadata_*.json"), key=lambda p: p.stat().st_mtime)
-            meta_path = meta_candidates[-1] if meta_candidates else None
-
-        results_dir = Path(self._prediction_out_dir())
-        results_dir.mkdir(parents=True, exist_ok=True)
-        out_csv = results_dir / "out.csv"
-
-        cmd = [
-            sys.executable,
-            "-m",
-            "src.services.pipeline_service",
-            "predict",
-            str(pipe_path),
-            feat_csv,
-            "--output",
-            str(out_csv),
-        ]
-        if meta_path and meta_path.exists():
-            cmd.extend(["--metadata", str(meta_path)])
-
-        self._set_action_buttons_enabled(False)
-        self.btn_auto_label.setEnabled(False)
-        self.set_button_progress(self.btn_auto_label, 5)
-        cursor_applied = False
-        success = False
-        try:
-            try:
-                QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-                cursor_applied = True
-            except Exception:
-                cursor_applied = False
-
-            try:
-                self.set_button_progress(self.btn_auto_label, 25)
-                subprocess.run(cmd, check=True)
-                self.set_button_progress(self.btn_auto_label, 55)
-            except subprocess.CalledProcessError as exc:
-                QtWidgets.QMessageBox.critical(
-                    None,
-                    "预测失败",
-                    "命令失败：\n{}\n{}".format(" ".join(cmd), exc),
-                )
-                self.display_result("[错误] 自动打标签失败：模型预测命令执行失败。")
-                return
-            except Exception as exc:
-                QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
-                self.display_result(f"[错误] 自动打标签失败：{exc}")
-                return
-
-            out_csv_str = str(out_csv)
-            self.display_result(f"[INFO] 自动打标签：预测输出 {out_csv_str}")
-            self._add_output(out_csv_str)
-            self._last_out_csv = out_csv_str
-            try:
-                self._open_csv_paged(out_csv_str)
-            except Exception:
-                pass
-
-            try:
-                self.set_button_progress(self.btn_auto_label, 80)
-                stats = auto_annotate(out_csv_str, mode="conservative", write_benign=True, top_k=300)
-                self.set_button_progress(self.btn_auto_label, 95)
-            except Exception as exc:
-                QtWidgets.QMessageBox.critical(None, "自动打标签失败", str(exc))
-                self.display_result(f"[错误] 自动打标签失败：{exc}")
-                return
-
-            stats = stats or {}
-            anomalies = int(stats.get("anomalies", 0))
-            normals = int(stats.get("normals", 0))
-            total = int(stats.get("total", 0))
-            added_a = int(stats.get("added_anomalies", stats.get("added_positive", 0)))
-            added_b = int(stats.get("added_normals", stats.get("added_negative", 0)))
-            message = (
-                "已写入 labels.csv\n"
-                f"异常: {anomalies}  正常: {normals}  总计: {total}\n\n"
-                f"本次新增 - 异常: {added_a}  正常: {added_b}\n"
-                f"预测结果：{out_csv_str}"
-            )
-            QtWidgets.QMessageBox.information(None, "自动打标签完成", message)
-            self.display_result(
-                f"[INFO] 自动打标签完成：累计标签 {total} 条（异常 {anomalies}，正常 {normals}），本次新增异常 {added_a}，正常 {added_b}。"
-            )
-            success = True
-        finally:
-            if cursor_applied:
-                try:
-                    QtWidgets.QApplication.restoreOverrideCursor()
-                except Exception:
-                    pass
-            self._set_action_buttons_enabled(True)
-            self.btn_auto_label.setEnabled(True)
-            if success:
-                self.set_button_progress(self.btn_auto_label, 100)
-                QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_auto_label))
-            else:
-                self.reset_button_progress(self.btn_auto_label)
 
     # --------- 数据预处理（基于特征 CSV） ----------
     def _on_preprocess_features(self):
