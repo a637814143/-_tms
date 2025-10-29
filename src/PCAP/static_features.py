@@ -5,10 +5,16 @@ from __future__ import annotations
 import json
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 from feature_utils import extract_flow_features
+
+try:  # Optional dependency used for user-facing progress bars.
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - tqdm is optional at runtime
+    tqdm = None  # type: ignore
 
 __all__ = [
     "ThreadSafeProgressTracker",
@@ -16,7 +22,21 @@ __all__ = [
     "extract_pcap_features",
     "extract_pcap_features_batch",
     "extract_pcap_features_to_file",
+    "extract_sources_to_jsonl",
+    "list_pcap_sources",
 ]
+
+_PCAP_SUFFIXES: Tuple[str, ...] = (".pcap", ".pcapng")
+
+
+@dataclass
+class ExtractionSummary:
+    """Summary describing a JSONL export produced from PCAP files."""
+
+    path: Path
+    source_count: int
+    record_count: int
+    success_count: int
 
 
 class ThreadSafeProgressTracker:
@@ -127,18 +147,48 @@ def extract_pcap_features_batch(
     return results
 
 
-def extract_pcap_features_to_file(
-    inputs: Iterable[Union[str, Path]],
+def list_pcap_sources(source: Union[str, Path]) -> List[Path]:
+    """Resolve a PCAP/PCAPNG path (file or directory) into concrete files."""
+
+    path = Path(source)
+
+    if path.is_dir():
+        files = [
+            item
+            for item in sorted(path.rglob("*"))
+            if item.is_file() and item.suffix.lower() in _PCAP_SUFFIXES
+        ]
+        if not files:
+            raise FileNotFoundError(f"No PCAP/PCAPNG files found in {path}")
+        return files
+
+    if path.is_file() and path.suffix.lower() in _PCAP_SUFFIXES:
+        return [path]
+
+    raise FileNotFoundError(f"Unsupported source for PCAP extraction: {path}")
+
+
+def _write_results_to_jsonl(
+    inputs: Sequence[Path],
     output_file: Union[str, Path],
     *,
     max_workers: Optional[int] = None,
     progress_callback=None,
     text_callback=None,
-) -> Path:
-    """Extract features for multiple PCAP files and write them as JSON lines."""
+    show_progress: bool = False,
+) -> ExtractionSummary:
+    """Helper that streams extraction results to a JSONL file."""
 
     output_path = Path(output_file)
     writer = ThreadSafeFileWriter(output_path, text_callback)
+    total_records = 0
+    success_count = 0
+
+    progress = (
+        tqdm(total=len(inputs), desc="Extracting PCAPs", unit="file", leave=False)
+        if show_progress and tqdm is not None
+        else None
+    )
 
     try:
         for result in extract_pcap_features_batch(
@@ -148,7 +198,64 @@ def extract_pcap_features_to_file(
             text_callback=text_callback,
         ):
             writer.write_result(result)
+            total_records += 1
+            if result.get("success", False):
+                success_count += 1
+            if progress is not None:
+                progress.update(1)
     finally:
         writer.close()
+        if progress is not None:
+            progress.close()
 
-    return output_path
+    return ExtractionSummary(
+        path=output_path,
+        source_count=len(inputs),
+        record_count=total_records,
+        success_count=success_count,
+    )
+
+
+def extract_pcap_features_to_file(
+    inputs: Iterable[Union[str, Path]],
+    output_file: Union[str, Path],
+    *,
+    max_workers: Optional[int] = None,
+    progress_callback=None,
+    text_callback=None,
+    show_progress: bool = False,
+) -> Path:
+    """Extract features for multiple PCAP files and write them as JSON lines."""
+
+    paths = [Path(item) for item in inputs]
+    summary = _write_results_to_jsonl(
+        paths,
+        output_file,
+        max_workers=max_workers,
+        progress_callback=progress_callback,
+        text_callback=text_callback,
+        show_progress=show_progress,
+    )
+    return summary.path
+
+
+def extract_sources_to_jsonl(
+    source: Union[str, Path],
+    output_file: Union[str, Path],
+    *,
+    max_workers: Optional[int] = None,
+    progress_callback=None,
+    text_callback=None,
+    show_progress: bool = False,
+) -> ExtractionSummary:
+    """Extract features from a path or PCAP file directly into JSONL output."""
+
+    inputs = list_pcap_sources(source)
+    return _write_results_to_jsonl(
+        inputs,
+        output_file,
+        max_workers=max_workers,
+        progress_callback=progress_callback,
+        text_callback=text_callback,
+        show_progress=show_progress,
+    )
