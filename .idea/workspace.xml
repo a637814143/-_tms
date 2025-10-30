@@ -4,9 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
-      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-    </list>
+    <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -43,33 +41,33 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "Python.ROOT.executor": "Run",
-    "Python.analyze_results.executor": "Run",
-    "Python.extractor (1).executor": "Run",
-    "Python.extractor.executor": "Run",
-    "Python.feature_extractor.executor": "Run",
-    "Python.info.executor": "Run",
-    "Python.split.executor": "Run",
-    "Python.test.executor": "Run",
-    "Python.ui (1).executor": "Run",
-    "Python.ui.executor": "Run",
-    "Python.ui_main.executor": "Run",
-    "Python.unsupervised_train.executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "main",
-    "ignore.virus.scanning.warn.message": "true",
-    "settings.editor.selected.configurable": "org.jetbrains.plugins.github.ui.GithubSettingsConfigurable"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;Python.ROOT.executor&quot;: &quot;Run&quot;,
+    &quot;Python.analyze_results.executor&quot;: &quot;Run&quot;,
+    &quot;Python.extractor (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.extractor.executor&quot;: &quot;Run&quot;,
+    &quot;Python.feature_extractor.executor&quot;: &quot;Run&quot;,
+    &quot;Python.info.executor&quot;: &quot;Run&quot;,
+    &quot;Python.split.executor&quot;: &quot;Run&quot;,
+    &quot;Python.test.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ui (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.ui.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ui_main.executor&quot;: &quot;Run&quot;,
+    &quot;Python.unsupervised_train.executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;ignore.virus.scanning.warn.message&quot;: &quot;true&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;org.jetbrains.plugins.github.ui.GithubSettingsConfigurable&quot;
   },
-  "keyToStringList": {
-    "com.intellij.ide.scratch.ScratchImplUtil$2/New Scratch File": [
-      "Properties"
+  &quot;keyToStringList&quot;: {
+    &quot;com.intellij.ide.scratch.ScratchImplUtil$2/New Scratch File&quot;: [
+      &quot;Properties&quot;
     ]
   }
-}]]></component>
+}</component>
   <component name="RunManager" selected="Python.ui_main">
     <configuration name="analyze_results" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="pythonProject8" />
