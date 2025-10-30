@@ -14,7 +14,6 @@ except Exception:  # pragma: no cover - pandas is optional at runtime
     pd = None  # type: ignore
 
 from .annotations import configured_plugin_dirs
-from .feature_utils import extract_flow_features
 from .static_features import (
     ExtractionSummary as _StaticExtractionSummary,
     ThreadSafeFileWriter,
@@ -173,9 +172,13 @@ def extract_features(
     if not path.exists():
         raise FileNotFoundError(f"pcap 不存在: {pcap_path}")
 
+    result = extract_pcap_features(path)
+    if not result.get("success", False):
+        raise RuntimeError(result.get("error", "特征提取失败"))
+
     rows = [
         _augment_flow_record(record, path)
-        for record in extract_flow_features(path)
+        for record in result.get("flows", [])
     ]
 
     _write_flow_csv(Path(output_csv), rows)
