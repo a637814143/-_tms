@@ -3,7 +3,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap, tempfile
 from pathlib import Path
 import numpy as np
-from typing import Collection, Dict, List, Optional, Set
+from typing import Collection, Dict, List, Optional, Set, Union
 from datetime import datetime
 
 import yaml
@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from joblib import load as joblib_load
 
-from PCAP import load_vectorized_dataset
+from PCAP import detect_pcap_with_model, load_vectorized_dataset
 
 # ---- 业务函数（保持导入路径）----
 from src.configuration import get_path, get_paths, load_config, project_root
@@ -1920,6 +1920,22 @@ class Ui_MainWindow(object):
     def _default_results_dir(self):
         return str(PATHS["results_analysis"])
 
+    def _default_pcap_source(self):
+        last = None
+        if hasattr(self, "_settings"):
+            try:
+                last = self._settings.get("last_input_path")
+            except Exception:
+                last = None
+        if isinstance(last, str) and last:
+            candidate = Path(last)
+            if candidate.is_dir():
+                return str(candidate)
+            parent = candidate.parent
+            if parent.exists():
+                return str(parent)
+        return str(PATHS.get("split", DATA_BASE))
+
     def _default_models_dir(self):
         return str(PATHS["models"])
 
@@ -3709,6 +3725,109 @@ class Ui_MainWindow(object):
         self._analysis_summary = None
 
     # --------- 模型预测（支持 Pipeline / 模型+scaler / 仅模型） ----------
+    def _predict_pcap(
+        self,
+        pcap_path: Union[str, Path],
+        *,
+        output_dir: Optional[str] = None,
+        metadata_override: Optional[dict] = None,
+        silent: bool = False,
+    ) -> dict:
+        if pd is None:
+            raise RuntimeError("pandas 未安装，无法执行预测。")
+
+        path = Path(pcap_path)
+        if not path.exists():
+            raise RuntimeError(f"未找到流量文件：{pcap_path}")
+
+        model_path = _default_model_path()
+        if not model_path.exists():
+            raise RuntimeError("未找到模型文件 model.txt，请先完成训练。")
+
+        try:
+            artifact = joblib_load(model_path)
+        except Exception as exc:
+            raise RuntimeError(f"模型加载失败：{exc}")
+
+        model = artifact.get("model")
+        feature_names = artifact.get("feature_names") or []
+        label_mapping = artifact.get("label_mapping") or {}
+
+        detection = detect_pcap_with_model(model_path, path)
+        if not detection.success:
+            message = detection.error or "PCAP 检测失败"
+            raise RuntimeError(message)
+
+        flows = detection.flows or []
+        predictions = detection.predictions or []
+        scores = detection.scores or []
+        labels = detection.prediction_labels or [
+            label_mapping.get(int(val), str(val)) for val in predictions
+        ]
+
+        dataframe = pd.DataFrame(flows) if flows else pd.DataFrame()
+
+        total = int(detection.flow_count)
+        malicious = int(sum(1 for val in predictions if int(val) != 0))
+        ratio = float(malicious / total) if total else 0.0
+
+        output_dir = output_dir or self._prediction_out_dir()
+        os.makedirs(output_dir, exist_ok=True)
+        safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in path.stem)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_csv = os.path.join(output_dir, f"prediction_{safe_name}_{stamp}.csv")
+        dataframe.to_csv(out_csv, index=False, encoding="utf-8")
+
+        classes: List[str] = []
+        if model is not None and hasattr(model, "classes_"):
+            for value in getattr(model, "classes_"):
+                display = label_mapping.get(int(value), str(value)) if label_mapping else str(value)
+                classes.append(str(display))
+
+        metadata = metadata_override or {}
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata.setdefault("feature_names", list(feature_names))
+        if label_mapping and "label_mapping" not in metadata:
+            metadata["label_mapping"] = label_mapping
+        if classes and "classes" not in metadata:
+            metadata["classes"] = classes
+        metadata.setdefault("flow_count", total)
+
+        self._selected_metadata = metadata
+        meta_path = Path(self._default_models_dir()) / "latest_iforest_metadata.json"
+        self._selected_metadata_path = str(meta_path) if meta_path.exists() else None
+        self._selected_pipeline_path = str(model_path)
+
+        messages = [
+            f"使用模型: {model_path.name}",
+            f"预测文件: {path.name}",
+            f"预测总流数：{total}",
+        ]
+        summary_lines = [
+            f"总流数：{total}",
+            f"可疑流数：{malicious} ({ratio:.2%})",
+        ]
+        if classes:
+            summary_lines.append("预测类别：" + ", ".join(classes))
+
+        if not silent:
+            for msg in summary_lines:
+                self.display_result(f"[INFO] {msg}")
+
+        return {
+            "output_csv": out_csv,
+            "dataframe": dataframe,
+            "summary": summary_lines,
+            "messages": messages,
+            "metadata": metadata,
+            "malicious": malicious,
+            "total": total,
+            "ratio": ratio,
+            "scores": scores,
+            "labels": labels,
+            "source_pcap": str(path),
+        }
+
     def _predict_dataframe(
         self,
         df: "pd.DataFrame",
@@ -3848,38 +3967,26 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.warning(None, "缺少依赖", "当前环境未安装 pandas，无法执行预测。")
             return
 
-        csv_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            None, "选择特征CSV", self._default_csv_feature_dir(), "CSV (*.csv)"
+        filters = "PCAP 文件 (*.pcap *.pcapng);;所有文件 (*)"
+        pcap_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            None, "选择流量文件", self._default_pcap_source(), filters
         )
-        if not csv_path:
+        if not pcap_path:
             return
 
-        try:
-            df = read_csv_flexible(csv_path)
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{exc}")
-            return
-
-        if df.empty:
-            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
-            return
-
-        self._remember_path(csv_path)
-
-        source_name = os.path.splitext(os.path.basename(csv_path))[0] or os.path.basename(csv_path)
         metadata_override = self._selected_metadata if isinstance(self._selected_metadata, dict) else None
 
         try:
-            result = self._predict_dataframe(
-                df,
-                source_name=source_name,
+            result = self._predict_pcap(
+                pcap_path,
                 metadata_override=metadata_override,
                 silent=True,
-                csv_path=csv_path,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
             return
+
+        self._remember_path(pcap_path)
 
         messages = result.get("messages") or []
         if messages:
@@ -3912,7 +4019,7 @@ class Ui_MainWindow(object):
 
         snapshot = {key: value for key, value in result.items() if key != "dataframe"}
         snapshot["dataframe"] = dataframe
-        snapshot["source_csv"] = csv_path
+        snapshot["source_pcap"] = pcap_path
         if metadata and "metadata" not in snapshot:
             snapshot["metadata"] = metadata
         self._latest_prediction_summary = snapshot
