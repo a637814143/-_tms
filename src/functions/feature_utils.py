@@ -593,7 +593,6 @@ def flow_to_feature_dict(flow: FlowAccumulator) -> Dict[str, object]:
         "Average Packet Size": flow.avg_packet_size,
         "Avg Fwd Segment Size": flow.avg_fwd_segment_size,
         "Avg Bwd Segment Size": flow.avg_bwd_segment_size,
-        "Fwd Header Length.1": flow.forward_header_bytes,
         "Fwd Avg Bytes/Bulk": 0.0,
         "Fwd Avg Packets/Bulk": 0.0,
         "Fwd Avg Bulk Rate": 0.0,

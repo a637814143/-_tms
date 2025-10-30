@@ -41,19 +41,7 @@ __all__ = [
 
 _PCAP_SUFFIXES: Tuple[str, ...] = (".pcap", ".pcapng")
 _CSV_ENCODING = "utf-8"
-_META_ALIASES: Tuple[str, ...] = (
-    "file",
-    "pcap_file",
-    "__source_file__",
-    "__source_path__",
-    "flow_id",
-    "src_ip",
-    "dst_ip",
-    "src_port",
-    "dst_port",
-    "protocol",
-    "label",
-)
+_META_ALIASES: Tuple[str, ...] = ()
 
 
 ExtractionSummary = _StaticExtractionSummary
@@ -70,13 +58,10 @@ def _ordered_flow_columns() -> Tuple[str, ...]:
     return tuple(CSV_COLUMNS)
 
 
-def _augment_flow_record(record: Dict[str, object], source: Path) -> Dict[str, object]:
-    """Attach legacy metadata columns expected by the GUI and pipeline."""
+def _augment_flow_record(record: Dict[str, object], _source: Path) -> Dict[str, object]:
+    """Ensure required canonical columns are present for downstream users."""
 
     payload = dict(record)
-    base_name = source.name
-    resolved = str(source.resolve())
-
     payload.setdefault("Flow ID", payload.get("Flow ID", ""))
     payload.setdefault("Source IP", payload.get("Source IP", ""))
     payload.setdefault("Destination IP", payload.get("Destination IP", ""))
@@ -84,18 +69,6 @@ def _augment_flow_record(record: Dict[str, object], source: Path) -> Dict[str, o
     payload.setdefault("Destination Port", payload.get("Destination Port", 0))
     payload.setdefault("Protocol", payload.get("Protocol", 0))
     payload.setdefault("Label", payload.get("Label", 0))
-
-    payload["file"] = base_name
-    payload["pcap_file"] = base_name
-    payload["__source_file__"] = base_name
-    payload["__source_path__"] = resolved
-    payload["flow_id"] = payload.get("Flow ID", "")
-    payload["src_ip"] = payload.get("Source IP", "")
-    payload["dst_ip"] = payload.get("Destination IP", "")
-    payload["src_port"] = payload.get("Source Port", 0)
-    payload["dst_port"] = payload.get("Destination Port", 0)
-    payload["protocol"] = payload.get("Protocol", 0)
-    payload["label"] = payload.get("Label", 0)
 
     return payload
 
