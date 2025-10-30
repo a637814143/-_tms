@@ -117,8 +117,6 @@ _CSV_READ_ENCODINGS: Sequence[str] = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
 def _resolve_actual_key(column: str, occurrence: int) -> str:
     """Translate a CSV column to the underlying flow dictionary key."""
 
-    if column == "Fwd Header Length" and occurrence == 1:
-        return "Fwd Header Length.1"
     return column
 
 
