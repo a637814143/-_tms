@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from PyQt5 import QtCore, QtGui, QtWidgets
-import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap
+import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap, tempfile
 from pathlib import Path
 import numpy as np
 from typing import Collection, Dict, List, Optional, Set
@@ -12,6 +12,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from joblib import load as joblib_load
+
+from PCAP import load_vectorized_dataset
 
 # ---- 业务函数（保持导入路径）----
 from src.configuration import get_path, get_paths, load_config, project_root
@@ -67,6 +69,14 @@ def _resolve_data_base() -> Path:
         fallback = Path.home() / "maldet_data"
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback.resolve()
+
+
+def _default_model_path() -> Path:
+    try:
+        base = Path(project_root())
+    except Exception:
+        base = Path.cwd()
+    return (base / "model.txt").resolve()
 
 
 APP_STYLE = """
@@ -1606,10 +1616,12 @@ class Ui_MainWindow(object):
         model_row.setSpacing(8)
         self.model_combo = QtWidgets.QComboBox()
         self.model_combo.setMinimumHeight(38)
+        self.model_combo.setVisible(False)
         self.model_refresh_btn = QtWidgets.QPushButton("刷新")
         self.model_refresh_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
         self.model_refresh_btn.setObjectName("secondary")
         self.model_refresh_btn.setMinimumWidth(120)
+        self.model_refresh_btn.setVisible(False)
         model_row.addWidget(self.model_combo)
         model_row.addWidget(self.model_refresh_btn)
         mg_layout.addLayout(model_row)
@@ -1948,130 +1960,93 @@ class Ui_MainWindow(object):
     def _refresh_model_versions(self):
         if not hasattr(self, "model_combo"):
             return
-        models_dir = Path(self._default_models_dir())
-        registry: Dict[str, dict] = {}
-        candidates: List[Path] = []
-        if models_dir.exists():
-            latest_path = models_dir / "latest_iforest_metadata.json"
-            if latest_path.exists():
-                candidates.append(latest_path)
-            pattern_files = sorted(models_dir.glob("iforest_metadata_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-            candidates.extend(pattern_files)
-        for path in candidates:
-            try:
-                with open(path, "r", encoding="utf-8") as fh:
-                    metadata = json.load(fh)
-                if not isinstance(metadata, dict):
-                    continue
-            except Exception:
-                continue
-            pipeline_path = metadata.get("pipeline_latest") or metadata.get("pipeline_path")
-            if pipeline_path and not os.path.isabs(pipeline_path):
-                pipeline_path = str((models_dir / pipeline_path).resolve())
-            display_timestamp = metadata.get("timestamp") or path.stem
-            anomaly_ratio = metadata.get("estimated_anomaly_ratio") or metadata.get("training_anomaly_ratio")
-            if anomaly_ratio is not None:
-                try:
-                    display_text = f"{display_timestamp} | 异常占比 {float(anomaly_ratio):.2%}"
-                except Exception:
-                    display_text = str(display_timestamp)
-            else:
-                display_text = str(display_timestamp)
-            registry[str(path)] = {
-                "metadata_path": str(path),
-                "metadata": metadata,
-                "pipeline_path": pipeline_path,
-                "display": display_text,
-            }
 
-        self._model_registry = registry
-        current_key = self._selected_model_key
+        model_path = _default_model_path()
+        models_dir = Path(self._default_models_dir())
+        metadata_path = models_dir / "latest_iforest_metadata.json"
+        metadata: Optional[dict] = None
+        if metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                metadata = None
+
+        if metadata is None and model_path.exists():
+            try:
+                artifact = joblib_load(model_path)
+                feature_names = artifact.get("feature_names") or []
+                label_mapping = artifact.get("label_mapping") or {}
+                model = artifact.get("model")
+                classes = []
+                if model is not None and hasattr(model, "classes_"):
+                    for value in getattr(model, "classes_"):
+                        label = label_mapping.get(int(value), str(value)) if label_mapping else str(value)
+                        classes.append(str(label))
+                metadata = {
+                    "feature_names": list(feature_names),
+                    "label_mapping": label_mapping,
+                    "classes": classes,
+                    "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+                }
+            except Exception:
+                metadata = None
+
+        self._model_registry = {}
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
-        for key, entry in registry.items():
-            self.model_combo.addItem(entry["display"], key)
         self.model_combo.blockSignals(False)
 
-        if current_key and current_key in registry:
-            idx = self.model_combo.findData(current_key)
-            if idx >= 0:
-                self.model_combo.setCurrentIndex(idx)
-                self._on_model_combo_changed(idx)
-                return
-
-        if self.model_combo.count():
-            self.model_combo.setCurrentIndex(0)
-            self._on_model_combo_changed(0)
+        if model_path.exists():
+            self.model_info_label.setText(f"默认模型：{model_path.name}")
+            self._selected_model_key = "default"
+            self._selected_metadata = metadata
+            self._selected_metadata_path = str(metadata_path) if metadata_path.exists() else None
+            self._selected_pipeline_path = str(model_path)
         else:
-            self._on_model_combo_changed(-1)
-
-    def _on_model_combo_changed(self, index: int) -> None:
-        if not hasattr(self, "model_combo"):
-            return
-        if index < 0:
-            key = None
-        else:
-            key = self.model_combo.itemData(index)
-        entry = self._model_registry.get(key) if key else None
-        if not entry:
             self.model_info_label.setText("尚未加载模型")
             self._selected_model_key = None
             self._selected_metadata = None
             self._selected_metadata_path = None
             self._selected_pipeline_path = None
+
+    def _on_model_combo_changed(self, index: int) -> None:
+        if not hasattr(self, "model_combo"):
             return
 
-        metadata = entry.get("metadata") or {}
-        self._selected_model_key = key
-        self._selected_metadata = metadata
-        self._selected_metadata_path = entry.get("metadata_path")
-        self._selected_pipeline_path = entry.get("pipeline_path")
+        model_path = _default_model_path()
+        models_dir = Path(self._default_models_dir())
+        metadata_path = models_dir / "latest_iforest_metadata.json"
+        metadata = self._selected_metadata
+        if metadata is None and metadata_path.exists():
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except Exception:
+                metadata = None
 
-        info_lines = []
-        if metadata.get("timestamp"):
-            info_lines.append(f"时间：{metadata['timestamp']}")
-        if metadata.get("contamination") is not None:
-            info_lines.append(f"训练污染率：{float(metadata['contamination']):.3%}")
-        if metadata.get("estimated_precision") is not None:
-            info_lines.append(f"估计精度：{float(metadata['estimated_precision']):.2%}")
-        if metadata.get("training_anomaly_ratio") is not None:
-            info_lines.append(f"训练异常占比：{float(metadata['training_anomaly_ratio']):.2%}")
-        if metadata.get("pseudo_labels"):
-            info_lines.append("含伪标签增强")
-        if metadata.get("manual_annotations"):
-            manual = metadata.get("manual_annotations")
-            info_lines.append(f"手工标注：{manual.get('total', 0)} 条")
-
-        self.model_info_label.setText("\n".join(info_lines) if info_lines else entry.get("display", ""))
-        self.dashboard.update_metrics(self._analysis_summary, metadata if isinstance(metadata, dict) else None)
+        if model_path.exists():
+            self.model_info_label.setText(f"默认模型：{model_path.name}")
+            self._selected_model_key = "default"
+            self._selected_metadata = metadata
+            self._selected_metadata_path = str(metadata_path) if metadata_path.exists() else None
+            self._selected_pipeline_path = str(model_path)
+            self.dashboard.update_metrics(self._analysis_summary, metadata if isinstance(metadata, dict) else None)
+        else:
+            self.model_info_label.setText("尚未加载模型")
+            self._selected_model_key = None
+            self._selected_metadata = None
+            self._selected_metadata_path = None
+            self._selected_pipeline_path = None
 
 
     def _latest_pipeline_bundle(self):
-        if self._selected_pipeline_path and os.path.exists(self._selected_pipeline_path):
-            return self._selected_pipeline_path, self._selected_metadata_path
-
-        models_dir = self._default_models_dir()
-        latest_path = os.path.join(models_dir, "latest_iforest_pipeline.joblib")
-        latest_meta = os.path.join(models_dir, "latest_iforest_metadata.json")
-        if os.path.exists(latest_path):
-            return latest_path, latest_meta if os.path.exists(latest_meta) else None
-
-        candidates = []
-        prefix = "iforest_pipeline_"
-        suffix = ".joblib"
-        for name in os.listdir(models_dir):
-            if not (name.startswith(prefix) and name.endswith(suffix)):
-                continue
-            path = os.path.join(models_dir, name)
-            stamp = name[len(prefix):-len(suffix)]
-            meta = os.path.join(models_dir, f"iforest_metadata_{stamp}.json")
-            candidates.append((os.path.getmtime(path), path, meta if os.path.exists(meta) else None))
-
-        if not candidates:
-            return None, None
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        _, path, meta = candidates[0]
-        return path, meta
+        model_path = _default_model_path()
+        if model_path.exists():
+            metadata_path = self._selected_metadata_path
+            if not metadata_path:
+                meta_file = Path(self._default_models_dir()) / "latest_iforest_metadata.json"
+                metadata_path = str(meta_file) if meta_file.exists() else None
+            return str(model_path), metadata_path
+        return None, None
 
     def _prediction_allowed_extras(self, metadata: Optional[dict]) -> Set[str]:
         allowed: Set[str] = set(TRAIN_META_COLUMNS)
@@ -3097,37 +3072,20 @@ class Ui_MainWindow(object):
 
         self._remember_path(feat_csv)
 
-        models_dir = Path(self._default_models_dir())
-        meta_path = models_dir / "latest_iforest_metadata.json"
-        pipe_path = models_dir / "latest_iforest_pipeline.joblib"
+        try:
+            df = read_csv_flexible(feat_csv)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{exc}")
+            return
 
-        if not pipe_path.exists():
-            candidates = sorted(models_dir.glob("iforest_pipeline_*.joblib"), key=lambda p: p.stat().st_mtime)
-            if not candidates:
-                QtWidgets.QMessageBox.critical(None, "错误", "未找到模型，请先训练。")
-                return
-            pipe_path = candidates[-1]
-
-        if not meta_path.exists():
-            meta_candidates = sorted(models_dir.glob("iforest_metadata_*.json"), key=lambda p: p.stat().st_mtime)
-            meta_path = meta_candidates[-1] if meta_candidates else None
+        if df.empty:
+            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
+            return
 
         results_dir = Path(self._prediction_out_dir())
         results_dir.mkdir(parents=True, exist_ok=True)
-        out_csv = results_dir / "out.csv"
 
-        cmd = [
-            sys.executable,
-            "-m",
-            "src.services.pipeline_service",
-            "predict",
-            str(pipe_path),
-            feat_csv,
-            "--output",
-            str(out_csv),
-        ]
-        if meta_path and meta_path.exists():
-            cmd.extend(["--metadata", str(meta_path)])
+        source_name = os.path.splitext(os.path.basename(feat_csv))[0] or os.path.basename(feat_csv)
 
         self._set_action_buttons_enabled(False)
         self.btn_auto_label.setEnabled(False)
@@ -3143,22 +3101,20 @@ class Ui_MainWindow(object):
 
             try:
                 self.set_button_progress(self.btn_auto_label, 25)
-                subprocess.run(cmd, check=True)
-                self.set_button_progress(self.btn_auto_label, 55)
-            except subprocess.CalledProcessError as exc:
-                QtWidgets.QMessageBox.critical(
-                    None,
-                    "预测失败",
-                    "命令失败：\n{}\n{}".format(" ".join(cmd), exc),
+                prediction = self._predict_dataframe(
+                    df,
+                    source_name=source_name,
+                    output_dir=str(results_dir),
+                    silent=True,
+                    csv_path=feat_csv,
                 )
-                self.display_result("[错误] 自动打标签失败：模型预测命令执行失败。")
-                return
+                self.set_button_progress(self.btn_auto_label, 55)
             except Exception as exc:
                 QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
                 self.display_result(f"[错误] 自动打标签失败：{exc}")
                 return
 
-            out_csv_str = str(out_csv)
+            out_csv_str = str(prediction.get("output_csv"))
             self.display_result(f"[INFO] 自动打标签：预测输出 {out_csv_str}")
             self._add_output(out_csv_str)
             self._last_out_csv = out_csv_str
@@ -3207,7 +3163,6 @@ class Ui_MainWindow(object):
             else:
                 self.reset_button_progress(self.btn_auto_label)
 
-    # --------- 数据预处理（基于特征 CSV） ----------
     def _on_preprocess_features(self):
         feature_source = self._ask_feature_source()
         if not feature_source:
@@ -3762,230 +3717,117 @@ class Ui_MainWindow(object):
         output_dir: Optional[str] = None,
         metadata_override: Optional[dict] = None,
         silent: bool = False,
+        csv_path: Optional[str] = None,
     ) -> dict:
         if pd is None:
             raise RuntimeError("pandas 未安装，无法执行预测。")
 
-        bundle = self._resolve_prediction_bundle(df, metadata_override=metadata_override)
-        if not bundle:
-            raise RuntimeError(
-                "未找到与所选特征CSV匹配的模型，请确认已选择训练时对应的特征文件。"
-            )
-
-        pipeline_path = bundle.get("pipeline_path")
-        metadata_obj = bundle.get("metadata") or {}
-        metadata = dict(metadata_obj) if isinstance(metadata_obj, dict) else {}
-        metadata_path = bundle.get("metadata_path")
-        allowed_extra = set(bundle.get("allowed_extra") or set())
-        extras_detected = list(bundle.get("extras") or [])
-        source = bundle.get("source")
-
-        if not pipeline_path or not os.path.exists(pipeline_path):
-            raise RuntimeError("未找到可用的模型管线，请先训练模型。")
+        model_path = _default_model_path()
+        if not model_path.exists():
+            raise RuntimeError("未找到模型文件 model.txt，请先完成训练。")
 
         try:
-            pipeline = joblib_load(pipeline_path)
+            artifact = joblib_load(model_path)
         except Exception as exc:
-            raise RuntimeError(f"模型管线加载失败：{exc}")
+            raise RuntimeError(f"模型加载失败：{exc}")
 
-        # 记录所选模型，确保后续操作保持一致
-        if metadata_path:
-            self._selected_metadata = metadata
-            self._selected_metadata_path = metadata_path
-            self._selected_pipeline_path = pipeline_path
-            if hasattr(self, "model_combo"):
-                idx = self.model_combo.findData(metadata_path)
-                if idx < 0:
-                    self._refresh_model_versions()
-                    idx = self.model_combo.findData(metadata_path)
-                if idx >= 0:
-                    self.model_combo.blockSignals(True)
-                    self.model_combo.setCurrentIndex(idx)
-                    self.model_combo.blockSignals(False)
-                    self._on_model_combo_changed(idx)
+        model = artifact.get("model")
+        feature_names = artifact.get("feature_names") or []
+        label_mapping = artifact.get("label_mapping") or {}
+        if model is None or not feature_names:
+            raise RuntimeError("模型文件缺少必要信息，请重新训练。")
 
-        feature_df_raw, align_info = _align_input_features(
-            df,
-            metadata,
-            strict=False,
-            allow_extra=allowed_extra.union(extras_detected),
+        if csv_path and os.path.exists(csv_path):
+            dataset_path = Path(csv_path)
+        else:
+            tmp_dir = Path(tempfile.mkdtemp(prefix="pcap_predict_"))
+            dataset_path = tmp_dir / "features.csv"
+            df.to_csv(dataset_path, index=False, encoding="utf-8")
+
+        matrix, _, _, _, stats = load_vectorized_dataset(
+            dataset_path, show_progress=False, return_stats=True
         )
-
-        messages: List[str] = []
-        if source and source not in {"selected", "override"}:
-            messages.append("已根据特征列自动匹配模型版本。")
-        messages.append(f"使用模型管线: {os.path.basename(pipeline_path)}")
-        if extras_detected:
-            sample = ", ".join(sorted(extras_detected)[:8])
-            more = " ..." if len(extras_detected) > 8 else ""
-            messages.append(f"忽略了 {len(extras_detected)} 个额外列: {sample}{more}")
-        missing_after_align = align_info.get("missing_filled") if isinstance(align_info, dict) else None
-        if missing_after_align:
-            missing_list = list(missing_after_align)
-            sample_missing = ", ".join(missing_list[:8])
-            more_missing = " ..." if len(missing_list) > 8 else ""
-            raise RuntimeError(
-                "检测到特征 CSV 缺少模型所需列，请确认选择的特征文件正确。\n缺少列: "
-                f"{sample_missing}{more_missing}"
-            )
-        schema_version = align_info.get("schema_version")
-        if schema_version and schema_version != MODEL_SCHEMA_VERSION:
-            messages.append(f"模型 schema_version={schema_version} 与当前 {MODEL_SCHEMA_VERSION} 不一致")
-
-        expected_order = align_info.get("feature_order") or []
-        pipeline_features = getattr(pipeline, "feature_names_in_", None)
-        if pipeline_features is not None:
-            pipeline_cols = [str(col) for col in pipeline_features]
-            if list(pipeline_cols) != list(expected_order):
-                raise RuntimeError(
-                    "模型管线的特征列顺序与训练时不一致，请重新训练或重新选择模型。"
-                )
-
-        models_dir = self._default_models_dir()
-        preproc_candidates: List[str] = []
-        if isinstance(metadata, dict):
-            if metadata.get("preprocessor_latest"):
-                preproc_candidates.append(metadata.get("preprocessor_latest"))
-            if metadata.get("preprocessor_path"):
-                preproc_candidates.append(metadata.get("preprocessor_path"))
-        preproc_candidates.append(os.path.join(models_dir, "latest_preprocessor.joblib"))
-
-        loaded_preprocessor = None
-        for path in preproc_candidates:
-            if not path or not os.path.exists(path):
-                continue
-            try:
-                loaded_preprocessor = joblib_load(path)
-                break
-            except Exception:
-                continue
-        if loaded_preprocessor is None and hasattr(pipeline, "named_steps"):
-            loaded_preprocessor = pipeline.named_steps.get("preprocessor")
-        if loaded_preprocessor is None:
-            raise RuntimeError("模型缺少特征预处理器。")
+        if matrix.size == 0:
+            raise RuntimeError("特征 CSV 为空，无法进行预测。")
 
         try:
-            feature_df_aligned = loaded_preprocessor.transform(feature_df_raw)
-        except Exception as exc:
-            raise RuntimeError(f"特征预处理失败：{exc}")
-
-        named_steps = getattr(pipeline, "named_steps", {}) if hasattr(pipeline, "named_steps") else {}
-        detector = named_steps.get("detector") if isinstance(named_steps, dict) else None
-        if detector is None:
-            raise RuntimeError("当前模型缺少集成检测器，请重新训练。")
-
-        transformed = feature_df_aligned
-        for name, step in pipeline.steps[1:-1]:
-            try:
-                transformed = step.transform(transformed)
-            except Exception as exc:
-                raise RuntimeError(f"特征变换失败（{name}）：{exc}")
-
-        try:
-            preds = detector.predict(transformed)
+            preds = model.predict(matrix)
         except Exception as exc:
             raise RuntimeError(f"预测失败：{exc}")
 
-        scores = getattr(detector, "last_combined_scores_", None)
-        if scores is None:
-            try:
-                scores = detector.score_samples(transformed)
-            except Exception:
-                scores = np.zeros(len(feature_df_aligned), dtype=float)
+        if hasattr(model, "predict_proba"):
+            proba = model.predict_proba(matrix)
+            scores = proba.max(axis=1)
+        elif hasattr(model, "decision_function"):
+            decision = model.decision_function(matrix)
+            if np.ndim(decision) == 1:
+                scores = 1.0 / (1.0 + np.exp(-decision))
+            else:
+                scores = decision.max(axis=1)
+        else:
+            scores = preds.astype(float)
         scores = np.asarray(scores, dtype=float)
 
-        vote_ratio = getattr(detector, "last_vote_ratio_", None)
-        if vote_ratio is None:
-            vote_blocks = []
-            for info in getattr(detector, "detectors_", {}).values():
-                est = getattr(info, "estimator", None)
-                if est is None or not hasattr(est, "predict"):
-                    continue
-                try:
-                    sub_pred = est.predict(transformed)
-                    vote_blocks.append(np.where(sub_pred == -1, 1.0, 0.0))
-                except Exception:
-                    continue
-            if vote_blocks:
-                vote_ratio = np.vstack(vote_blocks).mean(axis=0)
-        if vote_ratio is None:
-            vote_mean_meta = metadata.get("vote_mean") if isinstance(metadata, dict) else None
-            fallback_vote = 0.5 if vote_mean_meta is None else float(vote_mean_meta)
-            vote_ratio = np.full(len(feature_df_aligned), fallback_vote, dtype=float)
-        vote_ratio = np.asarray(vote_ratio, dtype=float)
-
-        threshold_breakdown_meta = metadata.get("threshold_breakdown") if isinstance(metadata, dict) else None
-        threshold = None
-        if isinstance(threshold_breakdown_meta, dict) and threshold_breakdown_meta.get("adaptive") is not None:
-            threshold = threshold_breakdown_meta.get("adaptive")
-        elif isinstance(metadata, dict):
-            threshold = metadata.get("threshold")
-        if threshold is None:
-            threshold = getattr(detector, "threshold_", None)
-        if threshold is None:
-            threshold = float(np.quantile(scores, 0.05)) if len(scores) else 0.0
-
-        vote_threshold = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
-        if vote_threshold is None:
-            vote_threshold = getattr(detector, "vote_threshold_", None)
-        if vote_threshold is None:
-            vote_threshold = float(np.mean(vote_ratio)) if len(vote_ratio) else 0.5
-        vote_threshold = float(np.clip(vote_threshold, 0.0, 1.0))
-
-        score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
-        if score_std is None:
-            score_std = float(np.std(scores) or 1.0)
-
-        conf_from_score = 1.0 / (1.0 + np.exp((scores - threshold) / (score_std + 1e-6)))
-        vote_component = np.clip((vote_ratio - vote_threshold) / max(1e-6, (1.0 - vote_threshold)), 0.0, 1.0)
-        risk_score = np.clip(0.6 * conf_from_score + 0.4 * vote_component, 0.0, 1.0)
-
-        supervised_scores = getattr(detector, "last_supervised_scores_", None)
-        if supervised_scores is not None:
-            risk_score = np.clip(0.5 * risk_score + 0.5 * supervised_scores.astype(float), 0.0, 1.0)
-        elif getattr(detector, "last_calibrated_scores_", None) is not None:
-            risk_score = np.clip(
-                0.6 * risk_score + 0.4 * detector.last_calibrated_scores_.astype(float),
-                0.0,
-                1.0,
-            )
+        if label_mapping:
+            labels = [label_mapping.get(int(val), str(val)) for val in preds]
+        else:
+            labels = [str(val) for val in preds]
 
         out_df = df.copy()
         out_df["prediction"] = preds
-        out_df["is_malicious"] = (preds == -1).astype(int)
-        out_df["anomaly_score"] = scores
-        out_df["anomaly_confidence"] = risk_score
-        out_df["vote_ratio"] = vote_ratio
-        out_df["risk_score"] = risk_score
+        out_df["prediction_label"] = labels
+        out_df["malicious_score"] = scores
 
-        malicious = int(out_df["is_malicious"].sum())
-        total = int(len(out_df))
-        ratio = (malicious / total) if total else 0.0
+        benign_label = None
+        if label_mapping and 0 in label_mapping:
+            benign_label = str(label_mapping[0])
+        elif stats.label_mapping and 0 in stats.label_mapping:
+            benign_label = str(stats.label_mapping[0])
+        if benign_label is None and labels:
+            benign_label = labels[0]
 
-        score_min = float(np.min(scores)) if len(scores) else 0.0
-        score_max = float(np.max(scores)) if len(scores) else 0.0
+        malicious = int(
+            sum(1 for label in labels if benign_label is None or str(label) != benign_label)
+        )
+        total = len(out_df)
+        ratio = float(malicious / total) if total else 0.0
 
-        summary_lines = [
-            f"模型预测完成：{source_name}",
-            f"检测包数：{total}",
-            f"异常包数：{malicious} ({ratio:.2%})",
-            f"自动阈值：{float(threshold):.6f}",
-            f"投票阈值：{vote_threshold:.2f}",
-            f"分数范围：{score_min:.4f} ~ {score_max:.4f}",
-            f"平均风险分：{float(risk_score.mean()):.2%}",
-        ]
-
-        if output_dir is None:
-            output_dir = self._prediction_out_dir()
+        output_dir = output_dir or self._prediction_out_dir()
         os.makedirs(output_dir, exist_ok=True)
         safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in source_name)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_csv = os.path.join(output_dir, f"prediction_{safe_name}_{stamp}.csv")
         out_df.to_csv(out_csv, index=False, encoding="utf-8")
 
-        messages.extend(summary_lines)
+        classes = []
+        if hasattr(model, "classes_"):
+            for value in getattr(model, "classes_"):
+                display = label_mapping.get(int(value), str(value)) if label_mapping else str(value)
+                classes.append(str(display))
+
+        metadata = metadata_override or {}
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        metadata.setdefault("feature_names", list(feature_names))
+        metadata.setdefault("label_mapping", label_mapping)
+        if classes:
+            metadata.setdefault("classes", classes)
+        metadata.setdefault("flow_count", int(stats.total_rows or total))
+
+        self._selected_metadata = metadata
+        meta_path = Path(self._default_models_dir()) / "latest_iforest_metadata.json"
+        self._selected_metadata_path = str(meta_path) if meta_path.exists() else None
+        self._selected_pipeline_path = str(model_path)
+
+        messages = [f"使用模型: {model_path.name}", f"预测总流数：{total}"]
+        summary_lines = [
+            f"总流数：{total}",
+            f"可疑流数：{malicious} ({ratio:.2%})",
+        ]
+        if classes:
+            summary_lines.append("预测类别：" + ", ".join(classes))
+
         if not silent:
-            for msg in messages:
+            for msg in summary_lines:
                 self.display_result(f"[INFO] {msg}")
 
         return {
@@ -3997,8 +3839,9 @@ class Ui_MainWindow(object):
             "malicious": malicious,
             "total": total,
             "ratio": ratio,
+            "scores": scores,
+            "labels": labels,
         }
-
 
     def _on_predict(self):
         if pd is None:
@@ -4032,6 +3875,7 @@ class Ui_MainWindow(object):
                 source_name=source_name,
                 metadata_override=metadata_override,
                 silent=True,
+                csv_path=csv_path,
             )
         except Exception as exc:
             QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
