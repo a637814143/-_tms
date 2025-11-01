@@ -54,6 +54,9 @@ try:
 except Exception:
     pd = None
 
+from .background import BackgroundTask, FunctionThread
+from .styles import APP_STYLE
+
 def _resolve_data_base() -> Path:
     env = os.getenv("MALDET_DATA_DIR")
     if env and env.strip():
@@ -67,137 +70,6 @@ def _resolve_data_base() -> Path:
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback.resolve()
 
-
-APP_STYLE = """
-/* 全局 */
-QWidget {
-  background-color: #F5F6FA;
-  font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI";
-  font-size: 14px;
-  color: #1F1F1F;
-}
-
-/* 顶部标题栏 */
-#TitleBar {
-  background: #F5F6FA;
-  border-bottom: 1px solid #E5E7EB;
-}
-#pageTitle {
-  font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI";
-  font-size: 18px;
-  font-weight: 700;
-  color: #111827;
-}
-
-/* 卡片/分组 */
-QGroupBox {
-  border: 1px solid #E5E7EB;
-  border-radius: 10px;
-  margin-top: 12px;
-  background: #FFFFFF;
-}
-QGroupBox::title {
-  subcontrol-origin: margin;
-  left: 12px;
-  padding: 0 6px;
-  font-weight: 600;
-  color: #111827;
-}
-
-/* 输入控件 */
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-  background: #FFFFFF;
-  border: 1px solid #D1D5DB;
-  border-radius: 8px;
-  padding: 8px 10px;
-}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
-  border: 1px solid #60A5FA;
-}
-
-/* 主按钮（执行类） */
-QPushButton {
-  background-color: #0EA5E9;
-  color: #FFFFFF;
-  border-radius: 10px;
-  padding: 8px 16px;
-  min-height: 38px;
-  border: 0;
-}
-QPushButton:hover { background-color: #38BDF8; }
-QPushButton:pressed { background-color: #0284C7; }
-QPushButton:disabled { background-color: #C7CDD4; color: #F9FAFB; }
-
-/* 次要按钮/分页按钮 */
-QPushButton#secondary {
-  background: #EEF1F6;
-  color: #111827;
-  border-radius: 10px;
-  padding: 8px 16px;
-  min-height: 38px;
-}
-QPushButton#secondary:hover { background: #E5EAF1; }
-QPushButton#secondary:pressed { background: #D9E0EA; }
-
-/* 表格 */
-QHeaderView::section {
-  background: #F3F4F6;
-  border: 1px solid #E5E7EB;
-  padding: 8px;
-  font-weight: 600;
-}
-QTableView {
-  background: #FFFFFF;
-  gridline-color: #E5E7EB;
-  border: 1px solid #E5E7EB;
-  border-radius: 8px;
-}
-
-/* 分隔条 */
-QSplitter::handle {
-  background-color: #E5E7EB;
-  width: 2px;
-}
-
-/* 状态栏 */
-QStatusBar {
-  background: #F3F4F6;
-  border-top: 1px solid #E5E7EB;
-  font-size: 12px;
-  color: #6B7280;
-  padding: 4px 8px;
-}
-
-/* 列表/文本区域 */
-QTextEdit, QPlainTextEdit, QListWidget {
-  background: #FFFFFF;
-  border: 1px solid #E5E7EB;
-  border-radius: 8px;
-}
-
-/* 工具按钮 & 滚动区 */
-QToolButton {
-  background: transparent;
-  border: none;
-  padding: 4px;
-}
-QToolButton:hover {
-  background: rgba(14, 165, 233, 0.1);
-  border-radius: 6px;
-}
-QScrollArea {
-  border: none;
-}
-
-/* 在线状态徽标 */
-#OnlineStatusLabel {
-  font-size: 12px;
-  color: #5F6368;
-  padding: 6px 8px;
-  border-radius: 6px;
-  background-color: #F3F4F6;
-}
-"""
 
 # 仅表格预览上限（全部数据都会落盘）
 PREVIEW_LIMIT_FOR_TABLE = 50
@@ -454,128 +326,6 @@ class PandasFrameModel(QtCore.QAbstractTableModel):
                 return str(sec)
         return str(sec)
 
-
-# =============== 后台线程 ===============
-class InfoWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(object)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.kwargs = kwargs
-
-    def run(self):
-        try:
-            kw = dict(self.kwargs)
-            kw["progress_cb"] = self.progress.emit
-            kw["cancel_cb"] = self.isInterruptionRequested
-            df = info(**kw)
-            self.progress.emit(100)
-            self.finished.emit(df)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class FeatureWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(str)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-    def __init__(self, pcap_path, csv_path):
-        super().__init__()
-        self.pcap_path = pcap_path
-        self.csv_path = csv_path
-
-    def run(self):
-        try:
-            fe_single(self.pcap_path, self.csv_path, progress_cb=self.progress.emit)
-            self.finished.emit(self.csv_path)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class DirFeatureWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(list)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-    def __init__(self, split_dir, out_dir, workers=8):
-        super().__init__()
-        self.split_dir = split_dir
-        self.out_dir = out_dir
-        self.workers = workers
-
-    def run(self):
-        try:
-            csvs = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
-            self.finished.emit(csvs)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class PreprocessWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(object)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-    def __init__(self, feature_source, out_dir):
-        super().__init__()
-        self.feature_source = feature_source
-        self.out_dir = out_dir
-
-    def run(self):
-        try:
-            result = preprocess_dir(self.feature_source, self.out_dir, progress_cb=self.progress.emit)
-            self.finished.emit(result)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class WorkerSignals(QtCore.QObject):
-    finished = QtCore.pyqtSignal(object)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-
-class BackgroundTask(QtCore.QRunnable):
-    def __init__(self, fn, *args, **kwargs):
-        super().__init__()
-        self._fn = fn
-        self._args = args
-        self._kwargs = kwargs
-        self.signals = WorkerSignals()
-
-    @property
-    def finished(self):
-        return self.signals.finished
-
-    @property
-    def error(self):
-        return self.signals.error
-
-    @property
-    def progress(self):
-        return self.signals.progress
-
-    def run(self):
-        kwargs = dict(self._kwargs)
-
-        def _emit_progress(value):
-            try:
-                value_int = int(float(value))
-            except Exception:
-                value_int = 0
-            self.signals.progress.emit(max(0, min(100, value_int)))
-
-        kwargs["progress_cb"] = _emit_progress
-        try:
-            result = self._fn(*self._args, **kwargs)
-        except Exception as exc:
-            self.signals.error.emit(str(exc))
-            return
-
-        self.signals.finished.emit(result)
 
 # ======= 交互式列选择（用于 scaler+model 场景）=======
 class FeaturePickDialog(QtWidgets.QDialog):
@@ -998,8 +748,10 @@ class Ui_MainWindow(object):
         self._csv_current_page: int = 1
 
         # worker
-        self.worker: Optional[InfoWorker] = None
-        self.preprocess_worker: Optional[PreprocessWorker] = None
+        self.worker: Optional[FunctionThread] = None
+        self.fe_worker: Optional[FunctionThread] = None
+        self.dir_fe_worker: Optional[FunctionThread] = None
+        self.preprocess_worker: Optional[FunctionThread] = None
         self.thread_pool = QtCore.QThreadPool.globalInstance()
         self._running_tasks: Set[BackgroundTask] = set()
 
@@ -1863,34 +1615,26 @@ class Ui_MainWindow(object):
         self.table_view.doubleClicked.connect(self._on_table_double_click)
 
     # --------- 路径小工具 ----------
+    _PATH_RESOLVERS = {
+        "_default_split_dir": "split",
+        "_default_results_dir": "results_analysis",
+        "_default_models_dir": "models",
+        "_default_csv_info_dir": "csv_info",
+        "_default_csv_feature_dir": "csv_feature",
+        "_analysis_out_dir": "results_analysis",
+        "_prediction_out_dir": "results_pred",
+        "_abnormal_out_dir": "results_abnormal",
+        "_preprocess_out_dir": "csv_preprocess",
+    }
+
     def _project_root(self):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    def _default_split_dir(self):
-        return str(PATHS["split"])
 
-    def _default_results_dir(self):
-        return str(PATHS["results_analysis"])
-
-    def _default_models_dir(self):
-        return str(PATHS["models"])
-
-    def _default_csv_info_dir(self):
-        return str(PATHS["csv_info"])
-
-    def _default_csv_feature_dir(self):
-        return str(PATHS["csv_feature"])
-
-    def _analysis_out_dir(self):
-        return str(PATHS["results_analysis"])
-
-    def _prediction_out_dir(self):
-        return str(PATHS["results_pred"])
-
-    def _abnormal_out_dir(self):
-        return str(PATHS["results_abnormal"])
-
-    def _preprocess_out_dir(self):
-        return str(PATHS["csv_preprocess"])
+    def __getattr__(self, name):
+        key = self._PATH_RESOLVERS.get(name)
+        if key:
+            return lambda key=key: str(PATHS[key])
+        raise AttributeError(name)
 
     def _current_memory_budget_bytes(self) -> Optional[int]:
         idx = self.memory_ceiling_combo.currentIndex()
@@ -2583,13 +2327,23 @@ class Ui_MainWindow(object):
         self._set_action_buttons_enabled(False)
         self.btn_view.setEnabled(False); self.set_button_progress(self.btn_view, 0)
 
-        self.worker = InfoWorker(
-            path=path, workers=workers,
-            mode=("all" if mode == "auto" and os.path.isdir(path) else ("file" if mode == "auto" and os.path.isfile(path) else mode)),
-            batch_size=batch, start_index=start,
+        self.worker = FunctionThread(
+            info,
+            path=path,
+            workers=workers,
+            mode=(
+                "all"
+                if mode == "auto" and os.path.isdir(path)
+                else ("file" if mode == "auto" and os.path.isfile(path) else mode)
+            ),
+            batch_size=batch,
+            start_index=start,
             files=file_list if os.path.isdir(path) else None,
-            proto_filter=proto, port_whitelist_text=wl, port_blacklist_text=bl,
+            proto_filter=proto,
+            port_whitelist_text=wl,
+            port_blacklist_text=bl,
             fast=True,
+            cancel_arg="cancel_cb",
         )
         self.worker.progress.connect(lambda p: self.set_button_progress(self.btn_view, p))
         self.worker.finished.connect(self._on_worker_finished)
@@ -2892,7 +2646,12 @@ class Ui_MainWindow(object):
         if os.path.isdir(path):
             self.display_result(f"[INFO] 目录特征提取：{path} -> {out_dir}")
             self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
-            self.dir_fe_worker = DirFeatureWorker(path, out_dir, workers=self.workers_spin.value())
+            self.dir_fe_worker = FunctionThread(
+                fe_dir,
+                path,
+                out_dir,
+                workers=self.workers_spin.value(),
+            )
             self.dir_fe_worker.progress.connect(lambda p: self.set_button_progress(self.btn_fe, p))
             self.dir_fe_worker.finished.connect(self._on_fe_dir_finished)
             self.dir_fe_worker.error.connect(self._on_fe_error)
@@ -2902,7 +2661,7 @@ class Ui_MainWindow(object):
             csv = os.path.join(out_dir, f"{base}_features_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
             self.display_result(f"[INFO] 单文件特征提取：{path} -> {csv}")
             self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
-            self.fe_worker = FeatureWorker(path, csv)
+            self.fe_worker = FunctionThread(fe_single, path, csv)
             self.fe_worker.progress.connect(lambda p: self.set_button_progress(self.btn_fe, p))
             self.fe_worker.finished.connect(self._on_fe_finished)
             self.fe_worker.error.connect(self._on_fe_error)
@@ -2973,7 +2732,11 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 数据预处理：{preview} -> {out_dir}")
         self._set_action_buttons_enabled(False)
         self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
-        self.preprocess_worker = PreprocessWorker(feature_source, out_dir)
+        self.preprocess_worker = FunctionThread(
+            preprocess_dir,
+            feature_source,
+            out_dir,
+        )
         self.preprocess_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
         self.preprocess_worker.finished.connect(self._on_preprocess_finished)
         self.preprocess_worker.error.connect(self._on_preprocess_error)
