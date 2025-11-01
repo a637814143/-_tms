@@ -31,6 +31,7 @@ _safe_export(
         "train_unsupervised_on_split",
         "DEFAULT_MODEL_PARAMS",
         "META_COLUMNS",
+        "compute_risk_components",
     ),
 )
 
