@@ -54,13 +54,432 @@ try:
 except Exception:
     pd = None
 
-from .background import BackgroundTask, FunctionThread
-from .dashboard import ResultsDashboard
-from .dialogs import AnomalyDetailDialog, ConfigEditorDialog, FeaturePickDialog
-from .models import PandasFrameModel
-from .settings import AppSettings
-from .styles import APP_STYLE
-from .watchers import OnlineDetectionWorker
+
+# ---- 简化的通用工具（保持在单文件中）----
+
+
+APP_STYLE = """
+QWidget {
+  background-color: #F5F6FA;
+  font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI";
+  font-size: 14px;
+  color: #1F1F1F;
+}
+
+#TitleBar {
+  background: #F5F6FA;
+  border-bottom: 1px solid #E5E7EB;
+}
+
+QGroupBox {
+  border: 1px solid #E5E7EB;
+  border-radius: 10px;
+  margin-top: 12px;
+  background: #FFFFFF;
+}
+
+QGroupBox::title {
+  subcontrol-origin: margin;
+  left: 12px;
+  padding: 0 6px;
+  font-weight: 600;
+  color: #111827;
+}
+
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+  background: #FFFFFF;
+  border: 1px solid #D1D5DB;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+  border: 1px solid #60A5FA;
+}
+
+QPushButton {
+  background-color: #0EA5E9;
+  color: #FFFFFF;
+  border-radius: 10px;
+  padding: 8px 16px;
+  min-height: 38px;
+  border: 0;
+}
+
+QPushButton:hover { background-color: #38BDF8; }
+QPushButton:pressed { background-color: #0284C7; }
+QPushButton:disabled { background-color: #C7CDD4; color: #F9FAFB; }
+
+QPushButton#secondary {
+  background: #EEF1F6;
+  color: #111827;
+  border-radius: 10px;
+  padding: 8px 16px;
+  min-height: 38px;
+}
+
+QPushButton#secondary:hover { background: #E5EAF1; }
+QPushButton#secondary:pressed { background: #D9E0EA; }
+
+QHeaderView::section {
+  background: #F3F4F6;
+  border: 1px solid #E5E7EB;
+  padding: 8px;
+  font-weight: 600;
+}
+
+QTableView {
+  background: #FFFFFF;
+  gridline-color: #E5E7EB;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+}
+
+QSplitter::handle {
+  background-color: #E5E7EB;
+  width: 2px;
+}
+
+QStatusBar {
+  background: #F3F4F6;
+  border-top: 1px solid #E5E7EB;
+  font-size: 12px;
+  color: #6B7280;
+  padding: 4px 8px;
+}
+
+QTextEdit, QPlainTextEdit, QListWidget {
+  background: #FFFFFF;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+}
+
+QToolButton {
+  background: transparent;
+  border: none;
+  padding: 4px;
+}
+
+QToolButton:hover {
+  background: rgba(14, 165, 233, 0.1);
+  border-radius: 6px;
+}
+
+QScrollArea { border: none; }
+
+#OnlineStatusLabel {
+  font-size: 12px;
+  color: #5F6368;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background-color: #F3F4F6;
+}
+"""
+
+
+class AppSettings:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.data: Dict[str, object] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            self.data = {}
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            self.data = payload if isinstance(payload, dict) else {}
+        except Exception:
+            self.data = {}
+
+    def get(self, key: str, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key: str, value) -> None:
+        self.data[key] = value
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+class PandasFrameModel(QtCore.QAbstractTableModel):
+    def __init__(self, frame: "pd.DataFrame", parent=None) -> None:
+        super().__init__(parent)
+        self._frame = frame
+        self._columns = list(frame.columns)
+
+    def rowCount(self, parent=None):  # type: ignore[override]
+        return 0 if parent and parent.isValid() else len(self._frame)
+
+    def columnCount(self, parent=None):  # type: ignore[override]
+        return 0 if parent and parent.isValid() else len(self._columns)
+
+    def data(self, index, role=QtCore.Qt.DisplayRole):  # type: ignore[override]
+        if not index.isValid() or role not in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
+            return None
+        value = self._frame.iloc[index.row(), index.column()]
+        if pd is None:
+            return value
+        if pd.isna(value):
+            return ""
+        if isinstance(value, float):
+            return f"{value:.6f}".rstrip("0").rstrip(".")
+        return str(value)
+
+    def headerData(self, section, orientation, role=QtCore.Qt.DisplayRole):  # type: ignore[override]
+        if role != QtCore.Qt.DisplayRole:
+            return None
+        if orientation == QtCore.Qt.Horizontal:
+            try:
+                return self._columns[section]
+            except IndexError:
+                return None
+        return section + 1
+
+
+class FunctionThread(QtCore.QThread):
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int)
+
+    def __init__(
+        self,
+        fn,
+        *args,
+        progress_arg: Optional[str] = "progress_cb",
+        cancel_arg: Optional[str] = None,
+        result_adapter=None,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+        self._progress_arg = progress_arg
+        self._cancel_arg = cancel_arg
+        self._result_adapter = result_adapter
+
+    def _emit_progress(self, value) -> None:
+        try:
+            pct = int(float(value))
+        except Exception:
+            pct = 0
+        self.progress.emit(max(0, min(100, pct)))
+
+    def run(self) -> None:  # pragma: no cover - PyQt thread lifecycle
+        kwargs = dict(self._kwargs)
+        if self._progress_arg:
+            kwargs[self._progress_arg] = self._emit_progress
+        if self._cancel_arg:
+            kwargs[self._cancel_arg] = self.isInterruptionRequested
+        try:
+            result = self._fn(*self._args, **kwargs)
+            if self._result_adapter:
+                result = self._result_adapter(result)
+        except Exception as exc:  # pragma: no cover - surface to UI
+            self.error.emit(str(exc))
+            return
+        self.finished.emit(result)
+
+
+class _WorkerSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int)
+
+
+class BackgroundTask(QtCore.QRunnable):
+    def __init__(self, fn, *args, **kwargs) -> None:
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+        self.signals = _WorkerSignals()
+
+    @property
+    def finished(self):
+        return self.signals.finished
+
+    @property
+    def error(self):
+        return self.signals.error
+
+    @property
+    def progress(self):
+        return self.signals.progress
+
+    def _emit_progress(self, value) -> None:
+        try:
+            pct = int(float(value))
+        except Exception:
+            pct = 0
+        self.signals.progress.emit(max(0, min(100, pct)))
+
+    def run(self) -> None:  # pragma: no cover - QRunnable lifecycle
+        kwargs = dict(self._kwargs)
+        kwargs.setdefault("progress_cb", self._emit_progress)
+        try:
+            result = self._fn(*self._args, **kwargs)
+        except Exception as exc:  # pragma: no cover - surface to UI
+            self.signals.error.emit(str(exc))
+            return
+        self.signals.finished.emit(result)
+
+
+class FeaturePickDialog(QtWidgets.QDialog):
+    def __init__(self, features: List[str], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("选择特征列")
+        self.resize(420, 480)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.list_widget = QtWidgets.QListWidget(self)
+        self.list_widget.addItems(features)
+        self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+        layout.addWidget(self.list_widget)
+        btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(btn_box)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+
+    def selected(self) -> List[str]:
+        return [item.text() for item in self.list_widget.selectedItems()]
+
+
+class ResultsDashboard(QtWidgets.QGroupBox):
+    def __init__(self, parent=None):
+        super().__init__("结果仪表盘", parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.summary_label = QtWidgets.QLabel("暂无数据")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+        grid = QtWidgets.QGridLayout()
+        layout.addLayout(grid)
+        self.metrics: Dict[str, QtWidgets.QLabel] = {}
+        names = [
+            ("total", "总流量"),
+            ("anomalies", "异常流"),
+            ("alerts", "高风险"),
+            ("last_update", "更新时间"),
+        ]
+        for idx, (key, label) in enumerate(names):
+            grid.addWidget(QtWidgets.QLabel(label + ":"), idx, 0)
+            value_label = QtWidgets.QLabel("-")
+            value_label.setObjectName(f"metric_{key}")
+            grid.addWidget(value_label, idx, 1)
+            self.metrics[key] = value_label
+
+    def update_summary(self, summary: Dict[str, object]) -> None:
+        if not summary:
+            self.summary_label.setText("暂无数据")
+            for widget in self.metrics.values():
+                widget.setText("-")
+            return
+        total = summary.get("total_flows", 0)
+        anomalies = summary.get("anomalies", 0)
+        self.summary_label.setText(f"总计 {total} 条流，其中 {anomalies} 条疑似异常")
+        self.metrics["total"].setText(str(total))
+        self.metrics["anomalies"].setText(str(anomalies))
+        self.metrics["alerts"].setText(str(summary.get("alerts", 0)))
+        ts = summary.get("last_update")
+        if ts:
+            self.metrics["last_update"].setText(str(ts))
+        else:
+            self.metrics["last_update"].setText("-")
+
+
+class AnomalyDetailDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("异常流详情")
+        self.resize(760, 520)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.table = QtWidgets.QTableWidget(self)
+        layout.addWidget(self.table)
+        self.annotation_box = QtWidgets.QPlainTextEdit(self)
+        layout.addWidget(self.annotation_box)
+        btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        layout.addWidget(btn_box)
+        btn_box.rejected.connect(self.reject)
+
+    def set_dataframe(self, df: "pd.DataFrame") -> None:
+        self.table.clear()
+        self.table.setRowCount(len(df))
+        self.table.setColumnCount(len(df.columns))
+        self.table.setHorizontalHeaderLabels([str(col) for col in df.columns])
+        for row_idx, (_, row) in enumerate(df.iterrows()):
+            for col_idx, value in enumerate(row):
+                self.table.setItem(row_idx, col_idx, QtWidgets.QTableWidgetItem(str(value)))
+
+    def set_annotation(self, text: str) -> None:
+        self.annotation_box.setPlainText(text)
+
+
+class ConfigEditorDialog(QtWidgets.QDialog):
+    def __init__(self, *, title: str, text: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(700, 520)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.editor = QtWidgets.QPlainTextEdit(self)
+        self.editor.setPlainText(text)
+        layout.addWidget(self.editor)
+        btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(btn_box)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+
+    def text(self) -> str:
+        return self.editor.toPlainText()
+
+
+class OnlineDetectionWorker(QtCore.QThread):
+    new_file = QtCore.pyqtSignal(str)
+    status = QtCore.pyqtSignal(str)
+    error = QtCore.pyqtSignal(str)
+    stopped = QtCore.pyqtSignal()
+
+    def __init__(self, watch_dir: str, poll_seconds: int = 5, parent=None):
+        super().__init__(parent)
+        self.watch_dir = Path(watch_dir)
+        self.poll_seconds = max(1, int(poll_seconds))
+        self._stop_flag = False
+        self._seen: Set[str] = set()
+
+    def stop(self) -> None:
+        self._stop_flag = True
+
+    def run(self) -> None:  # pragma: no cover - 线程逻辑难以单元测试
+        if not self.watch_dir.exists():
+            try:
+                self.watch_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self.error.emit(f"无法创建监控目录：{exc}")
+                return
+        self.status.emit(f"监控目录：{self.watch_dir}")
+        patterns = ("*.pcap", "*.pcapng")
+        while not self._stop_flag:
+            try:
+                files: List[Path] = []
+                for pattern in patterns:
+                    files.extend(sorted(self.watch_dir.glob(pattern)))
+                for path in files:
+                    norm = str(path.resolve())
+                    if norm in self._seen:
+                        continue
+                    self._seen.add(norm)
+                    self.new_file.emit(norm)
+            except Exception as exc:
+                self.error.emit(str(exc))
+            for _ in range(self.poll_seconds * 10):
+                if self._stop_flag:
+                    break
+                self.msleep(100)
+        self.stopped.emit()
 
 def _resolve_data_base() -> Path:
     env = os.getenv("MALDET_DATA_DIR")
