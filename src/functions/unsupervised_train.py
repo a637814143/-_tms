@@ -29,6 +29,21 @@ META_COLUMNS = {
 }
 
 
+# Columns containing metadata generated during preprocessing that should be
+# retained alongside the feature matrix.
+META_COLUMNS = {
+    "__source_file__",
+    "__source_path__",
+    "pcap_file",
+    "flow_id",
+    "src_ip",
+    "dst_ip",
+    "src_port",
+    "dst_port",
+    "protocol",
+}
+
+
 @dataclass
 class TrainingSummary:
     """Metadata describing a completed training run."""
