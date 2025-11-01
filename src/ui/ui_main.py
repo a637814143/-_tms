@@ -2268,12 +2268,23 @@ class Ui_MainWindow(object):
             w.setEnabled(is_batch)
 
     def _list_sorted(self, d: str) -> List[str]:
+        suffixes = (".pcap", ".pcapng")
+        matches: List[str] = []
+
+        if os.path.isfile(d):
+            return [d] if d.lower().endswith(suffixes) else []
+
         try:
-            names = [n for n in os.listdir(d) if n.lower().endswith((".pcap", ".pcapng"))]
+            for root, _dirs, files in os.walk(d):
+                for name in files:
+                    if not name.lower().endswith(suffixes):
+                        continue
+                    matches.append(os.path.join(root, name))
         except Exception:
-            names = []
-        names.sort()
-        return [os.path.join(d, n) for n in names]
+            matches = []
+
+        matches.sort()
+        return matches
 
     def _on_feature_slider_changed(self, value: int) -> None:
         if value <= 0:
