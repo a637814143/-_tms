@@ -1177,6 +1177,8 @@ class Ui_MainWindow(object):
         self.table_view.verticalHeader().setDefaultSectionSize(28)
         self.table_view.setAlternatingRowColors(True)
         self.table_view.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self._table_model = None  # type: Optional[PandasFrameModel]
+        self._table_proxy = None  # type: Optional[QtCore.QSortFilterProxyModel]
         self.table_widget.setMinimumHeight(22 * 16 + 40)
         tl.addWidget(self.table_view)
         self.display_tabs.addTab(self.table_widget, "流量表格")
@@ -2415,6 +2417,19 @@ class Ui_MainWindow(object):
         show_df = df.head(PREVIEW_LIMIT_FOR_TABLE).copy() if (len(df) > PREVIEW_LIMIT_FOR_TABLE and not self._csv_paged_path) else df
         self.table_view.setUpdatesEnabled(False)
         try:
+            if getattr(self, "_table_proxy", None) is not None:
+                try:
+                    self.table_view.setModel(None)
+                    self._table_proxy.deleteLater()
+                except Exception:
+                    pass
+                self._table_proxy = None
+            if getattr(self, "_table_model", None) is not None:
+                try:
+                    self._table_model.deleteLater()
+                except Exception:
+                    pass
+                self._table_model = None
             m = PandasFrameModel(show_df, self.table_view)
             proxy = QtCore.QSortFilterProxyModel(self.table_view)
             proxy.setSourceModel(m)
@@ -2423,6 +2438,8 @@ class Ui_MainWindow(object):
             self.table_view.setSortingEnabled(True)
             self.table_view.resizeColumnsToContents()
             self.display_tabs.setCurrentWidget(self.table_widget)
+            self._table_model = m
+            self._table_proxy = proxy
         finally:
             self.table_view.setUpdatesEnabled(True)
 
@@ -3967,6 +3984,18 @@ class Ui_MainWindow(object):
             self.results_text.clear()
             self.table_view.setSortingEnabled(False)
             self.table_view.setModel(None)
+            if getattr(self, "_table_proxy", None) is not None:
+                try:
+                    self._table_proxy.deleteLater()
+                except Exception:
+                    pass
+                self._table_proxy = None
+            if getattr(self, "_table_model", None) is not None:
+                try:
+                    self._table_model.deleteLater()
+                except Exception:
+                    pass
+                self._table_model = None
             self.display_tabs.setCurrentWidget(self.results_widget)
             self.output_list.clear()
             self._update_status_message("@2025 恶意流量检测系统")
