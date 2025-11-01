@@ -43,6 +43,13 @@ _PCAP_SUFFIXES: Tuple[str, ...] = (".pcap", ".pcapng")
 _CSV_ENCODING = "utf-8"
 _META_ALIASES: Tuple[str, ...] = ()
 
+try:  # Prefer the canonical header when available.
+    from .vectorizer import CSV_COLUMNS as _CANONICAL_FLOW_HEADER
+except Exception:  # pragma: no cover - vectorizer may be unavailable in minimal builds
+    _CANONICAL_FLOW_HEADER: Tuple[str, ...] = ()
+
+_STRING_FLOW_COLUMNS = {"Flow ID", "Source IP", "Destination IP", "Timestamp"}
+
 
 ExtractionSummary = _StaticExtractionSummary
 
@@ -50,6 +57,9 @@ ExtractionSummary = _StaticExtractionSummary
 @lru_cache(maxsize=1)
 def _ordered_flow_columns() -> Tuple[str, ...]:
     """Return the canonical CSV column order when available."""
+
+    if _CANONICAL_FLOW_HEADER:
+        return _CANONICAL_FLOW_HEADER
 
     try:
         from .vectorizer import CSV_COLUMNS  # circular import safe at runtime
@@ -102,30 +112,42 @@ def _write_flow_csv(output_path: Path, rows: List[Dict[str, object]]) -> None:
     """Persist flow records to disk using pandas when available."""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    header = list(_CANONICAL_FLOW_HEADER) if _CANONICAL_FLOW_HEADER else list(_ordered_flow_columns())
+    if not header:
+        if rows:
+            header = _column_order(rows[0].keys())
+        else:
+            header = []
 
-    if not rows:
-        columns = list(_ordered_flow_columns())
-        for alias in _META_ALIASES:
-            if alias not in columns:
-                columns.append(alias)
-        if not columns and rows:
-            columns = list(rows[0].keys())
-        with output_path.open("w", encoding=_CSV_ENCODING, newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=columns)
-            writer.writeheader()
-        return
-
-    if pd is not None:
+    if pd is not None and rows:
         frame = pd.DataFrame(rows)
-        order = _column_order(frame.columns)
-        frame.to_csv(output_path, index=False, columns=order, encoding=_CSV_ENCODING)
+        for column in header:
+            if column not in frame.columns:
+                frame[column] = "" if column in _STRING_FLOW_COLUMNS else 0.0
+        for column in header:
+            if column in _STRING_FLOW_COLUMNS:
+                frame[column] = frame[column].fillna("").astype(str)
+            else:
+                frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
+        frame = frame.loc[:, header]
+        frame.to_csv(output_path, index=False, encoding=_CSV_ENCODING)
         return
 
-    order = _column_order(rows[0].keys())
     with output_path.open("w", encoding=_CSV_ENCODING, newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=order)
-        writer.writeheader()
-        writer.writerows(rows)
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        for record in rows:
+            row: List[object] = []
+            for column in header:
+                value = record.get(column)
+                if column in _STRING_FLOW_COLUMNS:
+                    row.append("" if value is None else str(value))
+                else:
+                    try:
+                        row.append(float(value))
+                    except (TypeError, ValueError):
+                        row.append(0.0)
+            writer.writerow(row)
 
 
 def extract_features(

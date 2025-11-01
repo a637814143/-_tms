@@ -111,13 +111,19 @@ CSV_COLUMNS: Sequence[str] = (
 
 _STRING_COLUMNS = {"Flow ID", "Source IP", "Destination IP", "Timestamp"}
 _LABEL_COLUMN = "Label"
-_CSV_READ_ENCODINGS: Sequence[str] = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+CSV_READ_ENCODINGS: Sequence[str] = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+_CSV_READ_ENCODINGS = CSV_READ_ENCODINGS
+
+
+_DUPLICATE_COLUMN_ALIASES: Dict[Tuple[str, int], str] = {
+    ("Fwd Header Length", 1): "Fwd Header Length.1",
+}
 
 
 def _resolve_actual_key(column: str, occurrence: int) -> str:
     """Translate a CSV column to the underlying flow dictionary key."""
 
-    return column
+    return _DUPLICATE_COLUMN_ALIASES.get((column, occurrence), column)
 
 
 def _numeric_feature_metadata() -> List[str]:
@@ -141,6 +147,12 @@ def _numeric_feature_metadata() -> List[str]:
 
 _NUMERIC_FEATURE_KEYS = _numeric_feature_metadata()
 _NUMERIC_FEATURE_NAMES = list(_NUMERIC_FEATURE_KEYS)
+
+
+def numeric_feature_names() -> List[str]:
+    """Return the ordered numeric feature names used for model input."""
+
+    return list(_NUMERIC_FEATURE_NAMES)
 
 
 @dataclass
