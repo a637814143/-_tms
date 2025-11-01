@@ -2927,7 +2927,25 @@ class Ui_MainWindow(object):
         default_feature_files = self._default_feature_csv_files()
         feature_source: Optional[FeatureSource]
 
-        if default_feature_files:
+        # 先弹出文件选择器，允许用户手动指定要预处理的特征 CSV。
+        dialog_dir = self._default_csv_feature_dir()
+        if not dialog_dir or not os.path.isdir(dialog_dir):
+            dialog_dir = self.file_edit.text() or os.getcwd()
+
+        selected_files, _ = QtWidgets.QFileDialog.getOpenFileNames(
+            self.centralwidget,
+            "选择预处理特征 CSV",
+            dialog_dir,
+            "CSV 文件 (*.csv);;所有文件 (*)",
+        )
+
+        if selected_files:
+            feature_source = list(selected_files)
+            preview = f"手动选择的 {len(selected_files)} 个 CSV"
+            first_path = selected_files[0]
+            self.file_edit.setText(first_path)
+            self._remember_path(first_path)
+        elif default_feature_files:
             feature_source = list(default_feature_files)
             preview = f"{self._default_csv_feature_dir()} 中的 {len(default_feature_files)} 个 CSV"
             self.file_edit.setText(self._default_csv_feature_dir())
