@@ -573,6 +573,7 @@ def flow_to_feature_dict(flow: FlowAccumulator) -> Dict[str, object]:
         "Fwd URG Flags": flow.fwd_urg_flags,
         "Bwd URG Flags": flow.bwd_urg_flags,
         "Fwd Header Length": flow.forward_header_bytes,
+        "Fwd Header Length.1": flow.forward_header_bytes,
         "Bwd Header Length": flow.backward_header_bytes,
         "Fwd Packets/s": fwd_packets_per_s,
         "Bwd Packets/s": bwd_packets_per_s,
