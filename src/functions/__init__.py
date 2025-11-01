@@ -29,6 +29,9 @@ _safe_export(
         "TrainingSummary",
         "detect_pcap_with_model",
         "train_unsupervised_on_split",
+        "DEFAULT_MODEL_PARAMS",
+        "META_COLUMNS",
+        "compute_risk_components",
     ),
 )
 
