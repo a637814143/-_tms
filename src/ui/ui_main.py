@@ -210,21 +210,37 @@ class AppSettings:
 class PandasFrameModel(QtCore.QAbstractTableModel):
     def __init__(self, frame: "pd.DataFrame", parent=None) -> None:
         super().__init__(parent)
-        self._frame = frame
-        self._columns = list(frame.columns)
+        if pd is None or frame is None:
+            self._df = pd.DataFrame() if pd is not None else frame
+        else:
+            self._df = frame
+        # 兼容旧逻辑：外部会访问 _df 属性获取原始 DataFrame
+        self._frame = self._df
+        self._columns = list(self._df.columns) if pd is not None else []
 
     def rowCount(self, parent=None):  # type: ignore[override]
-        return 0 if parent and parent.isValid() else len(self._frame)
+        if parent and parent.isValid():
+            return 0
+        if pd is None or self._df is None:
+            return 0
+        return len(self._df)
 
     def columnCount(self, parent=None):  # type: ignore[override]
-        return 0 if parent and parent.isValid() else len(self._columns)
+        if parent and parent.isValid():
+            return 0
+        if pd is None or self._df is None:
+            return 0
+        return len(self._columns)
 
     def data(self, index, role=QtCore.Qt.DisplayRole):  # type: ignore[override]
-        if not index.isValid() or role not in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
+        if not index.isValid() or role not in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole, QtCore.Qt.ToolTipRole):
             return None
-        value = self._frame.iloc[index.row(), index.column()]
-        if pd is None:
-            return value
+        if pd is None or self._df is None:
+            return ""
+        try:
+            value = self._df.iloc[index.row(), index.column()]
+        except Exception:
+            return ""
         if pd.isna(value):
             return ""
         if isinstance(value, float):
@@ -237,9 +253,14 @@ class PandasFrameModel(QtCore.QAbstractTableModel):
         if orientation == QtCore.Qt.Horizontal:
             try:
                 return self._columns[section]
-            except IndexError:
+            except Exception:
                 return None
         return section + 1
+
+    def flags(self, index):  # type: ignore[override]
+        if not index.isValid():
+            return QtCore.Qt.NoItemFlags
+        return QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
 
 
 class FunctionThread(QtCore.QThread):
@@ -498,30 +519,55 @@ class ResultsDashboard(QtWidgets.QGroupBox):
 
 
 class AnomalyDetailDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None) -> None:
+    annotation_saved = QtCore.pyqtSignal(float)
+
+    def __init__(self, record: Dict[str, object], parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("异常流详情")
-        self.resize(760, 520)
+        self.setWindowTitle("异常样本详情")
+        self.resize(720, 520)
+        self._record = record
+
         layout = QtWidgets.QVBoxLayout(self)
-        self.table = QtWidgets.QTableWidget(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        header = QtWidgets.QHBoxLayout()
+        header.addWidget(QtWidgets.QLabel("双击列可复制，支持筛选"))
+        self.notes_edit = QtWidgets.QLineEdit()
+        self.notes_edit.setPlaceholderText("标注备注（可选）")
+        header.addWidget(self.notes_edit)
+        layout.addLayout(header)
+
+        self.table = QtWidgets.QTableWidget(len(record), 2)
+        self.table.setHorizontalHeaderLabels(["字段", "值"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for row, (key, value) in enumerate(sorted(record.items())):
+            key_item = QtWidgets.QTableWidgetItem(str(key))
+            val_item = QtWidgets.QTableWidgetItem(str(value))
+            self.table.setItem(row, 0, key_item)
+            self.table.setItem(row, 1, val_item)
         layout.addWidget(self.table)
-        self.annotation_box = QtWidgets.QPlainTextEdit(self)
-        layout.addWidget(self.annotation_box)
-        btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
-        layout.addWidget(btn_box)
-        btn_box.rejected.connect(self.reject)
 
-    def set_dataframe(self, df: "pd.DataFrame") -> None:
-        self.table.clear()
-        self.table.setRowCount(len(df))
-        self.table.setColumnCount(len(df.columns))
-        self.table.setHorizontalHeaderLabels([str(col) for col in df.columns])
-        for row_idx, (_, row) in enumerate(df.iterrows()):
-            for col_idx, value in enumerate(row):
-                self.table.setItem(row_idx, col_idx, QtWidgets.QTableWidgetItem(str(value)))
+        btns = QtWidgets.QDialogButtonBox()
+        self.btn_mark_normal = btns.addButton("标注为正常", QtWidgets.QDialogButtonBox.ActionRole)
+        self.btn_mark_anomaly = btns.addButton("标注为异常", QtWidgets.QDialogButtonBox.ActionRole)
+        btns.addButton(QtWidgets.QDialogButtonBox.Close)
+        layout.addWidget(btns)
 
-    def set_annotation(self, text: str) -> None:
-        self.annotation_box.setPlainText(text)
+        btns.rejected.connect(self.reject)
+        self.btn_mark_normal.clicked.connect(lambda: self._store_label(0.0))
+        self.btn_mark_anomaly.clicked.connect(lambda: self._store_label(1.0))
+
+    def _store_label(self, value: float) -> None:
+        try:
+            upsert_annotation(self._record, label=value, notes=self.notes_edit.text().strip() or None)
+            QtWidgets.QMessageBox.information(self, "标注成功", "已保存人工标注。")
+            self.annotation_saved.emit(value)
+            self.accept()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "保存失败", f"无法写入标注：{exc}")
 
 
 class ConfigEditorDialog(QtWidgets.QDialog):
@@ -2403,6 +2449,20 @@ class Ui_MainWindow(object):
             self._analysis_summary,
             self._selected_metadata if isinstance(self._selected_metadata, dict) else None,
         )
+
+    def _auto_tag_dataframe(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        if pd is None or df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        try:
+            labels = apply_annotations_to_frame(df)
+        except Exception as exc:
+            self.display_result(f"[WARN] 应用人工标注失败：{exc}")
+            return df
+        if labels is None:
+            return df
+        tagged = df.copy()
+        tagged["manual_label"] = labels
+        return tagged
 
     # --------- 批次按钮 ----------
 
