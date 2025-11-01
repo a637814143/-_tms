@@ -42,7 +42,10 @@ except Exception:  # pragma: no cover - fallback for minimal environments
         "__source_path__",
     }
 from src.functions.analyze_results import analyze_results as run_analysis
-from src.functions.preprocess import preprocess_feature_dir as preprocess_dir
+from src.functions.preprocess import (
+    preprocess_feature_dir as preprocess_dir,
+    FeatureSource,
+)
 from src.functions.annotations import (
     upsert_annotation,
     annotation_summary,
@@ -2184,6 +2187,7 @@ class Ui_MainWindow(object):
         return None
 
     def _ask_feature_source(self):
+        """兼容旧逻辑，保留文件对话框以便特殊场景下自定义输入。"""
         start_dir = self._default_csv_feature_dir()
         dir_path = QtWidgets.QFileDialog.getExistingDirectory(
             None, "选择特征 CSV 所在目录", start_dir
@@ -2200,6 +2204,23 @@ class Ui_MainWindow(object):
         if files:
             return files
         return None
+
+    def _default_feature_csv_files(self) -> List[str]:
+        """获取默认特征目录下的全部 CSV 文件列表。"""
+        feature_dir = Path(self._default_csv_feature_dir())
+        if not feature_dir.exists() or not feature_dir.is_dir():
+            return []
+
+        files: Set[str] = set()
+        for pattern in ("*.csv", "*.CSV"):
+            for path in feature_dir.glob(pattern):
+                if path.is_file():
+                    try:
+                        files.add(str(path.resolve()))
+                    except Exception:
+                        files.add(str(path))
+
+        return sorted(files)
 
     def _ask_training_source(self):
         current = self.file_edit.text().strip()
@@ -2902,26 +2923,45 @@ class Ui_MainWindow(object):
 
     # --------- 数据预处理（基于特征 CSV） ----------
     def _on_preprocess_features(self):
-        feature_source = self._ask_feature_source()
-        if not feature_source:
-            self.display_result("[INFO] 已取消数据预处理。")
-            return
+        # 默认直接使用配置中的特征目录与输出目录，确保与用户目录保持一致。
+        default_feature_files = self._default_feature_csv_files()
+        feature_source: Optional[FeatureSource]
+
+        if default_feature_files:
+            feature_source = list(default_feature_files)
+            preview = f"{self._default_csv_feature_dir()} 中的 {len(default_feature_files)} 个 CSV"
+            self.file_edit.setText(self._default_csv_feature_dir())
+            self._remember_path(self._default_csv_feature_dir())
+        else:
+            # 回退到手动选择，兼容自定义路径场景。
+            feature_source = self._ask_feature_source()
+            if not feature_source:
+                self.display_result("[INFO] 已取消数据预处理。")
+                return
+            if isinstance(feature_source, (list, tuple, set)):
+                files_list = list(feature_source)
+                preview = f"{len(files_list)} 个CSV文件"
+                if files_list:
+                    first_path = str(files_list[0])
+                    self.file_edit.setText(first_path)
+                    self._remember_path(first_path)
+            else:
+                preview = str(feature_source)
+                if os.path.exists(preview):
+                    self.file_edit.setText(preview)
+                    self._remember_path(preview)
 
         out_dir = self._preprocess_out_dir()
         os.makedirs(out_dir, exist_ok=True)
 
-        if isinstance(feature_source, (list, tuple, set)):
-            files_list = list(feature_source)
-            preview = f"{len(files_list)} 个CSV文件"
-            if files_list:
-                first_path = str(files_list[0])
-                self.file_edit.setText(first_path)
-                self._remember_path(first_path)
-        else:
-            preview = str(feature_source)
-            if os.path.exists(preview):
-                self.file_edit.setText(preview)
-                self._remember_path(preview)
+        if isinstance(feature_source, (list, tuple, set)) and not feature_source:
+            QtWidgets.QMessageBox.warning(
+                None,
+                "未找到特征 CSV",
+                "默认特征目录中未检测到任何 CSV 文件，请先执行特征提取。",
+            )
+            self.display_result("[WARN] 默认特征目录中没有可预处理的 CSV 文件。")
+            return
 
         self.display_result(f"[INFO] 数据预处理：{preview} -> {out_dir}")
         self._set_action_buttons_enabled(False)
