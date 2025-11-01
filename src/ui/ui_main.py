@@ -391,6 +391,111 @@ class ResultsDashboard(QtWidgets.QGroupBox):
         else:
             self.metrics["last_update"].setText("-")
 
+    def update_metrics(self, analysis: Optional[dict], metadata: Optional[dict]) -> None:
+        metrics: Dict[str, object] = {}
+        if isinstance(analysis, dict):
+            metrics_candidate = analysis.get("metrics")
+            if isinstance(metrics_candidate, dict):
+                metrics = metrics_candidate
+
+        def _as_float(value) -> Optional[float]:
+            try:
+                if value is None:
+                    return None
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _as_int(value) -> Optional[int]:
+            try:
+                if value is None:
+                    return None
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+
+        ratio_value = None
+        for key in ("malicious_ratio", "anomaly_ratio", "ratio"):
+            ratio_value = _as_float(metrics.get(key))
+            if ratio_value is not None:
+                break
+
+        total_value = None
+        for key in ("total_count", "total_rows", "total", "total_flows"):
+            total_value = _as_int(metrics.get(key))
+            if total_value is not None:
+                break
+
+        anomaly_value = None
+        for key in ("anomaly_count", "malicious_total", "malicious", "anomalies"):
+            anomaly_value = _as_int(metrics.get(key))
+            if anomaly_value is not None:
+                break
+
+        alerts_value = None
+        if isinstance(metrics.get("drift_alerts"), dict):
+            alerts_value = len(metrics.get("drift_alerts"))
+        elif isinstance(metrics.get("alerts"), dict):
+            alerts_value = len(metrics.get("alerts"))
+        elif isinstance(metrics.get("alerts"), (list, tuple, set)):
+            alerts_value = len(metrics.get("alerts"))
+        else:
+            alerts_value = _as_int(metrics.get("alerts"))
+
+        timestamp_value: Optional[str] = None
+        for key in ("last_update", "generated_at", "timestamp"):
+            raw = metrics.get(key) if metrics else None
+            if raw:
+                timestamp_value = str(raw)
+                break
+        if timestamp_value is None and isinstance(analysis, dict):
+            for key in ("last_update", "generated_at", "timestamp"):
+                raw = analysis.get(key)
+                if raw:
+                    timestamp_value = str(raw)
+                    break
+        if timestamp_value is None and isinstance(metadata, dict):
+            raw = metadata.get("timestamp")
+            if raw:
+                timestamp_value = str(raw)
+        if timestamp_value is None and (total_value is not None or anomaly_value is not None):
+            timestamp_value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        summary_payload: Dict[str, object] = {}
+        if total_value is not None:
+            summary_payload["total_flows"] = total_value
+        if anomaly_value is not None:
+            summary_payload["anomalies"] = anomaly_value
+        if alerts_value is not None and alerts_value >= 0:
+            summary_payload["alerts"] = alerts_value
+        if timestamp_value is not None:
+            summary_payload["last_update"] = timestamp_value
+
+        self.update_summary(summary_payload)
+
+        training_ratio = None
+        if isinstance(metadata, dict):
+            for key in ("training_anomaly_ratio", "contamination"):
+                training_ratio = _as_float(metadata.get(key))
+                if training_ratio is not None:
+                    break
+
+        info_lines: List[str] = []
+        if total_value is not None:
+            info_lines.append(f"总计 {total_value} 条流")
+        if anomaly_value is not None:
+            info_lines.append(f"其中 {anomaly_value} 条疑似异常")
+        if ratio_value is not None:
+            info_lines.append(f"当前异常占比 {ratio_value:.2%}")
+        if training_ratio is not None:
+            info_lines.append(f"训练异常占比 {training_ratio:.2%}")
+        if timestamp_value and (total_value is not None or anomaly_value is not None):
+            info_lines.append(f"更新时间 {timestamp_value}")
+
+        if info_lines:
+            self.summary_label.setText("，".join(info_lines))
+
+
 
 class AnomalyDetailDialog(QtWidgets.QDialog):
     def __init__(self, parent=None) -> None:
