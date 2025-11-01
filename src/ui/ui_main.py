@@ -3,7 +3,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap
 from pathlib import Path
 import numpy as np
-from typing import Collection, Dict, List, Optional, Set
+from typing import Collection, Dict, List, Optional, Set, Tuple
 from datetime import datetime
 
 import yaml
@@ -3755,53 +3755,30 @@ class Ui_MainWindow(object):
         }
 
 
-    def _on_predict(self):
-        if pd is None:
-            QtWidgets.QMessageBox.warning(None, "缺少依赖", "当前环境未安装 pandas，无法执行预测。")
-            return
-
-        csv_path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            None, "选择特征CSV", self._default_csv_feature_dir(), "CSV (*.csv)"
-        )
-        if not csv_path:
-            return
-
-        try:
-            df = read_csv_flexible(csv_path)
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{exc}")
-            return
-
-        if df.empty:
-            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
-            return
-
-        self._remember_path(csv_path)
-
-        source_name = os.path.splitext(os.path.basename(csv_path))[0] or os.path.basename(csv_path)
-        metadata_override = self._selected_metadata if isinstance(self._selected_metadata, dict) else None
-
-        try:
-            result = self._predict_dataframe(
-                df,
-                source_name=source_name,
-                metadata_override=metadata_override,
-                silent=True,
-            )
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
+    def _present_prediction_result(
+        self,
+        result: Optional[dict],
+        *,
+        source_name: str,
+        metadata_override: Optional[dict] = None,
+        source_csv: Optional[str] = None,
+        source_pcap: Optional[str] = None,
+        show_dialog: bool = True,
+    ) -> None:
+        if not isinstance(result, dict):
             return
 
         messages = result.get("messages") or []
         if messages:
-            log_text = "\n".join(f"[INFO] {line}" for line in messages)
-            self.display_result(log_text)
+            lines = [f"[INFO] [{source_name}] {line}" for line in messages]
+            self.display_result("\n".join(lines))
 
         output_csv = result.get("output_csv")
         if output_csv and os.path.exists(output_csv):
             self._add_output(output_csv)
             self._last_out_csv = output_csv
-            self._open_csv_paged(output_csv)
+            if show_dialog:
+                self._open_csv_paged(output_csv)
 
         dataframe = result.get("dataframe")
         if isinstance(dataframe, pd.DataFrame):
@@ -3822,16 +3799,249 @@ class Ui_MainWindow(object):
         self.dashboard.update_metrics(analysis_stub, metadata)
 
         snapshot = {key: value for key, value in result.items() if key != "dataframe"}
-        snapshot["dataframe"] = dataframe
-        snapshot["source_csv"] = csv_path
+        if isinstance(dataframe, pd.DataFrame):
+            snapshot["dataframe"] = dataframe
+        if source_csv:
+            snapshot["source_csv"] = source_csv
+        if source_pcap:
+            snapshot["source_pcap"] = source_pcap
         if metadata and "metadata" not in snapshot:
             snapshot["metadata"] = metadata
+        snapshot["source_name"] = source_name
         self._latest_prediction_summary = snapshot
 
-        QtWidgets.QMessageBox.information(
+        if show_dialog:
+            QtWidgets.QMessageBox.information(
+                None,
+                "预测完成",
+                "\n".join(result.get("summary") or ["模型预测已完成并写出结果。"]),
+            )
+
+    def _predict_pcap_batch(
+        self,
+        paths: List[str],
+        *,
+        metadata_override: Optional[dict],
+    ) -> None:
+        if not paths:
+            QtWidgets.QMessageBox.information(None, "无有效文件", "所选目录中没有可处理的 PCAP 文件。")
+            return
+
+        output_dir = self._prediction_out_dir()
+        os.makedirs(output_dir, exist_ok=True)
+
+        total = len(paths)
+        successes = 0
+        total_rows = 0
+        total_malicious = 0
+        failed: List[Tuple[str, str]] = []
+
+        for index, pcap_path in enumerate(paths, start=1):
+            self.display_result(f"[INFO] 处理 PCAP ({index}/{total}): {pcap_path}")
+            try:
+                payload = self._process_online_pcap(
+                    pcap_path,
+                    output_dir=output_dir,
+                    metadata=metadata_override,
+                )
+            except Exception as exc:
+                reason = str(exc)
+                failed.append((pcap_path, reason))
+                self.display_result(f"[错误] PCAP 处理失败：{pcap_path} -> {reason}")
+                continue
+
+            prediction = payload.get("prediction") if isinstance(payload, dict) else None
+            source_name = os.path.basename(pcap_path)
+            self._present_prediction_result(
+                prediction,
+                source_name=source_name,
+                metadata_override=metadata_override,
+                source_pcap=pcap_path,
+                show_dialog=False,
+            )
+
+            successes += 1
+            try:
+                total_rows += int(prediction.get("total", 0))  # type: ignore[arg-type]
+            except Exception:
+                pass
+            try:
+                total_malicious += int(prediction.get("malicious", 0))  # type: ignore[arg-type]
+            except Exception:
+                pass
+
+        if successes == 0:
+            error_lines = [f"- {os.path.basename(path)}: {reason}" for path, reason in failed[:5]]
+            if len(failed) > 5:
+                error_lines.append("...")
+            QtWidgets.QMessageBox.critical(
+                None,
+                "预测失败",
+                "所有 PCAP 文件处理均失败。\n" + "\n".join(error_lines),
+            )
+            return
+
+        summary_lines = [
+            f"共处理 PCAP 文件：{total} 个",
+            f"成功：{successes} 个，失败：{total - successes} 个",
+            f"累计检测流量：{total_rows} 条",
+            f"检测到异常：{total_malicious} 条",
+        ]
+        if failed:
+            sample = "; ".join(
+                f"{os.path.basename(path)}: {reason}" for path, reason in failed[:3]
+            )
+            if len(failed) > 3:
+                sample += " ..."
+            summary_lines.append(f"失败样例：{sample}")
+
+        QtWidgets.QMessageBox.information(None, "预测完成", "\n".join(summary_lines))
+
+    def _on_predict(self):
+        if pd is None:
+            QtWidgets.QMessageBox.warning(None, "缺少依赖", "当前环境未安装 pandas，无法执行预测。")
+            return
+
+        start_dir = self._default_csv_feature_dir()
+        file_path, selected_filter = QtWidgets.QFileDialog.getOpenFileName(
             None,
-            "预测完成",
-            "\n".join(result.get("summary") or ["模型预测已完成并写出结果。"]),
+            "选择特征CSV或PCAP",
+            start_dir,
+            "CSV (*.csv);;PCAP (*.pcap *.pcapng);;所有文件 (*)",
+        )
+
+        if file_path:
+            chosen_path = file_path
+        else:
+            dir_path = QtWidgets.QFileDialog.getExistingDirectory(
+                None, "选择特征或 PCAP 所在目录", start_dir
+            )
+            if not dir_path:
+                return
+            chosen_path = dir_path
+
+        chosen_path = chosen_path.strip()
+        if not chosen_path:
+            return
+
+        if not os.path.exists(chosen_path):
+            QtWidgets.QMessageBox.warning(None, "路径不存在", chosen_path)
+            return
+
+        metadata_override = self._selected_metadata if isinstance(self._selected_metadata, dict) else None
+
+        if os.path.isdir(chosen_path):
+            csv_candidates = [
+                os.path.join(chosen_path, name)
+                for name in os.listdir(chosen_path)
+                if name.lower().endswith(".csv")
+            ]
+            pcap_candidates = self._list_sorted(chosen_path)
+
+            if csv_candidates and not pcap_candidates:
+                # 若目录中只有 CSV，则提示选择具体文件
+                csv_file, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    None,
+                    "选择目录中的特征CSV",
+                    chosen_path,
+                    "CSV (*.csv);;所有文件 (*)",
+                )
+                if not csv_file:
+                    return
+                chosen_path = csv_file
+            elif pcap_candidates and not csv_candidates:
+                self._remember_path(chosen_path)
+                self._predict_pcap_batch(
+                    pcap_candidates,
+                    metadata_override=metadata_override,
+                )
+                return
+            elif pcap_candidates and csv_candidates:
+                choice = QtWidgets.QMessageBox.question(
+                    None,
+                    "选择预测模式",
+                    "该目录同时包含特征 CSV 和 PCAP 文件。\n是要按 PCAP 逐个检测吗?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.Yes,
+                )
+                if choice == QtWidgets.QMessageBox.Yes:
+                    self._remember_path(chosen_path)
+                    self._predict_pcap_batch(
+                        pcap_candidates,
+                        metadata_override=metadata_override,
+                    )
+                    return
+                csv_file, _ = QtWidgets.QFileDialog.getOpenFileName(
+                    None,
+                    "选择特征CSV",
+                    chosen_path,
+                    "CSV (*.csv);;所有文件 (*)",
+                )
+                if not csv_file:
+                    return
+                chosen_path = csv_file
+            else:
+                QtWidgets.QMessageBox.information(
+                    None,
+                    "未发现数据",
+                    "所选目录既没有特征 CSV 也没有 PCAP 文件。",
+                )
+                return
+
+        if not os.path.isdir(chosen_path):
+            self._remember_path(chosen_path)
+
+        if chosen_path.lower().endswith((".pcap", ".pcapng")):
+            try:
+                payload = self._process_online_pcap(
+                    chosen_path,
+                    output_dir=self._prediction_out_dir(),
+                    metadata=metadata_override,
+                )
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
+                return
+
+            prediction = payload.get("prediction") if isinstance(payload, dict) else None
+            source_name = os.path.basename(chosen_path)
+            self._present_prediction_result(
+                prediction,
+                source_name=source_name,
+                metadata_override=metadata_override,
+                source_pcap=chosen_path,
+                show_dialog=True,
+            )
+            return
+
+        try:
+            df = read_csv_flexible(chosen_path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{exc}")
+            return
+
+        if df.empty:
+            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
+            return
+
+        source_name = os.path.splitext(os.path.basename(chosen_path))[0] or os.path.basename(chosen_path)
+
+        try:
+            result = self._predict_dataframe(
+                df,
+                source_name=source_name,
+                metadata_override=metadata_override,
+                silent=True,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
+            return
+
+        self._present_prediction_result(
+            result,
+            source_name=source_name,
+            metadata_override=metadata_override,
+            source_csv=chosen_path,
+            show_dialog=True,
         )
 
     # --------- 输出列表 ----------
