@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from .predict_unsupervised import (
+    DEFAULT_MODEL_PARAMS,
     DetectionResult,
     TrainingSummary,
-    detect_pcap_with_model as _detect_pcap_with_model,
-    train_unsupervised_on_split as _train_unsupervised_on_split,
+    detect_pcap_with_model,
+    train_unsupervised_on_split,
 )
 
 # Columns that should be preserved when presenting prediction results in the UI.
@@ -20,11 +21,9 @@ META_COLUMNS = {
     "Timestamp",
 }
 
-train_unsupervised_on_split = _train_unsupervised_on_split
-
-detect_pcap_with_model = _detect_pcap_with_model
 
 __all__ = [
+    "DEFAULT_MODEL_PARAMS",
     "DetectionResult",
     "TrainingSummary",
     "META_COLUMNS",
