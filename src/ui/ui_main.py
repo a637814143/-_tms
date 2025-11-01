@@ -54,6 +54,433 @@ try:
 except Exception:
     pd = None
 
+
+# ---- 简化的通用工具（保持在单文件中）----
+
+
+APP_STYLE = """
+QWidget {
+  background-color: #F5F6FA;
+  font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI";
+  font-size: 14px;
+  color: #1F1F1F;
+}
+
+#TitleBar {
+  background: #F5F6FA;
+  border-bottom: 1px solid #E5E7EB;
+}
+
+QGroupBox {
+  border: 1px solid #E5E7EB;
+  border-radius: 10px;
+  margin-top: 12px;
+  background: #FFFFFF;
+}
+
+QGroupBox::title {
+  subcontrol-origin: margin;
+  left: 12px;
+  padding: 0 6px;
+  font-weight: 600;
+  color: #111827;
+}
+
+QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
+  background: #FFFFFF;
+  border: 1px solid #D1D5DB;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
+  border: 1px solid #60A5FA;
+}
+
+QPushButton {
+  background-color: #0EA5E9;
+  color: #FFFFFF;
+  border-radius: 10px;
+  padding: 8px 16px;
+  min-height: 38px;
+  border: 0;
+}
+
+QPushButton:hover { background-color: #38BDF8; }
+QPushButton:pressed { background-color: #0284C7; }
+QPushButton:disabled { background-color: #C7CDD4; color: #F9FAFB; }
+
+QPushButton#secondary {
+  background: #EEF1F6;
+  color: #111827;
+  border-radius: 10px;
+  padding: 8px 16px;
+  min-height: 38px;
+}
+
+QPushButton#secondary:hover { background: #E5EAF1; }
+QPushButton#secondary:pressed { background: #D9E0EA; }
+
+QHeaderView::section {
+  background: #F3F4F6;
+  border: 1px solid #E5E7EB;
+  padding: 8px;
+  font-weight: 600;
+}
+
+QTableView {
+  background: #FFFFFF;
+  gridline-color: #E5E7EB;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+}
+
+QSplitter::handle {
+  background-color: #E5E7EB;
+  width: 2px;
+}
+
+QStatusBar {
+  background: #F3F4F6;
+  border-top: 1px solid #E5E7EB;
+  font-size: 12px;
+  color: #6B7280;
+  padding: 4px 8px;
+}
+
+QTextEdit, QPlainTextEdit, QListWidget {
+  background: #FFFFFF;
+  border: 1px solid #E5E7EB;
+  border-radius: 8px;
+}
+
+QToolButton {
+  background: transparent;
+  border: none;
+  padding: 4px;
+}
+
+QToolButton:hover {
+  background: rgba(14, 165, 233, 0.1);
+  border-radius: 6px;
+}
+
+QScrollArea { border: none; }
+
+#OnlineStatusLabel {
+  font-size: 12px;
+  color: #5F6368;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background-color: #F3F4F6;
+}
+"""
+
+
+class AppSettings:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.data: Dict[str, object] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            self.data = {}
+            return
+        try:
+            with self.path.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            self.data = payload if isinstance(payload, dict) else {}
+        except Exception:
+            self.data = {}
+
+    def get(self, key: str, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key: str, value) -> None:
+        self.data[key] = value
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("w", encoding="utf-8") as fh:
+                json.dump(self.data, fh, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
+class PandasFrameModel(QtCore.QAbstractTableModel):
+    def __init__(self, frame: "pd.DataFrame", parent=None) -> None:
+        super().__init__(parent)
+        self._frame = frame
+        self._columns = list(frame.columns)
+
+    def rowCount(self, parent=None):  # type: ignore[override]
+        return 0 if parent and parent.isValid() else len(self._frame)
+
+    def columnCount(self, parent=None):  # type: ignore[override]
+        return 0 if parent and parent.isValid() else len(self._columns)
+
+    def data(self, index, role=QtCore.Qt.DisplayRole):  # type: ignore[override]
+        if not index.isValid() or role not in (QtCore.Qt.DisplayRole, QtCore.Qt.EditRole):
+            return None
+        value = self._frame.iloc[index.row(), index.column()]
+        if pd is None:
+            return value
+        if pd.isna(value):
+            return ""
+        if isinstance(value, float):
+            return f"{value:.6f}".rstrip("0").rstrip(".")
+        return str(value)
+
+    def headerData(self, section, orientation, role=QtCore.Qt.DisplayRole):  # type: ignore[override]
+        if role != QtCore.Qt.DisplayRole:
+            return None
+        if orientation == QtCore.Qt.Horizontal:
+            try:
+                return self._columns[section]
+            except IndexError:
+                return None
+        return section + 1
+
+
+class FunctionThread(QtCore.QThread):
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int)
+
+    def __init__(
+        self,
+        fn,
+        *args,
+        progress_arg: Optional[str] = "progress_cb",
+        cancel_arg: Optional[str] = None,
+        result_adapter=None,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+        self._progress_arg = progress_arg
+        self._cancel_arg = cancel_arg
+        self._result_adapter = result_adapter
+
+    def _emit_progress(self, value) -> None:
+        try:
+            pct = int(float(value))
+        except Exception:
+            pct = 0
+        self.progress.emit(max(0, min(100, pct)))
+
+    def run(self) -> None:  # pragma: no cover - PyQt thread lifecycle
+        kwargs = dict(self._kwargs)
+        if self._progress_arg:
+            kwargs[self._progress_arg] = self._emit_progress
+        if self._cancel_arg:
+            kwargs[self._cancel_arg] = self.isInterruptionRequested
+        try:
+            result = self._fn(*self._args, **kwargs)
+            if self._result_adapter:
+                result = self._result_adapter(result)
+        except Exception as exc:  # pragma: no cover - surface to UI
+            self.error.emit(str(exc))
+            return
+        self.finished.emit(result)
+
+
+class _WorkerSignals(QtCore.QObject):
+    finished = QtCore.pyqtSignal(object)
+    error = QtCore.pyqtSignal(str)
+    progress = QtCore.pyqtSignal(int)
+
+
+class BackgroundTask(QtCore.QRunnable):
+    def __init__(self, fn, *args, **kwargs) -> None:
+        super().__init__()
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+        self.signals = _WorkerSignals()
+
+    @property
+    def finished(self):
+        return self.signals.finished
+
+    @property
+    def error(self):
+        return self.signals.error
+
+    @property
+    def progress(self):
+        return self.signals.progress
+
+    def _emit_progress(self, value) -> None:
+        try:
+            pct = int(float(value))
+        except Exception:
+            pct = 0
+        self.signals.progress.emit(max(0, min(100, pct)))
+
+    def run(self) -> None:  # pragma: no cover - QRunnable lifecycle
+        kwargs = dict(self._kwargs)
+        kwargs.setdefault("progress_cb", self._emit_progress)
+        try:
+            result = self._fn(*self._args, **kwargs)
+        except Exception as exc:  # pragma: no cover - surface to UI
+            self.signals.error.emit(str(exc))
+            return
+        self.signals.finished.emit(result)
+
+
+class FeaturePickDialog(QtWidgets.QDialog):
+    def __init__(self, features: List[str], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("选择特征列")
+        self.resize(420, 480)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.list_widget = QtWidgets.QListWidget(self)
+        self.list_widget.addItems(features)
+        self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+        layout.addWidget(self.list_widget)
+        btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(btn_box)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+
+    def selected(self) -> List[str]:
+        return [item.text() for item in self.list_widget.selectedItems()]
+
+
+class ResultsDashboard(QtWidgets.QGroupBox):
+    def __init__(self, parent=None):
+        super().__init__("结果仪表盘", parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.summary_label = QtWidgets.QLabel("暂无数据")
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+        grid = QtWidgets.QGridLayout()
+        layout.addLayout(grid)
+        self.metrics: Dict[str, QtWidgets.QLabel] = {}
+        names = [
+            ("total", "总流量"),
+            ("anomalies", "异常流"),
+            ("alerts", "高风险"),
+            ("last_update", "更新时间"),
+        ]
+        for idx, (key, label) in enumerate(names):
+            grid.addWidget(QtWidgets.QLabel(label + ":"), idx, 0)
+            value_label = QtWidgets.QLabel("-")
+            value_label.setObjectName(f"metric_{key}")
+            grid.addWidget(value_label, idx, 1)
+            self.metrics[key] = value_label
+
+    def update_summary(self, summary: Dict[str, object]) -> None:
+        if not summary:
+            self.summary_label.setText("暂无数据")
+            for widget in self.metrics.values():
+                widget.setText("-")
+            return
+        total = summary.get("total_flows", 0)
+        anomalies = summary.get("anomalies", 0)
+        self.summary_label.setText(f"总计 {total} 条流，其中 {anomalies} 条疑似异常")
+        self.metrics["total"].setText(str(total))
+        self.metrics["anomalies"].setText(str(anomalies))
+        self.metrics["alerts"].setText(str(summary.get("alerts", 0)))
+        ts = summary.get("last_update")
+        if ts:
+            self.metrics["last_update"].setText(str(ts))
+        else:
+            self.metrics["last_update"].setText("-")
+
+
+class AnomalyDetailDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("异常流详情")
+        self.resize(760, 520)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.table = QtWidgets.QTableWidget(self)
+        layout.addWidget(self.table)
+        self.annotation_box = QtWidgets.QPlainTextEdit(self)
+        layout.addWidget(self.annotation_box)
+        btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        layout.addWidget(btn_box)
+        btn_box.rejected.connect(self.reject)
+
+    def set_dataframe(self, df: "pd.DataFrame") -> None:
+        self.table.clear()
+        self.table.setRowCount(len(df))
+        self.table.setColumnCount(len(df.columns))
+        self.table.setHorizontalHeaderLabels([str(col) for col in df.columns])
+        for row_idx, (_, row) in enumerate(df.iterrows()):
+            for col_idx, value in enumerate(row):
+                self.table.setItem(row_idx, col_idx, QtWidgets.QTableWidgetItem(str(value)))
+
+    def set_annotation(self, text: str) -> None:
+        self.annotation_box.setPlainText(text)
+
+
+class ConfigEditorDialog(QtWidgets.QDialog):
+    def __init__(self, *, title: str, text: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(700, 520)
+        layout = QtWidgets.QVBoxLayout(self)
+        self.editor = QtWidgets.QPlainTextEdit(self)
+        self.editor.setPlainText(text)
+        layout.addWidget(self.editor)
+        btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+        layout.addWidget(btn_box)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+
+    def text(self) -> str:
+        return self.editor.toPlainText()
+
+
+class OnlineDetectionWorker(QtCore.QThread):
+    new_file = QtCore.pyqtSignal(str)
+    status = QtCore.pyqtSignal(str)
+    error = QtCore.pyqtSignal(str)
+    stopped = QtCore.pyqtSignal()
+
+    def __init__(self, watch_dir: str, poll_seconds: int = 5, parent=None):
+        super().__init__(parent)
+        self.watch_dir = Path(watch_dir)
+        self.poll_seconds = max(1, int(poll_seconds))
+        self._stop_flag = False
+        self._seen: Set[str] = set()
+
+    def stop(self) -> None:
+        self._stop_flag = True
+
+    def run(self) -> None:  # pragma: no cover - 线程逻辑难以单元测试
+        if not self.watch_dir.exists():
+            try:
+                self.watch_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as exc:
+                self.error.emit(f"无法创建监控目录：{exc}")
+                return
+        self.status.emit(f"监控目录：{self.watch_dir}")
+        patterns = ("*.pcap", "*.pcapng")
+        while not self._stop_flag:
+            try:
+                files: List[Path] = []
+                for pattern in patterns:
+                    files.extend(sorted(self.watch_dir.glob(pattern)))
+                for path in files:
+                    norm = str(path.resolve())
+                    if norm in self._seen:
+                        continue
+                    self._seen.add(norm)
+                    self.new_file.emit(norm)
+            except Exception as exc:
+                self.error.emit(str(exc))
+            for _ in range(self.poll_seconds * 10):
+                if self._stop_flag:
+                    break
+                self.msleep(100)
+        self.stopped.emit()
+
 def _resolve_data_base() -> Path:
     env = os.getenv("MALDET_DATA_DIR")
     if env and env.strip():
@@ -67,137 +494,6 @@ def _resolve_data_base() -> Path:
         fallback.mkdir(parents=True, exist_ok=True)
         return fallback.resolve()
 
-
-APP_STYLE = """
-/* 全局 */
-QWidget {
-  background-color: #F5F6FA;
-  font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI";
-  font-size: 14px;
-  color: #1F1F1F;
-}
-
-/* 顶部标题栏 */
-#TitleBar {
-  background: #F5F6FA;
-  border-bottom: 1px solid #E5E7EB;
-}
-#pageTitle {
-  font-family: "Microsoft YaHei UI", "PingFang SC", "Segoe UI";
-  font-size: 18px;
-  font-weight: 700;
-  color: #111827;
-}
-
-/* 卡片/分组 */
-QGroupBox {
-  border: 1px solid #E5E7EB;
-  border-radius: 10px;
-  margin-top: 12px;
-  background: #FFFFFF;
-}
-QGroupBox::title {
-  subcontrol-origin: margin;
-  left: 12px;
-  padding: 0 6px;
-  font-weight: 600;
-  color: #111827;
-}
-
-/* 输入控件 */
-QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {
-  background: #FFFFFF;
-  border: 1px solid #D1D5DB;
-  border-radius: 8px;
-  padding: 8px 10px;
-}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {
-  border: 1px solid #60A5FA;
-}
-
-/* 主按钮（执行类） */
-QPushButton {
-  background-color: #0EA5E9;
-  color: #FFFFFF;
-  border-radius: 10px;
-  padding: 8px 16px;
-  min-height: 38px;
-  border: 0;
-}
-QPushButton:hover { background-color: #38BDF8; }
-QPushButton:pressed { background-color: #0284C7; }
-QPushButton:disabled { background-color: #C7CDD4; color: #F9FAFB; }
-
-/* 次要按钮/分页按钮 */
-QPushButton#secondary {
-  background: #EEF1F6;
-  color: #111827;
-  border-radius: 10px;
-  padding: 8px 16px;
-  min-height: 38px;
-}
-QPushButton#secondary:hover { background: #E5EAF1; }
-QPushButton#secondary:pressed { background: #D9E0EA; }
-
-/* 表格 */
-QHeaderView::section {
-  background: #F3F4F6;
-  border: 1px solid #E5E7EB;
-  padding: 8px;
-  font-weight: 600;
-}
-QTableView {
-  background: #FFFFFF;
-  gridline-color: #E5E7EB;
-  border: 1px solid #E5E7EB;
-  border-radius: 8px;
-}
-
-/* 分隔条 */
-QSplitter::handle {
-  background-color: #E5E7EB;
-  width: 2px;
-}
-
-/* 状态栏 */
-QStatusBar {
-  background: #F3F4F6;
-  border-top: 1px solid #E5E7EB;
-  font-size: 12px;
-  color: #6B7280;
-  padding: 4px 8px;
-}
-
-/* 列表/文本区域 */
-QTextEdit, QPlainTextEdit, QListWidget {
-  background: #FFFFFF;
-  border: 1px solid #E5E7EB;
-  border-radius: 8px;
-}
-
-/* 工具按钮 & 滚动区 */
-QToolButton {
-  background: transparent;
-  border: none;
-  padding: 4px;
-}
-QToolButton:hover {
-  background: rgba(14, 165, 233, 0.1);
-  border-radius: 6px;
-}
-QScrollArea {
-  border: none;
-}
-
-/* 在线状态徽标 */
-#OnlineStatusLabel {
-  font-size: 12px;
-  color: #5F6368;
-  padding: 6px 8px;
-  border-radius: 6px;
-  background-color: #F3F4F6;
-}
-"""
 
 # 仅表格预览上限（全部数据都会落盘）
 PREVIEW_LIMIT_FOR_TABLE = 50
@@ -384,523 +680,6 @@ def _align_input_features(
     return aligned, info
 
 
-class AppSettings:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.data: dict[str, object] = {}
-        self._load()
-
-    def _load(self) -> None:
-        if not self.path.exists():
-            self.data = {}
-            return
-        try:
-            with open(self.path, "r", encoding="utf-8") as fh:
-                payload = json.load(fh)
-            if isinstance(payload, dict):
-                self.data = payload
-            else:
-                self.data = {}
-        except Exception:
-            self.data = {}
-
-    def get(self, key: str, default=None):
-        return self.data.get(key, default)
-
-    def set(self, key: str, value) -> None:
-        self.data[key] = value
-        self._save()
-
-    def _save(self) -> None:
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "w", encoding="utf-8") as fh:
-                json.dump(self.data, fh, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-# =============== 表格模型与行高亮 ===============
-class PandasFrameModel(QtCore.QAbstractTableModel):
-    def __init__(self, df: "pd.DataFrame", parent=None):
-        super().__init__(parent)
-        self._df = df if df is not None else pd.DataFrame()
-
-    def rowCount(self, p=QtCore.QModelIndex()):
-        return 0 if p.isValid() else len(self._df)
-
-    def columnCount(self, p=QtCore.QModelIndex()):
-        return 0 if p.isValid() else len(self._df.columns)
-
-    def data(self, idx, role=QtCore.Qt.DisplayRole):
-        if not idx.isValid():
-            return None
-        if role in (QtCore.Qt.DisplayRole, QtCore.Qt.ToolTipRole):
-            try:
-                v = self._df.iat[idx.row(), idx.column()]
-                if pd is not None and pd.isna(v):
-                    return ""
-                return "" if v is None else str(v)
-            except Exception:
-                return ""
-        return None
-
-    def headerData(self, sec, ori, role=QtCore.Qt.DisplayRole):
-        if role != QtCore.Qt.DisplayRole:
-            return None
-        if ori == QtCore.Qt.Horizontal:
-            try:
-                return str(self._df.columns[sec])
-            except Exception:
-                return str(sec)
-        return str(sec)
-
-
-# =============== 后台线程 ===============
-class InfoWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(object)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.kwargs = kwargs
-
-    def run(self):
-        try:
-            kw = dict(self.kwargs)
-            kw["progress_cb"] = self.progress.emit
-            kw["cancel_cb"] = self.isInterruptionRequested
-            df = info(**kw)
-            self.progress.emit(100)
-            self.finished.emit(df)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class FeatureWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(str)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-    def __init__(self, pcap_path, csv_path):
-        super().__init__()
-        self.pcap_path = pcap_path
-        self.csv_path = csv_path
-
-    def run(self):
-        try:
-            fe_single(self.pcap_path, self.csv_path, progress_cb=self.progress.emit)
-            self.finished.emit(self.csv_path)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class DirFeatureWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(list)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-    def __init__(self, split_dir, out_dir, workers=8):
-        super().__init__()
-        self.split_dir = split_dir
-        self.out_dir = out_dir
-        self.workers = workers
-
-    def run(self):
-        try:
-            csvs = fe_dir(self.split_dir, self.out_dir, workers=self.workers, progress_cb=self.progress.emit)
-            self.finished.emit(csvs)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class PreprocessWorker(QtCore.QThread):
-    finished = QtCore.pyqtSignal(object)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-    def __init__(self, feature_source, out_dir):
-        super().__init__()
-        self.feature_source = feature_source
-        self.out_dir = out_dir
-
-    def run(self):
-        try:
-            result = preprocess_dir(self.feature_source, self.out_dir, progress_cb=self.progress.emit)
-            self.finished.emit(result)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
-class WorkerSignals(QtCore.QObject):
-    finished = QtCore.pyqtSignal(object)
-    error = QtCore.pyqtSignal(str)
-    progress = QtCore.pyqtSignal(int)
-
-
-class BackgroundTask(QtCore.QRunnable):
-    def __init__(self, fn, *args, **kwargs):
-        super().__init__()
-        self._fn = fn
-        self._args = args
-        self._kwargs = kwargs
-        self.signals = WorkerSignals()
-
-    @property
-    def finished(self):
-        return self.signals.finished
-
-    @property
-    def error(self):
-        return self.signals.error
-
-    @property
-    def progress(self):
-        return self.signals.progress
-
-    def run(self):
-        kwargs = dict(self._kwargs)
-
-        def _emit_progress(value):
-            try:
-                value_int = int(float(value))
-            except Exception:
-                value_int = 0
-            self.signals.progress.emit(max(0, min(100, value_int)))
-
-        kwargs["progress_cb"] = _emit_progress
-        try:
-            result = self._fn(*self._args, **kwargs)
-        except Exception as exc:
-            self.signals.error.emit(str(exc))
-            return
-
-        self.signals.finished.emit(result)
-
-# ======= 交互式列选择（用于 scaler+model 场景）=======
-class FeaturePickDialog(QtWidgets.QDialog):
-    def __init__(self, all_columns: List[str], need_k: int, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"选择并排序特征列（需要 {need_k} 列）")
-        self.resize(700, 420)
-        lay = QtWidgets.QVBoxLayout(self)
-
-        info = QtWidgets.QLabel("左侧可用列 → 添加到右侧并拖动排序；必须与训练时列数一致。")
-        lay.addWidget(info)
-
-        body = QtWidgets.QHBoxLayout()
-        lay.addLayout(body)
-
-        self.list_all = QtWidgets.QListWidget()
-        self.list_all.addItems(all_columns)
-        self.list_all.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
-
-        mid = QtWidgets.QVBoxLayout()
-        btn_add = QtWidgets.QPushButton("→ 添加")
-        btn_remove = QtWidgets.QPushButton("← 移除")
-        btn_up = QtWidgets.QPushButton("上移")
-        btn_down = QtWidgets.QPushButton("下移")
-        mid.addStretch(1); mid.addWidget(btn_add); mid.addWidget(btn_remove); mid.addSpacing(10)
-        mid.addWidget(btn_up); mid.addWidget(btn_down); mid.addStretch(1)
-
-        self.list_sel = QtWidgets.QListWidget()
-        self.list_sel.setDragDropMode(QtWidgets.QAbstractItemView.InternalMove)
-
-        body.addWidget(self.list_all, 5)
-        body.addLayout(mid, 1)
-        body.addWidget(self.list_sel, 5)
-
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        lay.addWidget(btns)
-
-        self.need_k = need_k
-        btn_add.clicked.connect(self._add)
-        btn_remove.clicked.connect(self._remove)
-        btn_up.clicked.connect(lambda: self._move(-1))
-        btn_down.clicked.connect(lambda: self._move(1))
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-
-    def _add(self):
-        for it in self.list_all.selectedItems():
-            self.list_sel.addItem(it.text())
-
-    def _remove(self):
-        for it in self.list_sel.selectedItems():
-            self.list_sel.takeItem(self.list_sel.row(it))
-
-    def _move(self, d):
-        rows = [self.list_sel.row(it) for it in self.list_sel.selectedItems()]
-        if not rows: return
-        r = rows[0]
-        nr = r + d
-        if 0 <= nr < self.list_sel.count():
-            it = self.list_sel.takeItem(r)
-            self.list_sel.insertItem(nr, it)
-            self.list_sel.setCurrentRow(nr)
-
-    def selected_columns(self) -> List[str]:
-        return [self.list_sel.item(i).text() for i in range(self.list_sel.count())]
-
-    def accept(self):
-        sel = self.selected_columns()
-        if len(sel) != self.need_k:
-            QtWidgets.QMessageBox.warning(self, "列数不一致", f"当前选择 {len(sel)} 列，需要 {self.need_k} 列。")
-            return
-        super().accept()
-
-
-class ResultsDashboard(QtWidgets.QGroupBox):
-    def __init__(self, parent=None):
-        super().__init__("结果仪表盘", parent)
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(12, 8, 12, 12)
-        layout.setSpacing(6)
-
-        self.anomaly_bar = QtWidgets.QProgressBar()
-        self.anomaly_bar.setRange(0, 100)
-        self.anomaly_bar.setFormat("尚无结果")
-        layout.addWidget(QtWidgets.QLabel("异常占比"))
-        layout.addWidget(self.anomaly_bar)
-
-        self.training_compare = QtWidgets.QLabel("训练/当前比较尚未加载")
-        self.training_compare.setWordWrap(True)
-        layout.addWidget(self.training_compare)
-
-        self.metrics_label = QtWidgets.QLabel("Precision / Recall / F1 待更新")
-        self.metrics_label.setWordWrap(True)
-        layout.addWidget(self.metrics_label)
-
-        self.timeline_label = QtWidgets.QLabel("暂无风险趋势数据")
-        self.timeline_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.timeline_label.setMinimumHeight(140)
-        self.timeline_label.setStyleSheet("QLabel { border:1px solid #E6E9EF; border-radius:6px; background:#FFFFFF; }")
-        self.timeline_label.setScaledContents(True)
-        layout.addWidget(self.timeline_label)
-
-        self._timeline_path: Optional[str] = None
-
-    def update_metrics(self, analysis: Optional[dict], metadata: Optional[dict]) -> None:
-        ratio: Optional[float] = None
-        metrics = None
-        if isinstance(analysis, dict):
-            metrics = analysis.get("metrics") if isinstance(analysis.get("metrics"), dict) else None
-            if metrics:
-                ratio = metrics.get("malicious_ratio")
-        if ratio is not None:
-            self.anomaly_bar.setValue(int(np.clip(ratio, 0.0, 1.0) * 100))
-            self.anomaly_bar.setFormat(f"{ratio:.2%}")
-        else:
-            self.anomaly_bar.reset()
-            self.anomaly_bar.setFormat("尚无结果")
-
-        train_ratio = None
-        if isinstance(metadata, dict):
-            train_ratio = metadata.get("training_anomaly_ratio")
-        compare_lines = []
-        if train_ratio is not None:
-            compare_lines.append(f"训练异常占比：{float(train_ratio):.2%}")
-        if ratio is not None:
-            compare_lines.append(f"当前检测异常占比：{ratio:.2%}")
-        if isinstance(metadata, dict) and metadata.get("timestamp"):
-            compare_lines.append(f"模型时间：{metadata.get('timestamp')}")
-        self.training_compare.setText("\n".join(compare_lines) if compare_lines else "训练/当前比较尚未加载")
-
-        eval_block = None
-        if isinstance(metadata, dict) and isinstance(metadata.get("evaluation"), dict):
-            eval_block = metadata.get("evaluation")
-        if eval_block is None and metrics and isinstance(metrics.get("model_metrics"), dict):
-            eval_block = metrics.get("model_metrics")
-        if eval_block:
-            precision = float(eval_block.get("precision", 0.0))
-            recall = float(eval_block.get("recall", 0.0))
-            f1 = float(eval_block.get("f1", 0.0))
-            text = f"Precision：{precision:.2%}  Recall：{recall:.2%}  F1：{f1:.2%}"
-        else:
-            text = "Precision / Recall / F1 待更新"
-        if metrics:
-            roc_val = metrics.get("roc_auc")
-            pr_val = metrics.get("pr_auc")
-            if roc_val is not None or pr_val is not None:
-                parts = [text]
-                if roc_val is not None:
-                    parts.append(f"ROC AUC：{float(roc_val):.3f}")
-                if pr_val is not None:
-                    parts.append(f"PR AUC：{float(pr_val):.3f}")
-                text = "\n".join(parts)
-        self.metrics_label.setText(text)
-
-        timeline_path = None
-        if analysis:
-            timeline_path = analysis.get("timeline_plot")
-            if not timeline_path and metrics:
-                timeline_path = metrics.get("timeline_plot")
-        if timeline_path and os.path.exists(timeline_path):
-            if timeline_path != self._timeline_path:
-                pixmap = QtGui.QPixmap(timeline_path)
-                if not pixmap.isNull():
-                    self.timeline_label.setPixmap(pixmap)
-                    self.timeline_label.setText("")
-                    self._timeline_path = timeline_path
-        else:
-            self.timeline_label.setPixmap(QtGui.QPixmap())
-            self.timeline_label.setText("暂无风险趋势数据")
-            self._timeline_path = None
-
-
-class AnomalyDetailDialog(QtWidgets.QDialog):
-    annotation_saved = QtCore.pyqtSignal(float)
-
-    def __init__(self, record: Dict[str, object], parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("异常样本详情")
-        self.resize(720, 520)
-        self._record = record
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(6)
-
-        header = QtWidgets.QHBoxLayout()
-        header.addWidget(QtWidgets.QLabel("双击列可复制，支持筛选"))
-        self.notes_edit = QtWidgets.QLineEdit()
-        self.notes_edit.setPlaceholderText("标注备注（可选）")
-        header.addWidget(self.notes_edit)
-        layout.addLayout(header)
-
-        self.table = QtWidgets.QTableWidget(len(record), 2)
-        self.table.setHorizontalHeaderLabels(["字段", "值"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setStretchLastSection(True)
-        for row, (key, value) in enumerate(sorted(record.items())):
-            key_item = QtWidgets.QTableWidgetItem(str(key))
-            val_item = QtWidgets.QTableWidgetItem(str(value))
-            self.table.setItem(row, 0, key_item)
-            self.table.setItem(row, 1, val_item)
-        layout.addWidget(self.table)
-
-        btns = QtWidgets.QDialogButtonBox()
-        self.btn_mark_normal = btns.addButton("标注为正常", QtWidgets.QDialogButtonBox.ActionRole)
-        self.btn_mark_anomaly = btns.addButton("标注为异常", QtWidgets.QDialogButtonBox.ActionRole)
-        btns.addButton(QtWidgets.QDialogButtonBox.Close)
-        layout.addWidget(btns)
-
-        btns.rejected.connect(self.reject)
-        self.btn_mark_normal.clicked.connect(lambda: self._store_label(0.0))
-        self.btn_mark_anomaly.clicked.connect(lambda: self._store_label(1.0))
-
-    def _store_label(self, value: float) -> None:
-        try:
-            upsert_annotation(self._record, label=value, notes=self.notes_edit.text().strip() or None)
-            QtWidgets.QMessageBox.information(self, "标注成功", "已保存人工标注。")
-            self.annotation_saved.emit(value)
-            self.accept()
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "保存失败", f"无法写入标注：{exc}")
-
-
-class ConfigEditorDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("编辑全局配置 (YAML)")
-        self.resize(720, 540)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(6)
-
-        self.path = project_root() / "config" / "default.yaml"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-
-        layout.addWidget(QtWidgets.QLabel(f"配置文件：{self.path}"))
-        self.editor = QtWidgets.QPlainTextEdit()
-        layout.addWidget(self.editor, 1)
-
-        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
-        layout.addWidget(btns)
-
-        btn_reload = QtWidgets.QPushButton("重新加载")
-        btns.addButton(btn_reload, QtWidgets.QDialogButtonBox.ResetRole)
-
-        btns.accepted.connect(self._on_save)
-        btns.rejected.connect(self.reject)
-        btn_reload.clicked.connect(self._load)
-
-        self._load()
-
-    def _load(self) -> None:
-        try:
-            with open(self.path, "r", encoding="utf-8") as fh:
-                text = fh.read()
-        except FileNotFoundError:
-            text = yaml.safe_dump(load_config() or {}, allow_unicode=True, sort_keys=False)
-        self.editor.setPlainText(text)
-
-    def _on_save(self) -> None:
-        text = self.editor.toPlainText()
-        try:
-            yaml.safe_load(text or "{}")
-        except yaml.YAMLError as exc:
-            QtWidgets.QMessageBox.critical(self, "格式错误", f"YAML 解析失败：{exc}")
-            return
-        try:
-            with open(self.path, "w", encoding="utf-8") as fh:
-                fh.write(text)
-            if hasattr(load_config, "cache_clear"):
-                load_config.cache_clear()
-        except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "保存失败", f"无法写入配置：{exc}")
-            return
-        QtWidgets.QMessageBox.information(self, "已保存", "配置已保存。部分修改可能需重启生效。")
-        self.accept()
-
-
-class OnlineDetectionWorker(QtCore.QThread):
-    new_file = QtCore.pyqtSignal(str)
-    status = QtCore.pyqtSignal(str)
-    error = QtCore.pyqtSignal(str)
-    stopped = QtCore.pyqtSignal()
-
-    def __init__(self, watch_dir: str, poll_seconds: int = 5, parent=None):
-        super().__init__(parent)
-        self.watch_dir = Path(watch_dir)
-        self.poll_seconds = max(1, int(poll_seconds))
-        self._stop_flag = False
-        self._seen: Set[str] = set()
-
-    def stop(self) -> None:
-        self._stop_flag = True
-
-    def run(self) -> None:
-        if not self.watch_dir.exists():
-            try:
-                self.watch_dir.mkdir(parents=True, exist_ok=True)
-            except Exception as exc:
-                self.error.emit(f"无法创建监控目录：{exc}")
-                return
-        self.status.emit(f"监控目录：{self.watch_dir}")
-        patterns = ("*.pcap", "*.pcapng")
-        while not self._stop_flag:
-            try:
-                files: List[Path] = []
-                for pattern in patterns:
-                    files.extend(sorted(self.watch_dir.glob(pattern)))
-                for path in files:
-                    norm = str(path.resolve())
-                    if norm in self._seen:
-                        continue
-                    self._seen.add(norm)
-                    self.new_file.emit(norm)
-            except Exception as exc:
-                self.error.emit(str(exc))
-            for _ in range(self.poll_seconds * 10):
-                if self._stop_flag:
-                    break
-                self.msleep(100)
-        self.stopped.emit()
-
-
 # =============== 主 UI ===============
 class Ui_MainWindow(object):
     # --------- 基本结构 ----------
@@ -998,8 +777,10 @@ class Ui_MainWindow(object):
         self._csv_current_page: int = 1
 
         # worker
-        self.worker: Optional[InfoWorker] = None
-        self.preprocess_worker: Optional[PreprocessWorker] = None
+        self.worker: Optional[FunctionThread] = None
+        self.fe_worker: Optional[FunctionThread] = None
+        self.dir_fe_worker: Optional[FunctionThread] = None
+        self.preprocess_worker: Optional[FunctionThread] = None
         self.thread_pool = QtCore.QThreadPool.globalInstance()
         self._running_tasks: Set[BackgroundTask] = set()
 
@@ -1863,34 +1644,26 @@ class Ui_MainWindow(object):
         self.table_view.doubleClicked.connect(self._on_table_double_click)
 
     # --------- 路径小工具 ----------
+    _PATH_RESOLVERS = {
+        "_default_split_dir": "split",
+        "_default_results_dir": "results_analysis",
+        "_default_models_dir": "models",
+        "_default_csv_info_dir": "csv_info",
+        "_default_csv_feature_dir": "csv_feature",
+        "_analysis_out_dir": "results_analysis",
+        "_prediction_out_dir": "results_pred",
+        "_abnormal_out_dir": "results_abnormal",
+        "_preprocess_out_dir": "csv_preprocess",
+    }
+
     def _project_root(self):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    def _default_split_dir(self):
-        return str(PATHS["split"])
 
-    def _default_results_dir(self):
-        return str(PATHS["results_analysis"])
-
-    def _default_models_dir(self):
-        return str(PATHS["models"])
-
-    def _default_csv_info_dir(self):
-        return str(PATHS["csv_info"])
-
-    def _default_csv_feature_dir(self):
-        return str(PATHS["csv_feature"])
-
-    def _analysis_out_dir(self):
-        return str(PATHS["results_analysis"])
-
-    def _prediction_out_dir(self):
-        return str(PATHS["results_pred"])
-
-    def _abnormal_out_dir(self):
-        return str(PATHS["results_abnormal"])
-
-    def _preprocess_out_dir(self):
-        return str(PATHS["csv_preprocess"])
+    def __getattr__(self, name):
+        key = self._PATH_RESOLVERS.get(name)
+        if key:
+            return lambda key=key: str(PATHS[key])
+        raise AttributeError(name)
 
     def _current_memory_budget_bytes(self) -> Optional[int]:
         idx = self.memory_ceiling_combo.currentIndex()
@@ -2583,13 +2356,23 @@ class Ui_MainWindow(object):
         self._set_action_buttons_enabled(False)
         self.btn_view.setEnabled(False); self.set_button_progress(self.btn_view, 0)
 
-        self.worker = InfoWorker(
-            path=path, workers=workers,
-            mode=("all" if mode == "auto" and os.path.isdir(path) else ("file" if mode == "auto" and os.path.isfile(path) else mode)),
-            batch_size=batch, start_index=start,
+        self.worker = FunctionThread(
+            info,
+            path=path,
+            workers=workers,
+            mode=(
+                "all"
+                if mode == "auto" and os.path.isdir(path)
+                else ("file" if mode == "auto" and os.path.isfile(path) else mode)
+            ),
+            batch_size=batch,
+            start_index=start,
             files=file_list if os.path.isdir(path) else None,
-            proto_filter=proto, port_whitelist_text=wl, port_blacklist_text=bl,
+            proto_filter=proto,
+            port_whitelist_text=wl,
+            port_blacklist_text=bl,
             fast=True,
+            cancel_arg="cancel_cb",
         )
         self.worker.progress.connect(lambda p: self.set_button_progress(self.btn_view, p))
         self.worker.finished.connect(self._on_worker_finished)
@@ -2892,7 +2675,12 @@ class Ui_MainWindow(object):
         if os.path.isdir(path):
             self.display_result(f"[INFO] 目录特征提取：{path} -> {out_dir}")
             self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
-            self.dir_fe_worker = DirFeatureWorker(path, out_dir, workers=self.workers_spin.value())
+            self.dir_fe_worker = FunctionThread(
+                fe_dir,
+                path,
+                out_dir,
+                workers=self.workers_spin.value(),
+            )
             self.dir_fe_worker.progress.connect(lambda p: self.set_button_progress(self.btn_fe, p))
             self.dir_fe_worker.finished.connect(self._on_fe_dir_finished)
             self.dir_fe_worker.error.connect(self._on_fe_error)
@@ -2902,7 +2690,7 @@ class Ui_MainWindow(object):
             csv = os.path.join(out_dir, f"{base}_features_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
             self.display_result(f"[INFO] 单文件特征提取：{path} -> {csv}")
             self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
-            self.fe_worker = FeatureWorker(path, csv)
+            self.fe_worker = FunctionThread(fe_single, path, csv)
             self.fe_worker.progress.connect(lambda p: self.set_button_progress(self.btn_fe, p))
             self.fe_worker.finished.connect(self._on_fe_finished)
             self.fe_worker.error.connect(self._on_fe_error)
@@ -2973,7 +2761,11 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 数据预处理：{preview} -> {out_dir}")
         self._set_action_buttons_enabled(False)
         self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
-        self.preprocess_worker = PreprocessWorker(feature_source, out_dir)
+        self.preprocess_worker = FunctionThread(
+            preprocess_dir,
+            feature_source,
+            out_dir,
+        )
         self.preprocess_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
         self.preprocess_worker.finished.connect(self._on_preprocess_finished)
         self.preprocess_worker.error.connect(self._on_preprocess_error)
