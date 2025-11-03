@@ -41,6 +41,11 @@ except Exception:  # pragma: no cover - fallback for minimal environments
         "__source_file__",
         "__source_path__",
     }
+
+try:
+    from src.functions import summarize_prediction_labels
+except Exception:  # pragma: no cover - helper unavailable in minimal builds
+    summarize_prediction_labels = None  # type: ignore
 from src.functions.analyze_results import analyze_results as run_analysis
 from src.functions.preprocess import (
     preprocess_feature_dir as preprocess_dir,
@@ -3630,15 +3635,45 @@ class Ui_MainWindow(object):
 
             preds = model.predict(matrix)
             label_mapping = pipeline.get("label_mapping")
+            mapping: Optional[Dict[int, str]]
             if isinstance(label_mapping, dict):
-                labels = [label_mapping.get(int(value), str(value)) for value in preds]
+                mapping = {int(key): str(value) for key, value in label_mapping.items()}
             else:
-                labels = [str(value) for value in preds]
+                mapping = None
+
+            if summarize_prediction_labels is not None:
+                labels, anomaly_count, normal_count, status_text = summarize_prediction_labels(
+                    preds,
+                    mapping,
+                )
+            else:
+                labels = [
+                    mapping.get(int(value), str(value)) if mapping is not None else str(value)
+                    for value in preds
+                ]
+                anomaly_count = None
+                normal_count = None
+                status_text = None
+                if labels:
+                    abnormal = sum(1 for label in labels if str(label) == "异常")
+                    normal = sum(1 for label in labels if str(label) == "正常")
+                    if abnormal:
+                        anomaly_count = abnormal
+                        normal_count = normal
+                        status_text = "异常"
+                    elif normal:
+                        anomaly_count = 0
+                        normal_count = normal
+                        status_text = "正常"
 
             out_df = df.copy()
             out_df["prediction"] = [int(value) if isinstance(value, (int, np.integer)) else value for value in preds]
             out_df["prediction_label"] = labels
             out_df["malicious_score"] = [float(value) for value in np.asarray(scores, dtype=float)]
+            if status_text is not None:
+                out_df["prediction_status"] = [
+                    label if label in {"异常", "正常"} else status_text for label in labels
+                ]
 
             if output_dir is None:
                 output_dir = self._prediction_out_dir()
