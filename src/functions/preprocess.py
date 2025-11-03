@@ -15,7 +15,7 @@ except Exception:  # pragma: no cover - pandas 可能未安装
     pd = None  # type: ignore
 
 from .csv_utils import read_csv_flexible
-from .vectorizer import CSV_COLUMNS
+from .vectorizer import CSV_COLUMNS, CSV_READ_ENCODINGS
 
 ProgressCallback = Optional[Callable[[int], None]]
 FeatureSource = Union[str, Sequence[str]]
@@ -89,6 +89,88 @@ def _align_dataframe(frame: "pd.DataFrame") -> "pd.DataFrame":
     return df.loc[:, header]
 
 
+def _normalise_csv_record(record: Dict[str, object], header: Sequence[str]) -> Tuple[List[object], bool]:
+    """Normalise a CSV row without pandas and report whether it is labelled."""
+
+    aligned: List[object] = []
+    has_label = False
+
+    for column in header:
+        value = record.get(column)
+        if column in _STRING_COLUMNS:
+            aligned.append("" if value is None else str(value))
+        elif column == _LABEL_COLUMN:
+            label_value = "" if value is None else str(value)
+            has_label = bool(label_value.strip())
+            aligned.append(label_value)
+        else:
+            try:
+                aligned.append(float(value))
+            except (TypeError, ValueError):
+                aligned.append(0.0)
+
+    return aligned, has_label
+
+
+def _append_csv_file_without_pandas(
+    csv_path: str,
+    dataset_path: str,
+    header: Sequence[str],
+) -> Tuple[int, int]:
+    """Append normalised CSV rows to the dataset when pandas is absent."""
+
+    encoding_candidates = list(CSV_READ_ENCODINGS)
+    if None not in encoding_candidates:
+        encoding_candidates.append(None)
+
+    last_unicode_error: Optional[UnicodeDecodeError] = None
+    tried_encodings: List[str] = []
+
+    for encoding in encoding_candidates:
+        open_kwargs = {"newline": ""}
+        if encoding is not None:
+            open_kwargs["encoding"] = encoding
+
+        try:
+            with open(csv_path, **open_kwargs) as source_handle:
+                reader = csv.DictReader(source_handle)
+                if reader.fieldnames is None:
+                    return 0, 0
+
+                rows = 0
+                labeled_rows = 0
+                with open(dataset_path, "a", encoding="utf-8", newline="") as target_handle:
+                    writer = csv.writer(target_handle)
+                    for raw_row in reader:
+                        if not raw_row:
+                            continue
+                        # DictReader may include a ``None`` key for excess columns – ignore it.
+                        raw_row.pop(None, None)
+                        aligned_row, has_label = _normalise_csv_record(raw_row, header)
+                        writer.writerow(aligned_row)
+                        rows += 1
+                        if has_label:
+                            labeled_rows += 1
+
+                return rows, labeled_rows
+        except UnicodeDecodeError as exc:
+            tried_encodings.append(encoding or "<default>")
+            last_unicode_error = exc
+            continue
+
+    if last_unicode_error is not None:
+        detail = ", ".join(tried_encodings) or "未知编码"
+        raise UnicodeDecodeError(
+            last_unicode_error.encoding or "utf-8",
+            last_unicode_error.object,
+            last_unicode_error.start,
+            last_unicode_error.end,
+            f"无法读取 CSV（尝试编码: {detail}）",
+        ) from last_unicode_error
+
+    raise RuntimeError(f"无法读取 CSV 文件: {csv_path}")
+
+
 def preprocess_feature_dir(
     feature_dir: FeatureSource,
     output_dir: str,
@@ -96,9 +178,6 @@ def preprocess_feature_dir(
     progress_cb: ProgressCallback = None,
 ) -> Dict[str, object]:
     """批量读取特征 CSV，合并为单一且列顺序固定的数据集。"""
-
-    if pd is None:  # pragma: no cover - 仅在缺少 pandas 时触发
-        raise RuntimeError("pandas 未安装，无法执行数据预处理。")
 
     csv_files, resolved_source = _resolve_feature_sources(feature_dir)
     os.makedirs(output_dir, exist_ok=True)
@@ -127,17 +206,22 @@ def preprocess_feature_dir(
     labeled_rows = 0
     total_files = len(csv_files)
 
-    for index, csv_path in enumerate(csv_files, start=1):
-        df = read_csv_flexible(csv_path)
-        aligned = _align_dataframe(df)
-        aligned.to_csv(dataset_path, mode="a", header=False, index=False, encoding="utf-8")
+    use_pandas = pd is not None
 
-        rows = int(aligned.shape[0])
-        if rows:
-            label_series = aligned[_LABEL_COLUMN].astype(str)
-            labeled = int(label_series.str.strip().ne("").sum())
-        else:
-            labeled = 0
+    for index, csv_path in enumerate(csv_files, start=1):
+        if use_pandas:
+            df = read_csv_flexible(csv_path)
+            aligned = _align_dataframe(df)
+            aligned.to_csv(dataset_path, mode="a", header=False, index=False, encoding="utf-8")
+
+            rows = int(aligned.shape[0])
+            if rows:
+                label_series = aligned[_LABEL_COLUMN].astype(str)
+                labeled = int(label_series.str.strip().ne("").sum())
+            else:
+                labeled = 0
+        else:  # pragma: no cover - 仅在缺少 pandas 时运行
+            rows, labeled = _append_csv_file_without_pandas(csv_path, dataset_path, header)
 
         manifest_rows.append(
             {
