@@ -26,6 +26,7 @@ __all__ = [
     "train_unsupervised_on_split",
     "detect_pcap_with_model",
     "compute_risk_components",
+    "summarize_prediction_labels",
 ]
 
 
@@ -54,6 +55,9 @@ class DetectionResult:
     flows: List[Dict[str, object]]
     error: Optional[str] = None
     prediction_labels: Optional[List[str]] = None
+    status_text: Optional[str] = None
+    anomaly_count: Optional[int] = None
+    normal_count: Optional[int] = None
 
 
 DEFAULT_MODEL_PARAMS: Dict[str, Union[int, float, None]] = {
@@ -65,6 +69,33 @@ DEFAULT_MODEL_PARAMS: Dict[str, Union[int, float, None]] = {
 }
 
 MODEL_SCHEMA_VERSION = "2025.10"
+
+# Keywords used to interpret prediction labels as "正常" or "异常".
+_ANOMALY_KEYWORDS = {
+    "1",
+    "-1",
+    "attack",
+    "anomaly",
+    "anomalous",
+    "malicious",
+    "恶意",
+    "异常",
+    "是",
+    "yes",
+    "true",
+}
+
+_NORMAL_KEYWORDS = {
+    "0",
+    "benign",
+    "normal",
+    "legit",
+    "合法",
+    "正常",
+    "否",
+    "no",
+    "false",
+}
 
 # Columns that should be preserved when presenting prediction results in the UI.
 META_COLUMNS = {
@@ -248,6 +279,76 @@ def train_unsupervised_on_split(
     return result
 
 
+def _interpret_label_name(label: str) -> Optional[str]:
+    token = label.strip().lower()
+    if token in _ANOMALY_KEYWORDS:
+        return "异常"
+    if token in _NORMAL_KEYWORDS:
+        return "正常"
+    return None
+
+
+def _interpret_label_value(value: object) -> Optional[str]:
+    try:
+        int_value = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if int_value in (1, -1):
+        return "异常"
+    if int_value == 0:
+        return "正常"
+    return None
+
+
+def summarize_prediction_labels(
+    predictions: Iterable[object],
+    label_mapping: Optional[Dict[int, str]] = None,
+) -> Tuple[List[str], int, int, Optional[str]]:
+    """Normalise prediction labels and derive anomaly statistics."""
+
+    normalized_labels: List[str] = []
+    anomaly_count = 0
+    normal_count = 0
+
+    for value in predictions:
+        mapped: Optional[str] = None
+        if label_mapping is not None:
+            try:
+                mapped = label_mapping.get(int(value))
+            except (TypeError, ValueError):
+                mapped = None
+
+        label_name = mapped or str(value)
+
+        status = _interpret_label_name(label_name)
+        if status is None:
+            status = _interpret_label_value(value)
+
+        if status == "异常":
+            anomaly_count += 1
+            normalized_labels.append("异常")
+        elif status == "正常":
+            normal_count += 1
+            normalized_labels.append("正常")
+        else:
+            normalized_labels.append(label_name)
+            inferred = _interpret_label_value(value)
+            if inferred == "异常":
+                anomaly_count += 1
+            elif inferred == "正常":
+                normal_count += 1
+
+    status_text: Optional[str]
+    if anomaly_count > 0:
+        status_text = "异常"
+    elif normalized_labels:
+        status_text = "正常"
+    else:
+        status_text = None
+
+    return normalized_labels, anomaly_count, normal_count, status_text
+
+
 def _load_model_artifact(
     model_path: Union[str, Path]
 ) -> Tuple[HistGradientBoostingClassifier, List[str], Optional[Dict[int, str]]]:
@@ -280,6 +381,9 @@ def detect_pcap_with_model(
             flows=[],
             error=result.get("error"),
             prediction_labels=None,
+            status_text=None,
+            anomaly_count=0,
+            normal_count=0,
         )
 
     flows = [dict(flow) for flow in result.get("flows", [])]
@@ -297,6 +401,9 @@ def detect_pcap_with_model(
             scores=[],
             flows=[],
             prediction_labels=[],
+            status_text="正常",
+            anomaly_count=0,
+            normal_count=0,
         )
 
     X = vectorized.matrix
@@ -313,12 +420,10 @@ def detect_pcap_with_model(
         scores = model.predict(X)
 
     predictions = model.predict(X)
-    prediction_labels: List[str] = []
-    if label_mapping:
-        for value in predictions:
-            prediction_labels.append(label_mapping.get(int(value), str(value)))
-    else:
-        prediction_labels = [str(value) for value in predictions]
+    prediction_labels, anomaly_count, normal_count, status_text = summarize_prediction_labels(
+        predictions,
+        label_mapping,
+    )
 
     annotated_flows: List[Dict[str, object]] = []
     for flow, label, label_name, score in zip(flows, predictions, prediction_labels, scores):
@@ -326,6 +431,10 @@ def detect_pcap_with_model(
         annotated["prediction"] = int(label)
         annotated["prediction_label"] = label_name
         annotated["malicious_score"] = float(score)
+        if label_name in {"异常", "正常"}:
+            annotated["prediction_status"] = label_name
+        elif status_text is not None:
+            annotated["prediction_status"] = status_text
         annotated_flows.append(annotated)
 
     return DetectionResult(
@@ -337,6 +446,9 @@ def detect_pcap_with_model(
         scores=[float(value) for value in scores],
         flows=annotated_flows,
         prediction_labels=prediction_labels,
+        status_text=status_text,
+        anomaly_count=anomaly_count,
+        normal_count=normal_count,
     )
 
 

@@ -6,7 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 try:  # Optional heavy dependencies. Provide graceful degradation when absent.
     import numpy as np  # type: ignore
@@ -37,6 +37,7 @@ from src.functions.csv_utils import read_csv_flexible
 try:
     from src.functions.unsupervised_train import (
         compute_risk_components,
+        summarize_prediction_labels,
         train_unsupervised_on_split,
     )
 except ModuleNotFoundError:  # pragma: no cover - triggered in lightweight envs
@@ -46,6 +47,30 @@ except ModuleNotFoundError:  # pragma: no cover - triggered in lightweight envs
         train_unsupervised_on_split,
         load_simple_model,
     )
+    def summarize_prediction_labels(
+        predictions: Iterable[object],
+        label_mapping: Optional[Dict[int, str]] = None,
+    ) -> Tuple[List[str], int, int, Optional[str]]:
+        labels: List[str] = []
+        anomaly_count = 0
+        for value in predictions:
+            mapped = None
+            if label_mapping is not None:
+                try:
+                    mapped = label_mapping.get(int(value))
+                except (TypeError, ValueError):
+                    mapped = None
+            label = mapped or str(value)
+            labels.append(label)
+            try:
+                ivalue = int(value)
+            except (TypeError, ValueError):
+                continue
+            if ivalue in (1, -1):
+                anomaly_count += 1
+        normal_count = max(len(labels) - anomaly_count, 0)
+        status = "异常" if anomaly_count > 0 else ("正常" if labels else None)
+        return labels, anomaly_count, normal_count, status
 else:
     from src.functions.simple_unsupervised import (
         simple_predict,
@@ -93,7 +118,7 @@ def _run_prediction(
     *,
     metadata_path: Optional[str] = None,
     output_path: Optional[str] = None,
-) -> str:
+) -> Dict[str, object]:
     if not os.path.exists(pipeline_path):
         raise FileNotFoundError(f"未找到模型管线: {pipeline_path}")
     if not os.path.exists(feature_csv):
@@ -106,6 +131,12 @@ def _run_prediction(
             feature_csv,
             output_path=output_path,
         )
+        result_info: Dict[str, object] = {
+            "output_path": output_path,
+            "status_text": None,
+            "anomaly_count": None,
+            "normal_count": None,
+        }
     else:
         if joblib_load is None or pd is None or np is None:
             raise RuntimeError(
@@ -153,20 +184,30 @@ def _run_prediction(
 
             preds = model.predict(matrix)
             label_mapping = pipeline.get("label_mapping")
-            if label_mapping:
-                labels = [label_mapping.get(int(value), str(value)) for value in preds]
-            else:
-                labels = [str(value) for value in preds]
+            labels, anomaly_count, normal_count, status_text = summarize_prediction_labels(
+                preds,
+                label_mapping if isinstance(label_mapping, dict) else None,
+            )
 
             output_df = df.copy()
             output_df["prediction"] = preds
             output_df["prediction_label"] = labels
             output_df["malicious_score"] = scores
+            if status_text is not None:
+                output_df["prediction_status"] = [
+                    label if label in {"异常", "正常"} else status_text for label in labels
+                ]
 
             if output_path is None:
                 base = Path(feature_csv).with_suffix("")
                 output_path = str(base) + "_predictions.csv"
             output_df.to_csv(output_path, index=False, encoding="utf-8")
+            result_info = {
+                "output_path": output_path,
+                "status_text": status_text,
+                "anomaly_count": anomaly_count,
+                "normal_count": normal_count,
+            }
         else:
             metadata: Dict[str, object] = {}
             if metadata_path and os.path.exists(metadata_path):
@@ -232,15 +273,27 @@ def _run_prediction(
                 output_path = str(base) + "_predictions.csv"
             output_df.to_csv(output_path, index=False, encoding="utf-8")
 
+            anomaly_count = int((preds == -1).sum())
+            normal_count = int(len(preds) - anomaly_count)
+            status_text = "异常" if anomaly_count > 0 else ("正常" if len(preds) > 0 else None)
+            result_info = {
+                "output_path": output_path,
+                "status_text": status_text,
+                "anomaly_count": anomaly_count,
+                "normal_count": normal_count,
+            }
+
     log_model_event(
         "cli.predict",
         {
             "pipeline_path": pipeline_path,
             "feature_csv": feature_csv,
-            "output_path": output_path,
+            "output_path": result_info.get("output_path"),
+            "status_text": result_info.get("status_text"),
+            "anomaly_count": result_info.get("anomaly_count"),
         },
     )
-    return output_path
+    return result_info
 
 
 def _handle_extract(args: argparse.Namespace) -> int:
@@ -303,12 +356,21 @@ def _handle_train(args: argparse.Namespace) -> int:
 
 
 def _handle_predict(args: argparse.Namespace) -> int:
-    output_path = _run_prediction(
+    result = _run_prediction(
         args.pipeline,
         args.features,
         metadata_path=args.metadata,
         output_path=args.output,
     )
+    status_text = result.get("status_text") if isinstance(result, dict) else None
+    if status_text:
+        anomaly = result.get("anomaly_count") if isinstance(result, dict) else None
+        normal = result.get("normal_count") if isinstance(result, dict) else None
+        if isinstance(anomaly, int) and isinstance(normal, int):
+            print(f"预测结果：{status_text}（异常 {anomaly} / 正常 {normal}）")
+        else:
+            print(f"预测结果：{status_text}")
+    output_path = result.get("output_path") if isinstance(result, dict) else result
     print(output_path)
     return 0
 
