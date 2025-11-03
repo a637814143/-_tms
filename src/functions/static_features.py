@@ -93,14 +93,23 @@ class ThreadSafeFileWriter:
         self.close()
 
 
-def extract_pcap_features(pcap_path: Union[str, Path], progress_callback=None) -> Dict[str, object]:
+def extract_pcap_features(
+    pcap_path: Union[str, Path],
+    progress_callback=None,
+    *,
+    fast: bool = False,
+    **kwargs,
+) -> Dict[str, object]:
     """Extract CIC-style flow statistics for a single PCAP file."""
 
     pcap_path = Path(pcap_path)
     progress_callback = progress_callback or (lambda *_: None)
 
     try:
-        flows = extract_flow_features(pcap_path)
+        if kwargs:
+            kwargs.clear()
+
+        flows = extract_flow_features(pcap_path, fast=fast)
         progress_callback(100)
         return {
             "success": True,
@@ -123,6 +132,8 @@ def extract_pcap_features_batch(
     max_workers: Optional[int] = None,
     progress_callback=None,
     text_callback=None,
+    fast: bool = False,
+    **kwargs,
 ) -> List[Dict[str, object]]:
     """Parallel feature extraction over multiple PCAP files."""
 
@@ -130,11 +141,19 @@ def extract_pcap_features_batch(
     tracker = ThreadSafeProgressTracker(len(paths), progress_callback, text_callback)
     results: List[Dict[str, object]] = []
 
+    if kwargs:
+        kwargs.clear()
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {}
         for path in paths:
             callback = lambda progress, name=path.name: tracker.update_progress(progress, name)
-            future = executor.submit(extract_pcap_features, path, callback)
+            future = executor.submit(
+                extract_pcap_features,
+                path,
+                callback,
+                fast=fast,
+            )
             future_map[future] = path
         for future in as_completed(future_map):
             path = future_map[future]

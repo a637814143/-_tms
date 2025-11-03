@@ -155,19 +155,28 @@ def extract_features(
     output_csv: str,
     packet_index: Optional[int] = None,
     progress_cb=None,
+    *,
+    fast: bool = False,
+    **kwargs,
 ) -> str:
     """Extract flow features and export them to a CSV file.
 
     The ``packet_index`` argument is accepted for backwards compatibility but
     currently ignored – the modern extractor always exports all flows for the
-    given PCAP file.
+    given PCAP file. When ``fast`` is true a lightweight feature set is
+    produced, skipping expensive statistical calculations while keeping the
+    canonical columns available for downstream consumers.
     """
 
     path = Path(pcap_path)
     if not path.exists():
         raise FileNotFoundError(f"pcap 不存在: {pcap_path}")
 
-    result = extract_pcap_features(path)
+    if kwargs:
+        # absorb legacy/unknown parameters for forwards compatibility
+        kwargs.clear()
+
+    result = extract_pcap_features(path, fast=fast)
     if not result.get("success", False):
         raise RuntimeError(result.get("error", "特征提取失败"))
 
@@ -189,12 +198,18 @@ def extract_features_dir(
     out_dir: str,
     workers: int = 4,
     progress_cb=None,
+    *,
+    fast: bool = False,
+    **kwargs,
 ) -> List[str]:
     """Batch extract features for every PCAP/PCAPNG inside ``split_dir``."""
 
     directory = Path(split_dir)
     if not directory.is_dir():
         raise FileNotFoundError(f"目录不存在: {split_dir}")
+
+    if kwargs:
+        kwargs.clear()
 
     inputs = [
         path
@@ -218,7 +233,12 @@ def extract_features_dir(
 
     def _process(path: Path) -> str:
         target = output_dir / f"{path.stem}_features.csv"
-        return extract_features(str(path), str(target), progress_cb=None)
+        return extract_features(
+            str(path),
+            str(target),
+            progress_cb=None,
+            fast=fast,
+        )
 
     if workers and workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as executor:
