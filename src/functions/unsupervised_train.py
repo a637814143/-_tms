@@ -189,7 +189,7 @@ def _prepare_metadata(
     model_path: Path,
     models_dir: Path,
     timestamp: str,
-) -> Tuple[dict, Path, Path]:
+) -> Tuple[dict, Path, Path, Path]:
     """Construct and persist metadata compatible with the existing UI."""
 
     metadata = {
@@ -219,7 +219,14 @@ def _prepare_metadata(
     latest_pipeline = models_dir / "latest_iforest_pipeline.joblib"
     shutil.copyfile(model_path, latest_pipeline)
 
-    return metadata, metadata_path, latest_meta
+    canonical_model = models_dir / "model.joblib"
+    canonical_model.parent.mkdir(parents=True, exist_ok=True)
+    if canonical_model.resolve() != model_path.resolve():
+        shutil.copyfile(model_path, canonical_model)
+
+    metadata["pipeline_canonical"] = canonical_model.name
+
+    return metadata, metadata_path, latest_meta, canonical_model
 
 
 def train_unsupervised_on_split(
@@ -244,7 +251,7 @@ def train_unsupervised_on_split(
 
     summary = train_hist_gradient_boosting(dataset_path, model_path, **model_kwargs)
 
-    metadata, metadata_path, latest_meta = _prepare_metadata(
+    metadata, metadata_path, latest_meta, canonical_model = _prepare_metadata(
         summary,
         dataset_path=dataset_path,
         model_path=model_path,
@@ -258,6 +265,7 @@ def train_unsupervised_on_split(
         "pipeline_latest": str(model_path),
         "metadata_path": str(metadata_path),
         "metadata_latest": str(latest_meta),
+        "model_joblib": str(canonical_model),
         "results_csv": None,
         "summary_csv": None,
         "scaler_path": None,
