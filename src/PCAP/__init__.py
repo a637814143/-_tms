@@ -1,12 +1,10 @@
-"""Backwards-compatible thin wrappers for PCAP modeling helpers."""
+"""PCAP modeling package aggregating training and inference helpers."""
 
-from __future__ import annotations
-
-from src.PCAP.modeling import (
+from .modeling import (
     DEFAULT_MODEL_PARAMS,
     DetectionResult,
-    META_COLUMNS,
     MODEL_SCHEMA_VERSION,
+    META_COLUMNS,
     TrainingSummary,
     compute_risk_components,
     detect_pcap_with_model,
@@ -18,8 +16,8 @@ from src.PCAP.modeling import (
 __all__ = [
     "DEFAULT_MODEL_PARAMS",
     "DetectionResult",
-    "META_COLUMNS",
     "MODEL_SCHEMA_VERSION",
+    "META_COLUMNS",
     "TrainingSummary",
     "compute_risk_components",
     "detect_pcap_with_model",
