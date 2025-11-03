@@ -32,6 +32,7 @@ _safe_export(
         "DEFAULT_MODEL_PARAMS",
         "META_COLUMNS",
         "compute_risk_components",
+        "summarize_prediction_labels",
     ),
 )
 

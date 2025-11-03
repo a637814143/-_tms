@@ -9,6 +9,7 @@ from .unsupervised_train import (
     TrainingSummary,
     compute_risk_components,
     detect_pcap_with_model,
+    summarize_prediction_labels,
     train_hist_gradient_boosting,
     train_unsupervised_on_split,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "TrainingSummary",
     "compute_risk_components",
     "detect_pcap_with_model",
+    "summarize_prediction_labels",
     "train_hist_gradient_boosting",
     "train_unsupervised_on_split",
 ]
