@@ -3913,19 +3913,20 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.warning(None, "缺少依赖", "当前环境未安装 pandas，无法执行预测。")
             return
 
-        start_dir = self._default_csv_feature_dir()
-        file_path, selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+        preferred_pcap_dir = r"D:\pythonProject8\data\split"
+        start_dir = preferred_pcap_dir if os.path.exists(preferred_pcap_dir) else self._default_split_dir()
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
             None,
-            "选择特征CSV或PCAP",
+            "选择 PCAP 文件",
             start_dir,
-            "CSV (*.csv);;PCAP (*.pcap *.pcapng);;所有文件 (*)",
+            "PCAP (*.pcap *.pcapng);;所有文件 (*)",
         )
 
         if file_path:
             chosen_path = file_path
         else:
             dir_path = QtWidgets.QFileDialog.getExistingDirectory(
-                None, "选择特征或 PCAP 所在目录", start_dir
+                None, "选择 PCAP 所在目录", start_dir
             )
             if not dir_path:
                 return
@@ -3942,62 +3943,22 @@ class Ui_MainWindow(object):
         metadata_override = self._selected_metadata if isinstance(self._selected_metadata, dict) else None
 
         if os.path.isdir(chosen_path):
-            csv_candidates = [
-                os.path.join(chosen_path, name)
-                for name in os.listdir(chosen_path)
-                if name.lower().endswith(".csv")
-            ]
             pcap_candidates = self._list_sorted(chosen_path)
 
-            if csv_candidates and not pcap_candidates:
-                # 若目录中只有 CSV，则提示选择具体文件
-                csv_file, _ = QtWidgets.QFileDialog.getOpenFileName(
-                    None,
-                    "选择目录中的特征CSV",
-                    chosen_path,
-                    "CSV (*.csv);;所有文件 (*)",
-                )
-                if not csv_file:
-                    return
-                chosen_path = csv_file
-            elif pcap_candidates and not csv_candidates:
-                self._remember_path(chosen_path)
-                self._predict_pcap_batch(
-                    pcap_candidates,
-                    metadata_override=metadata_override,
-                )
-                return
-            elif pcap_candidates and csv_candidates:
-                choice = QtWidgets.QMessageBox.question(
-                    None,
-                    "选择预测模式",
-                    "该目录同时包含特征 CSV 和 PCAP 文件。\n是要按 PCAP 逐个检测吗?",
-                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-                    QtWidgets.QMessageBox.Yes,
-                )
-                if choice == QtWidgets.QMessageBox.Yes:
-                    self._remember_path(chosen_path)
-                    self._predict_pcap_batch(
-                        pcap_candidates,
-                        metadata_override=metadata_override,
-                    )
-                    return
-                csv_file, _ = QtWidgets.QFileDialog.getOpenFileName(
-                    None,
-                    "选择特征CSV",
-                    chosen_path,
-                    "CSV (*.csv);;所有文件 (*)",
-                )
-                if not csv_file:
-                    return
-                chosen_path = csv_file
-            else:
+            if not pcap_candidates:
                 QtWidgets.QMessageBox.information(
                     None,
                     "未发现数据",
-                    "所选目录既没有特征 CSV 也没有 PCAP 文件。",
+                    "所选目录没有可用的 PCAP 文件。",
                 )
                 return
+
+            self._remember_path(chosen_path)
+            self._predict_pcap_batch(
+                pcap_candidates,
+                metadata_override=metadata_override,
+            )
+            return
 
         if not os.path.isdir(chosen_path):
             self._remember_path(chosen_path)
