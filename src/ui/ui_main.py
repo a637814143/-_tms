@@ -3607,6 +3607,70 @@ class Ui_MainWindow(object):
                     "模型管线的特征列顺序与训练时不一致，请重新训练或重新选择模型。"
                 )
 
+        if isinstance(pipeline, dict) and "model" in pipeline and "feature_names" in pipeline:
+            feature_names = [str(name) for name in pipeline.get("feature_names", [])]
+            if not feature_names:
+                feature_names = list(expected_order)
+            if feature_names and expected_order and list(feature_names) != list(expected_order):
+                feature_df_raw = feature_df_raw.loc[:, feature_names]
+            matrix = feature_df_raw.loc[:, feature_names].to_numpy(dtype=np.float64, copy=False)
+
+            model = pipeline["model"]
+            if hasattr(model, "predict_proba"):
+                proba = model.predict_proba(matrix)
+                scores = proba.max(axis=1)
+            elif hasattr(model, "decision_function"):
+                decision = model.decision_function(matrix)
+                if np.ndim(decision) == 1:
+                    scores = 1.0 / (1.0 + np.exp(-decision))
+                else:
+                    scores = decision.max(axis=1)
+            else:
+                scores = model.predict(matrix)
+
+            preds = model.predict(matrix)
+            label_mapping = pipeline.get("label_mapping")
+            if isinstance(label_mapping, dict):
+                labels = [label_mapping.get(int(value), str(value)) for value in preds]
+            else:
+                labels = [str(value) for value in preds]
+
+            out_df = df.copy()
+            out_df["prediction"] = [int(value) if isinstance(value, (int, np.integer)) else value for value in preds]
+            out_df["prediction_label"] = labels
+            out_df["malicious_score"] = [float(value) for value in np.asarray(scores, dtype=float)]
+
+            if output_dir is None:
+                output_dir = self._prediction_out_dir()
+            os.makedirs(output_dir, exist_ok=True)
+            safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in source_name)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_csv = os.path.join(output_dir, f"prediction_{safe_name}_{stamp}.csv")
+            out_df.to_csv(out_csv, index=False, encoding="utf-8")
+
+            summary_lines = [
+                f"模型预测完成：{source_name}",
+                f"输出行数：{len(out_df)}",
+            ]
+            messages.extend(summary_lines)
+            if not silent:
+                for msg in summary_lines:
+                    self.display_result(f"[INFO] {msg}")
+
+            return {
+                "output_csv": out_csv,
+                "dataframe": out_df,
+                "summary": summary_lines,
+                "messages": messages,
+                "metadata": metadata,
+                "malicious": None,
+                "total": int(len(out_df)),
+                "ratio": None,
+                "predictions": [int(value) if isinstance(value, (int, np.integer)) else value for value in preds],
+                "scores": [float(value) for value in np.asarray(scores, dtype=float)],
+                "labels": labels,
+            }
+
         models_dir = self._default_models_dir()
         preproc_candidates: List[str] = []
         if isinstance(metadata, dict):
