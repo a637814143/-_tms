@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -17,7 +20,9 @@ __all__ = [
     "TrainingSummary",
     "DetectionResult",
     "DEFAULT_MODEL_PARAMS",
+    "MODEL_SCHEMA_VERSION",
     "META_COLUMNS",
+    "train_hist_gradient_boosting",
     "train_unsupervised_on_split",
     "detect_pcap_with_model",
     "compute_risk_components",
@@ -59,6 +64,8 @@ DEFAULT_MODEL_PARAMS: Dict[str, Union[int, float, None]] = {
     "random_state": 1337,
 }
 
+MODEL_SCHEMA_VERSION = "2025.10"
+
 # Columns that should be preserved when presenting prediction results in the UI.
 META_COLUMNS = {
     "Flow ID",
@@ -71,7 +78,7 @@ META_COLUMNS = {
 }
 
 
-def train_unsupervised_on_split(
+def train_hist_gradient_boosting(
     dataset_path: Union[str, Path],
     model_path: Union[str, Path],
     **kwargs: Union[int, float, None],
@@ -114,6 +121,131 @@ def train_unsupervised_on_split(
         label_mapping=label_mapping,
         dropped_flows=int(stats.dropped_rows),
     )
+
+
+def _resolve_dataset_path(input_path: Union[str, Path]) -> Path:
+    """Resolve the dataset CSV path from a user-provided input."""
+
+    path = Path(input_path)
+    if not path.exists():
+        raise FileNotFoundError(f"找不到训练数据: {input_path}")
+
+    if path.is_file():
+        if path.suffix.lower() != ".csv":
+            raise ValueError("目前仅支持以 CSV 形式提供的训练数据。")
+        return path
+
+    candidates: List[Path] = []
+    preferred_tokens = ("vectorized", "feature", "train")
+    for child in path.glob("*.csv"):
+        lowered = child.name.lower()
+        if any(token in lowered for token in preferred_tokens):
+            candidates.append(child)
+    if not candidates:
+        candidates = list(path.glob("*.csv"))
+
+    if not candidates:
+        raise FileNotFoundError("指定目录中未找到任何 CSV 训练数据。")
+
+    candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _prepare_metadata(
+    summary: TrainingSummary,
+    *,
+    dataset_path: Path,
+    model_path: Path,
+    models_dir: Path,
+    timestamp: str,
+) -> Tuple[dict, Path, Path]:
+    """Construct and persist metadata compatible with the existing UI."""
+
+    metadata = {
+        "schema_version": MODEL_SCHEMA_VERSION,
+        "feature_order": summary.feature_names,
+        "feature_columns": summary.feature_names,
+        "feature_names_in": summary.feature_names,
+        "classes": summary.classes,
+        "label_mapping": summary.label_mapping,
+        "flow_count": summary.flow_count,
+        "dropped_flows": summary.dropped_flows,
+        "dataset_path": str(dataset_path),
+        "pipeline_path": f"iforest_pipeline_{timestamp}.joblib",
+        "pipeline_latest": f"iforest_pipeline_{timestamp}.joblib",
+        "timestamp": timestamp,
+        "model_type": "hist_gradient_boosting",
+    }
+
+    metadata_path = models_dir / f"iforest_metadata_{timestamp}.json"
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
+    latest_meta = models_dir / "latest_iforest_metadata.json"
+    shutil.copyfile(metadata_path, latest_meta)
+
+    latest_pipeline = models_dir / "latest_iforest_pipeline.joblib"
+    shutil.copyfile(model_path, latest_pipeline)
+
+    return metadata, metadata_path, latest_meta
+
+
+def train_unsupervised_on_split(
+    input_path: Union[str, Path],
+    results_dir: Optional[Union[str, Path]] = None,
+    models_dir: Optional[Union[str, Path]] = None,
+    **kwargs: Union[int, float, None],
+) -> Dict[str, object]:
+    """Compatibility wrapper used by the CLI/UI training entry points."""
+
+    dataset_path = _resolve_dataset_path(input_path)
+    models_root = Path(models_dir) if models_dir else dataset_path.parent
+    models_root.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    model_path = models_root / f"iforest_pipeline_{timestamp}.joblib"
+
+    model_kwargs: Dict[str, Union[int, float, None]] = {}
+    for key in DEFAULT_MODEL_PARAMS:
+        if key in kwargs and kwargs[key] is not None:
+            model_kwargs[key] = kwargs[key]
+
+    summary = train_hist_gradient_boosting(dataset_path, model_path, **model_kwargs)
+
+    metadata, metadata_path, latest_meta = _prepare_metadata(
+        summary,
+        dataset_path=dataset_path,
+        model_path=model_path,
+        models_dir=models_root,
+        timestamp=timestamp,
+    )
+
+    result: Dict[str, object] = {
+        "model_path": str(model_path),
+        "pipeline_path": str(model_path),
+        "pipeline_latest": str(model_path),
+        "metadata_path": str(metadata_path),
+        "metadata_latest": str(latest_meta),
+        "results_csv": None,
+        "summary_csv": None,
+        "scaler_path": None,
+        "flows": summary.flow_count,
+        "malicious": 0,
+        "feature_columns": summary.feature_names,
+        "classes": summary.classes,
+        "label_mapping": summary.label_mapping,
+        "dropped_flows": summary.dropped_flows,
+        "timestamp": timestamp,
+        "schema_version": MODEL_SCHEMA_VERSION,
+        "summary": summary,
+        "metadata": metadata,
+    }
+
+    if results_dir:
+        Path(results_dir).mkdir(parents=True, exist_ok=True)
+
+    return result
 
 
 def _load_model_artifact(

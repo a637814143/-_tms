@@ -120,69 +120,117 @@ def _run_prediction(
         if df.empty:
             raise RuntimeError("特征 CSV 为空，无法预测。")
 
-        metadata: Dict[str, object] = {}
-        if metadata_path and os.path.exists(metadata_path):
-            try:
-                with open(metadata_path, "r", encoding="utf-8") as fh:
-                    payload = json.load(fh)
-                if isinstance(payload, dict):
-                    metadata = payload
-            except Exception as exc:  # pragma: no cover - best effort
-                logger.warning("Failed to read metadata %s: %s", metadata_path, exc)
+        if isinstance(pipeline, dict) and "model" in pipeline and "feature_names" in pipeline:
+            feature_names = [str(name) for name in pipeline.get("feature_names", [])]
+            if not feature_names:
+                raise RuntimeError("模型缺少特征列描述，无法执行预测。")
 
-        detector = pipeline.named_steps.get("detector")
-        if detector is None:
-            raise RuntimeError("管线中缺少 detector 步骤。")
+            missing = [col for col in feature_names if col not in df.columns]
+            if missing:
+                sample = ", ".join(missing[:8])
+                more = " ..." if len(missing) > 8 else ""
+                raise RuntimeError(f"特征 CSV 缺少必要列: {sample}{more}")
 
-        transformed = pipeline[:-1].transform(df)
-        scores = detector.score_samples(transformed)
-        preds = detector.predict(transformed)
+            matrix = (
+                df.loc[:, feature_names]
+                .apply(pd.to_numeric, errors="coerce")
+                .fillna(0.0)
+                .to_numpy(dtype=np.float64, copy=False)
+            )
 
-        vote_ratio = detector.last_vote_ratio_
-        if vote_ratio is None and detector.fit_votes_:
-            vote_ratio = np.vstack(
-                [np.where(v == -1, 1.0, 0.0) for v in detector.fit_votes_.values()]
-            ).mean(axis=0)
-        if vote_ratio is None:
-            vote_ratio = np.ones_like(scores)
+            model = pipeline["model"]
+            if hasattr(model, "predict_proba"):
+                proba = model.predict_proba(matrix)
+                scores = proba.max(axis=1)
+            elif hasattr(model, "decision_function"):
+                decision = model.decision_function(matrix)
+                if np.ndim(decision) == 1:
+                    scores = 1.0 / (1.0 + np.exp(-decision))
+                else:
+                    scores = decision.max(axis=1)
+            else:
+                scores = model.predict(matrix)
 
-        threshold = metadata.get("threshold") if isinstance(metadata, dict) else None
-        if threshold is None and getattr(detector, "threshold_", None) is not None:
-            threshold = float(detector.threshold_)
-        elif threshold is None:
-            threshold = float(np.quantile(scores, 0.05))
+            preds = model.predict(matrix)
+            label_mapping = pipeline.get("label_mapping")
+            if label_mapping:
+                labels = [label_mapping.get(int(value), str(value)) for value in preds]
+            else:
+                labels = [str(value) for value in preds]
 
-        score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
-        if score_std is None:
-            score_std = float(np.std(scores) or 1.0)
+            output_df = df.copy()
+            output_df["prediction"] = preds
+            output_df["prediction_label"] = labels
+            output_df["malicious_score"] = scores
 
-        vote_threshold = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
-        if vote_threshold is None and getattr(detector, "vote_threshold_", None) is not None:
-            vote_threshold = float(detector.vote_threshold_)
-        elif vote_threshold is None:
-            vote_threshold = float(np.clip(np.mean(vote_ratio), 0.0, 1.0))
+            if output_path is None:
+                base = Path(feature_csv).with_suffix("")
+                output_path = str(base) + "_predictions.csv"
+            output_df.to_csv(output_path, index=False, encoding="utf-8")
+        else:
+            metadata: Dict[str, object] = {}
+            if metadata_path and os.path.exists(metadata_path):
+                try:
+                    with open(metadata_path, "r", encoding="utf-8") as fh:
+                        payload = json.load(fh)
+                    if isinstance(payload, dict):
+                        metadata = payload
+                except Exception as exc:  # pragma: no cover - best effort
+                    logger.warning("Failed to read metadata %s: %s", metadata_path, exc)
 
-        risk_score, score_component, vote_component = compute_risk_components(
-            scores,
-            vote_ratio,
-            float(threshold),
-            float(vote_threshold),
-            float(score_std),
-        )
+            detector = pipeline.named_steps.get("detector")
+            if detector is None:
+                raise RuntimeError("管线中缺少 detector 步骤。")
 
-        output_df = df.copy()
-        output_df["anomaly_score"] = scores
-        output_df["vote_ratio"] = vote_ratio
-        output_df["score_component"] = score_component
-        output_df["vote_component"] = vote_component
-        output_df["risk_score"] = risk_score
-        output_df["prediction"] = preds
-        output_df["is_malicious"] = (preds == -1).astype(int)
+            transformed = pipeline[:-1].transform(df)
+            scores = detector.score_samples(transformed)
+            preds = detector.predict(transformed)
 
-        if output_path is None:
-            base = Path(feature_csv).with_suffix("")
-            output_path = str(base) + "_predictions.csv"
-        output_df.to_csv(output_path, index=False, encoding="utf-8")
+            vote_ratio = detector.last_vote_ratio_
+            if vote_ratio is None and detector.fit_votes_:
+                vote_ratio = np.vstack(
+                    [np.where(v == -1, 1.0, 0.0) for v in detector.fit_votes_.values()]
+                ).mean(axis=0)
+            if vote_ratio is None:
+                vote_ratio = np.ones_like(scores)
+
+            threshold = metadata.get("threshold") if isinstance(metadata, dict) else None
+            if threshold is None and getattr(detector, "threshold_", None) is not None:
+                threshold = float(detector.threshold_)
+            elif threshold is None:
+                threshold = float(np.quantile(scores, 0.05))
+
+            score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
+            if score_std is None:
+                score_std = float(np.std(scores) or 1.0)
+
+            vote_threshold = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
+            if vote_threshold is None and getattr(detector, "vote_threshold_", None) is not None:
+                vote_threshold = float(detector.vote_threshold_)
+            elif vote_threshold is None:
+                vote_threshold = float(np.clip(np.mean(vote_ratio), 0.0, 1.0))
+
+            risk_score, score_component, vote_component = compute_risk_components(
+                scores,
+                vote_ratio,
+                float(threshold),
+                float(vote_threshold),
+                float(score_std),
+            )
+
+            output_df = df.copy()
+            output_df["anomaly_score"] = scores
+            output_df["vote_ratio"] = vote_ratio
+            output_df["score_component"] = score_component
+            output_df["vote_component"] = vote_component
+            output_df["risk_score"] = risk_score
+            output_df["prediction"] = preds
+            output_df["is_malicious"] = (preds == -1).astype(int)
+
+            if output_path is None:
+                base = Path(feature_csv).with_suffix("")
+                output_path = str(base) + "_predictions.csv"
+            output_df.to_csv(output_path, index=False, encoding="utf-8")
 
     log_model_event(
         "cli.predict",
