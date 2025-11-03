@@ -3648,10 +3648,21 @@ class Ui_MainWindow(object):
             out_csv = os.path.join(output_dir, f"prediction_{safe_name}_{stamp}.csv")
             out_df.to_csv(out_csv, index=False, encoding="utf-8")
 
+            total_rows = int(len(out_df))
             summary_lines = [
                 f"模型预测完成：{source_name}",
-                f"输出行数：{len(out_df)}",
+                f"输出行数：{total_rows}",
             ]
+            if status_text is not None:
+                summary_lines.append(f"分析结论：{status_text}")
+            ratio: Optional[float] = None
+            if anomaly_count is not None:
+                summary_line = f"异常数量：{int(anomaly_count)}"
+                if normal_count is not None:
+                    summary_line += f"，正常数量：{int(normal_count)}"
+                summary_lines.append(summary_line)
+                if total_rows:
+                    ratio = float(anomaly_count) / float(total_rows)
             messages.extend(summary_lines)
             if not silent:
                 for msg in summary_lines:
@@ -3663,9 +3674,12 @@ class Ui_MainWindow(object):
                 "summary": summary_lines,
                 "messages": messages,
                 "metadata": metadata,
-                "malicious": None,
-                "total": int(len(out_df)),
-                "ratio": None,
+                "malicious": int(anomaly_count) if anomaly_count is not None else None,
+                "total": total_rows,
+                "ratio": ratio,
+                "status_text": status_text,
+                "anomaly_count": int(anomaly_count) if anomaly_count is not None else None,
+                "normal_count": int(normal_count) if normal_count is not None else None,
                 "predictions": [int(value) if isinstance(value, (int, np.integer)) else value for value in preds],
                 "scores": [float(value) for value in np.asarray(scores, dtype=float)],
                 "labels": labels,
