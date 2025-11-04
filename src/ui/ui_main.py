@@ -23,7 +23,7 @@ from src.functions.feature_extractor import (
 )
 from src.functions.csv_utils import read_csv_flexible
 try:
-    from src.functions.unsupervised_train import (
+    from src.functions.modeling import (
         META_COLUMNS as TRAIN_META_COLUMNS,
         train_unsupervised_on_split as run_train,
     )
@@ -47,7 +47,7 @@ try:
 except Exception:  # pragma: no cover - helper unavailable in minimal builds
     summarize_prediction_labels = None  # type: ignore
 from src.functions.analyze_results import analyze_results as run_analysis
-from src.functions.preprocess import (
+from src.functions.vectorizer import (
     preprocess_feature_dir as preprocess_dir,
     FeatureSource,
 )

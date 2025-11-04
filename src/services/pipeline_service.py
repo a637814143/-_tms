@@ -35,7 +35,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
 from src.functions.logging_utils import get_logger, log_model_event
 from src.functions.csv_utils import read_csv_flexible
 try:
-    from src.functions.unsupervised_train import (
+    from src.functions.modeling import (
         compute_risk_components,
         summarize_prediction_labels,
         train_unsupervised_on_split,

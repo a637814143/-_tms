@@ -23,13 +23,16 @@ def _safe_export(module_name: str, symbols: Sequence[str]) -> None:
 
 
 _safe_export(
-    "unsupervised_train",
+    "modeling",
     (
         "DetectionResult",
         "TrainingSummary",
+        "ModelTrainer",
+        "ModelPredictor",
         "detect_pcap_with_model",
         "train_unsupervised_on_split",
         "DEFAULT_MODEL_PARAMS",
+        "MODEL_SCHEMA_VERSION",
         "META_COLUMNS",
         "compute_risk_components",
         "summarize_prediction_labels",
@@ -37,9 +40,11 @@ _safe_export(
 )
 
 _safe_export(
-    "static_features",
+    "feature_extractor",
     (
+        "FeatureExtractor",
         "extract_pcap_features",
+        "extract_pcap_features_to_file",
         "extract_sources_to_jsonl",
         "list_pcap_sources",
     ),
@@ -54,5 +59,8 @@ _safe_export(
         "vectorize_jsonl_files",
         "vectorize_flows",
         "vectorize_pcaps",
+        "DataPreprocessor",
+        "preprocess_feature_dir",
+        "FeatureSource",
     ),
 )

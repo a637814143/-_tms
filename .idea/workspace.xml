@@ -6,6 +6,16 @@
   <component name="ChangeListManager">
     <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/__init__.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/feature_extractor.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/feature_extractor.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/modeling.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/modeling.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/predict_unsupervised.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/preprocess.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/static_features.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/unsupervised_train.py" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/vectorizer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/vectorizer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/services/pipeline_service.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/services/pipeline_service.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/ui/ui_main.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/ui_main.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -214,14 +224,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1754543842572</updated>
-    </task>
-    <task id="LOCAL-00002" summary="Changes">
-      <option name="closed" value="true" />
-      <created>1761739932540</created>
-      <option name="number" value="00002" />
-      <option name="presentableId" value="LOCAL-00002" />
-      <option name="project" value="LOCAL" />
-      <updated>1761739932540</updated>
     </task>
     <task id="LOCAL-00003" summary="Changes">
       <option name="closed" value="true" />
@@ -607,7 +609,15 @@
       <option name="project" value="LOCAL" />
       <updated>1762261044645</updated>
     </task>
-    <option name="localTasksCounter" value="51" />
+    <task id="LOCAL-00051" summary="8888">
+      <option name="closed" value="true" />
+      <created>1762262566478</created>
+      <option name="number" value="00051" />
+      <option name="presentableId" value="LOCAL-00051" />
+      <option name="project" value="LOCAL" />
+      <updated>1762262566478</updated>
+    </task>
+    <option name="localTasksCounter" value="52" />
     <servers />
   </component>
   <component name="UnknownFeatures">
