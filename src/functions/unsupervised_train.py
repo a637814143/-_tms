@@ -100,6 +100,8 @@ def train_unsupervised_on_split(
 
     numeric_names = numeric_feature_names()
 
+    model_metadata_path = model_path.with_name("metadata.json")
+
     metadata: Dict[str, object] = {
         "schema_version": MODEL_SCHEMA_VERSION,
         "timestamp": timestamp_str,
@@ -111,6 +113,7 @@ def train_unsupervised_on_split(
         "label_mapping": summary.label_mapping or {},
         "contamination": kwargs.get("contamination"),
         "training_anomaly_ratio": kwargs.get("training_anomaly_ratio"),
+        "model_metadata_path": str(model_metadata_path),
     }
 
     metadata_path = models_root / f"iforest_metadata_{stamp_token}.json"
@@ -128,6 +131,7 @@ def train_unsupervised_on_split(
         "pipeline_latest": str(model_path),
         "metadata_path": str(metadata_path),
         "metadata_latest": str(latest_metadata_path),
+        "model_metadata_path": str(model_metadata_path),
         "model_joblib": str(model_path),
         "results_csv": None,
         "summary_csv": None,
