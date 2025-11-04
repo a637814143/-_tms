@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import json
-import shutil
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -55,9 +52,6 @@ class DetectionResult:
     flows: List[Dict[str, object]]
     error: Optional[str] = None
     prediction_labels: Optional[List[str]] = None
-    status_text: Optional[str] = None
-    anomaly_count: Optional[int] = None
-    normal_count: Optional[int] = None
 
 
 DEFAULT_MODEL_PARAMS: Dict[str, Union[int, float, None]] = {
@@ -182,53 +176,6 @@ def _resolve_dataset_path(input_path: Union[str, Path]) -> Path:
     return candidates[0]
 
 
-def _prepare_metadata(
-    summary: TrainingSummary,
-    *,
-    dataset_path: Path,
-    model_path: Path,
-    models_dir: Path,
-    timestamp: str,
-) -> Tuple[dict, Path, Path, Path]:
-    """Construct and persist metadata compatible with the existing UI."""
-
-    metadata = {
-        "schema_version": MODEL_SCHEMA_VERSION,
-        "feature_order": summary.feature_names,
-        "feature_columns": summary.feature_names,
-        "feature_names_in": summary.feature_names,
-        "classes": summary.classes,
-        "label_mapping": summary.label_mapping,
-        "flow_count": summary.flow_count,
-        "dropped_flows": summary.dropped_flows,
-        "dataset_path": str(dataset_path),
-        "pipeline_path": f"iforest_pipeline_{timestamp}.joblib",
-        "pipeline_latest": f"iforest_pipeline_{timestamp}.joblib",
-        "timestamp": timestamp,
-        "model_type": "hist_gradient_boosting",
-    }
-
-    metadata_path = models_dir / f"iforest_metadata_{timestamp}.json"
-    metadata_path.parent.mkdir(parents=True, exist_ok=True)
-    with metadata_path.open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, ensure_ascii=False, indent=2)
-
-    latest_meta = models_dir / "latest_iforest_metadata.json"
-    shutil.copyfile(metadata_path, latest_meta)
-
-    latest_pipeline = models_dir / "latest_iforest_pipeline.joblib"
-    shutil.copyfile(model_path, latest_pipeline)
-
-    canonical_model = models_dir / "model.joblib"
-    canonical_model.parent.mkdir(parents=True, exist_ok=True)
-    if canonical_model.resolve() != model_path.resolve():
-        shutil.copyfile(model_path, canonical_model)
-
-    metadata["pipeline_canonical"] = canonical_model.name
-
-    return metadata, metadata_path, latest_meta, canonical_model
-
-
 def train_unsupervised_on_split(
     input_path: Union[str, Path],
     results_dir: Optional[Union[str, Path]] = None,
@@ -241,8 +188,7 @@ def train_unsupervised_on_split(
     models_root = Path(models_dir) if models_dir else dataset_path.parent
     models_root.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    model_path = models_root / f"iforest_pipeline_{timestamp}.joblib"
+    model_path = models_root / "model.joblib"
 
     model_kwargs: Dict[str, Union[int, float, None]] = {}
     for key in DEFAULT_MODEL_PARAMS:
@@ -251,21 +197,13 @@ def train_unsupervised_on_split(
 
     summary = train_hist_gradient_boosting(dataset_path, model_path, **model_kwargs)
 
-    metadata, metadata_path, latest_meta, canonical_model = _prepare_metadata(
-        summary,
-        dataset_path=dataset_path,
-        model_path=model_path,
-        models_dir=models_root,
-        timestamp=timestamp,
-    )
-
     result: Dict[str, object] = {
         "model_path": str(model_path),
         "pipeline_path": str(model_path),
         "pipeline_latest": str(model_path),
-        "metadata_path": str(metadata_path),
-        "metadata_latest": str(latest_meta),
-        "model_joblib": str(canonical_model),
+        "metadata_path": None,
+        "metadata_latest": None,
+        "model_joblib": str(model_path),
         "results_csv": None,
         "summary_csv": None,
         "scaler_path": None,
@@ -275,10 +213,10 @@ def train_unsupervised_on_split(
         "classes": summary.classes,
         "label_mapping": summary.label_mapping,
         "dropped_flows": summary.dropped_flows,
-        "timestamp": timestamp,
+        "timestamp": None,
         "schema_version": MODEL_SCHEMA_VERSION,
         "summary": summary,
-        "metadata": metadata,
+        "metadata": None,
     }
 
     if results_dir:
@@ -389,9 +327,6 @@ def detect_pcap_with_model(
             flows=[],
             error=result.get("error"),
             prediction_labels=None,
-            status_text=None,
-            anomaly_count=0,
-            normal_count=0,
         )
 
     flows = [dict(flow) for flow in result.get("flows", [])]
@@ -409,9 +344,6 @@ def detect_pcap_with_model(
             scores=[],
             flows=[],
             prediction_labels=[],
-            status_text="正常",
-            anomaly_count=0,
-            normal_count=0,
         )
 
     X = vectorized.matrix
@@ -428,10 +360,12 @@ def detect_pcap_with_model(
         scores = model.predict(X)
 
     predictions = model.predict(X)
-    prediction_labels, anomaly_count, normal_count, status_text = summarize_prediction_labels(
-        predictions,
-        label_mapping,
-    )
+    prediction_labels: List[str] = []
+    if label_mapping:
+        for value in predictions:
+            prediction_labels.append(label_mapping.get(int(value), str(value)))
+    else:
+        prediction_labels = [str(value) for value in predictions]
 
     annotated_flows: List[Dict[str, object]] = []
     for flow, label, label_name, score in zip(flows, predictions, prediction_labels, scores):
@@ -439,10 +373,6 @@ def detect_pcap_with_model(
         annotated["prediction"] = int(label)
         annotated["prediction_label"] = label_name
         annotated["malicious_score"] = float(score)
-        if label_name in {"异常", "正常"}:
-            annotated["prediction_status"] = label_name
-        elif status_text is not None:
-            annotated["prediction_status"] = status_text
         annotated_flows.append(annotated)
 
     return DetectionResult(
@@ -454,9 +384,6 @@ def detect_pcap_with_model(
         scores=[float(value) for value in scores],
         flows=annotated_flows,
         prediction_labels=prediction_labels,
-        status_text=status_text,
-        anomaly_count=anomaly_count,
-        normal_count=normal_count,
     )
 
 

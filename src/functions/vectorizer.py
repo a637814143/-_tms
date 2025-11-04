@@ -623,4 +623,4 @@ def load_vectorized_dataset(
     raise ValueError(
         "Unable to decode CSV dataset using supported encodings: "
         + ", ".join(_CSV_READ_ENCODINGS)
-    ) from last_error
+    )
