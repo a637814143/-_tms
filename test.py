@@ -1,4 +1,4 @@
-from src.functions.unsupervised_train import train_unsupervised_on_split
+from src.functions.modeling import train_unsupervised_on_split
 
 if __name__ == "__main__":
     split_dir   = "data/111"       # 你存放切分包的目录
