@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
@@ -117,6 +119,12 @@ def train_hist_gradient_boosting(
     }
     dump(artifact, model_path)
 
+    _write_model_metadata(
+        model_path,
+        feature_names=feature_names,
+        label_mapping=label_mapping,
+    )
+
     if label_mapping:
         classes_display = [label_mapping.get(int(cls), str(cls)) for cls in clf.classes_]
     else:
@@ -130,6 +138,38 @@ def train_hist_gradient_boosting(
         label_mapping=label_mapping,
         dropped_flows=int(stats.dropped_rows),
     )
+
+
+def _write_model_metadata(
+    model_path: Union[str, Path],
+    *,
+    feature_names: Iterable[Union[str, bytes]],
+    label_mapping: Optional[Dict[int, str]] = None,
+) -> Path:
+    """Persist metadata alongside the trained model for UI alignment."""
+
+    path = Path(model_path)
+    metadata_path = path.with_name("metadata.json")
+
+    feature_list = [str(name) for name in feature_names]
+    if label_mapping:
+        labels = {str(key): str(value) for key, value in label_mapping.items()}
+    else:
+        labels = {}
+
+    metadata = {
+        "feature_names": feature_list,
+        "feature_order": feature_list,
+        "feature_names_in": feature_list,
+        "label_mapping": labels,
+        "model_path": str(path.name),
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
+    return metadata_path
 
 
 def _load_model_artifact(
