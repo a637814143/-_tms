@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
@@ -14,6 +16,7 @@ from .modeling import (
     summarize_prediction_labels,
     train_hist_gradient_boosting,
 )
+from .vectorizer import numeric_feature_names
 
 __all__ = [
     "DEFAULT_MODEL_PARAMS",
@@ -91,12 +94,40 @@ def train_unsupervised_on_split(
 
     summary = train_hist_gradient_boosting(dataset_path, model_path, **model_kwargs)
 
+    timestamp = datetime.now()
+    timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+    stamp_token = timestamp.strftime("%Y%m%d_%H%M%S")
+
+    numeric_names = numeric_feature_names()
+
+    metadata: Dict[str, object] = {
+        "schema_version": MODEL_SCHEMA_VERSION,
+        "timestamp": timestamp_str,
+        "pipeline_latest": model_path.name,
+        "pipeline_path": model_path.name,
+        "feature_order": list(numeric_names),
+        "feature_names_in": list(numeric_names),
+        "feature_columns": summary.feature_names,
+        "label_mapping": summary.label_mapping or {},
+        "contamination": kwargs.get("contamination"),
+        "training_anomaly_ratio": kwargs.get("training_anomaly_ratio"),
+    }
+
+    metadata_path = models_root / f"iforest_metadata_{stamp_token}.json"
+    latest_metadata_path = models_root / "latest_iforest_metadata.json"
+
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
+    with latest_metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
     result: Dict[str, object] = {
         "model_path": str(model_path),
         "pipeline_path": str(model_path),
         "pipeline_latest": str(model_path),
-        "metadata_path": None,
-        "metadata_latest": None,
+        "metadata_path": str(metadata_path),
+        "metadata_latest": str(latest_metadata_path),
         "model_joblib": str(model_path),
         "results_csv": None,
         "summary_csv": None,
@@ -107,10 +138,10 @@ def train_unsupervised_on_split(
         "classes": summary.classes,
         "label_mapping": summary.label_mapping,
         "dropped_flows": summary.dropped_flows,
-        "timestamp": None,
+        "timestamp": timestamp_str,
         "schema_version": MODEL_SCHEMA_VERSION,
         "summary": summary,
-        "metadata": None,
+        "metadata": metadata,
     }
 
     if results_dir:
