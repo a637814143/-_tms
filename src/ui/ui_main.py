@@ -1723,6 +1723,7 @@ class Ui_MainWindow(object):
             self._add_output(output_csv)
             self._last_out_csv = output_csv
             self._open_csv_paged(output_csv)
+            self._auto_analyze(output_csv)
 
         dataframe = prediction.get("dataframe")
         if isinstance(dataframe, pd.DataFrame):
@@ -2693,13 +2694,48 @@ class Ui_MainWindow(object):
             return
 
         export_df = None
-        if "prediction" in df.columns:
-            export_df = df[df["prediction"] == -1].copy()
+
+        def _extract_threshold(source) -> Optional[float]:
+            if not isinstance(source, dict):
+                return None
+            for key in ("score_threshold", "decision_threshold", "threshold"):
+                val = source.get(key)
+                if isinstance(val, (int, float)):
+                    return float(val)
+                if isinstance(val, str):
+                    try:
+                        return float(val)
+                    except ValueError:
+                        continue
+            return None
+
+        if "prediction_status" in df.columns:
+            export_df = df[df["prediction_status"].astype(str) == "异常"].copy()
+        elif "prediction_label" in df.columns:
+            export_df = df[
+                df["prediction_label"].astype(str).str.strip().str.lower().isin(
+                    {"异常", "恶意", "malicious", "anomaly", "attack"}
+                )
+            ].copy()
+        elif "malicious_score" in df.columns:
+            threshold = _extract_threshold(metrics_payload) if metrics_payload else None
+            if threshold is None:
+                threshold = _extract_threshold(summary_payload.get("metadata")) if isinstance(summary_payload.get("metadata"), dict) else None
+            if threshold is None:
+                threshold = _extract_threshold(self._selected_metadata) if isinstance(self._selected_metadata, dict) else None
+            if threshold is None and isinstance(self._latest_prediction_summary, dict):
+                threshold = _extract_threshold(self._latest_prediction_summary.get("metadata"))
+            if threshold is None:
+                threshold = 0.5
+            scores = pd.to_numeric(df["malicious_score"], errors="coerce") if pd is not None else df["malicious_score"]
+            export_df = df[scores >= threshold].copy()
+        elif "prediction" in df.columns:
+            export_df = df[df["prediction"].isin([1, -1])].copy()
         elif "anomaly_score" in df.columns:
             export_df = df[df["anomaly_score"] > 0].copy()
         else:
             if not written_any:
-                QtWidgets.QMessageBox.information(None, "无异常标记", "没有 prediction 或 anomaly_score 列，无法筛选异常。")
+                QtWidgets.QMessageBox.information(None, "无异常标记", "没有可识别的异常列，无法筛选异常。")
             return
         if export_df.empty:
             if not written_any:
@@ -3372,6 +3408,55 @@ class Ui_MainWindow(object):
         QtWidgets.QMessageBox.critical(None, "训练失败", msg)
         self.display_result(f"[错误] 训练失败: {msg}")
 
+    def _auto_analyze(self, csv_path: str) -> None:
+        btn = getattr(self, "btn_analysis", None)
+        if not csv_path or not os.path.exists(csv_path) or btn is None:
+            return
+
+        settings = getattr(self, "_settings", None)
+        if settings is not None and not bool(settings.get("auto_analyze_after_predict", True)):
+            return
+
+        if not btn.isEnabled():
+            return
+
+        out_dir = self._analysis_out_dir()
+        os.makedirs(out_dir, exist_ok=True)
+
+        meta_path = getattr(self, "_selected_metadata_path", None)
+        if not meta_path or not os.path.exists(meta_path):
+            _, latest_meta = self._latest_pipeline_bundle()
+            if latest_meta and os.path.exists(latest_meta):
+                meta_path = latest_meta
+
+        if not meta_path or not os.path.exists(meta_path):
+            return
+
+        self.display_result(f"[INFO] 自动分析预测结果 -> {out_dir}")
+        self._analysis_summary = None
+        self._set_action_buttons_enabled(False)
+        btn.setEnabled(False)
+        self.set_button_progress(btn, 1)
+
+        def _finished(result):
+            payload = result if isinstance(result, dict) else {"out_dir": out_dir}
+            if isinstance(payload, dict) and "out_dir" not in payload:
+                payload["out_dir"] = out_dir
+            self._on_analysis_finished(payload)
+
+        analysis_task = BackgroundTask(
+            run_analysis,
+            csv_path,
+            out_dir,
+            metadata_path=meta_path,
+        )
+        self._start_background_task(
+            analysis_task,
+            _finished,
+            self._on_analysis_error,
+            lambda p: self.set_button_progress(btn, p),
+        )
+
     # --------- 运行分析 ----------
     def _on_run_analysis(self):
         out_dir = self._analysis_out_dir()
@@ -3621,17 +3706,90 @@ class Ui_MainWindow(object):
             matrix = feature_df_raw.loc[:, feature_names].to_numpy(dtype=np.float64, copy=False)
 
             model = pipeline["model"]
+            positive_keywords = {"异常", "恶意", "malicious", "anomaly", "attack", "1", "-1"}
+            classes = list(getattr(model, "classes_", []))
+            pos_idx = None
+            meta_pos_label = ""
+            meta_pos_class = None
+            if isinstance(metadata, dict):
+                meta_pos_label = str(metadata.get("positive_label", "")).strip().lower()
+                meta_pos_class = metadata.get("positive_class")
+
+            def _label_for(cls_val):
+                if mapping:
+                    try:
+                        mapped = mapping.get(int(cls_val))
+                    except (TypeError, ValueError):
+                        mapped = mapping.get(str(cls_val))
+                    if mapped is not None:
+                        return str(mapped).strip()
+                return str(cls_val).strip()
+
+            if meta_pos_class is not None and classes:
+                for idx, cls_val in enumerate(classes):
+                    if cls_val == meta_pos_class:
+                        pos_idx = idx
+                        break
+                    try:
+                        if isinstance(meta_pos_class, str) and isinstance(cls_val, (int, np.integer)):
+                            if int(meta_pos_class) == int(cls_val):
+                                pos_idx = idx
+                                break
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        if isinstance(meta_pos_class, (int, np.integer)) and int(meta_pos_class) == int(cls_val):
+                            pos_idx = idx
+                            break
+                    except (TypeError, ValueError):
+                        pass
+
+            if pos_idx is None and meta_pos_label:
+                for idx, cls_val in enumerate(classes):
+                    if _label_for(cls_val).lower() == meta_pos_label:
+                        pos_idx = idx
+                        break
+
+            if pos_idx is None and classes:
+                for idx, cls_val in enumerate(classes):
+                    if _label_for(cls_val).lower() in positive_keywords:
+                        pos_idx = idx
+                        break
+
+            if pos_idx is None and classes:
+                try:
+                    if 1 in classes:
+                        pos_idx = classes.index(1)
+                    elif -1 in classes:
+                        pos_idx = classes.index(-1)
+                except ValueError:
+                    pos_idx = None
+
+            if pos_idx is None and classes:
+                pos_idx = len(classes) - 1
+
             if hasattr(model, "predict_proba"):
                 proba = model.predict_proba(matrix)
-                scores = proba.max(axis=1)
+                if np.ndim(proba) == 2 and proba.shape[1] >= 2:
+                    if pos_idx is not None and 0 <= pos_idx < proba.shape[1]:
+                        scores = proba[:, pos_idx]
+                    else:
+                        scores = proba[:, -1]
+                else:
+                    scores = proba
             elif hasattr(model, "decision_function"):
                 decision = model.decision_function(matrix)
                 if np.ndim(decision) == 1:
                     scores = 1.0 / (1.0 + np.exp(-decision))
                 else:
-                    scores = decision.max(axis=1)
+                    if pos_idx is not None and decision.shape[1] > pos_idx:
+                        margin = decision[:, pos_idx]
+                    else:
+                        margin = decision.max(axis=1)
+                    scores = 1.0 / (1.0 + np.exp(-margin))
             else:
-                scores = model.predict(matrix)
+                raw_pred = model.predict(matrix)
+                scores = np.asarray(raw_pred, dtype=float)
 
             preds = model.predict(matrix)
             label_mapping = pipeline.get("label_mapping")
@@ -3903,6 +4061,7 @@ class Ui_MainWindow(object):
             self._last_out_csv = output_csv
             if show_dialog:
                 self._open_csv_paged(output_csv)
+            self._auto_analyze(output_csv)
 
         dataframe = result.get("dataframe")
         if isinstance(dataframe, pd.DataFrame):

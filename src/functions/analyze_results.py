@@ -23,8 +23,15 @@ logger = get_logger(__name__)
 
 # ---- 基础配置 --------------------------------------------------------------
 
-SCORE_CANDIDATES: Sequence[str] = ("anomaly_score", "score", "iforest_score")
+SCORE_CANDIDATES: Sequence[str] = (
+    "malicious_score",
+    "anomaly_score",
+    "score",
+    "iforest_score",
+)
 LABEL_CANDIDATES: Sequence[str] = (
+    "prediction_status",
+    "prediction_label",
     "is_malicious",
     "is_anomaly",
     "predicted_label",
@@ -194,10 +201,13 @@ def _export_summary_by_file(
     return path
 
 
-def _plot_hist(scores: pd.Series, out_dir: str) -> str:
+def _plot_hist(scores: pd.Series, out_dir: str, *, descending: bool) -> str:
     plt.figure(figsize=(10, 6))
     plt.hist(scores.dropna().to_numpy(dtype=float), bins=50, color="#4C72B0", edgecolor="white")
-    plt.xlabel("Anomaly score (lower = more anomalous)")
+    if descending:
+        plt.xlabel("Anomaly score (higher = more anomalous)")
+    else:
+        plt.xlabel("Anomaly score (lower = more anomalous)")
     plt.ylabel("Count")
     plt.title("Anomaly Score Distribution")
     plt.tight_layout()
@@ -345,7 +355,14 @@ def analyze_results(
         malicious_total = int(df_meta[label_col].sum())
         malicious_ratio = float(malicious_total / total_rows)
 
-    hist_path = _plot_hist(df_meta[score_col], out_dir)
+    score_column_meta = ""
+    if isinstance(meta_payload, dict):
+        score_column_meta = str(meta_payload.get("score_column", "")).strip().lower()
+    descending_scores = score_col.lower() in {"malicious_score", "prob_malicious", "proba_malicious"}
+    if score_column_meta in {"malicious_score", "prob_malicious", "proba_malicious"}:
+        descending_scores = True
+
+    hist_path = _plot_hist(df_meta[score_col], out_dir, descending=descending_scores)
 
     meta_top_percent = meta_payload.get("refine_top_percent") if isinstance(meta_payload, dict) else None
     if isinstance(meta_top_percent, (int, float)) and meta_top_percent > 0:
@@ -357,7 +374,10 @@ def analyze_results(
     if total_rows >= 20:
         top_n = max(20, top_n)
     top_n = min(top_n, MAX_TOP_ROWS, total_rows)
-    top_meta = df_meta.nsmallest(top_n, score_col).copy()
+    if descending_scores:
+        top_meta = df_meta.nlargest(top_n, score_col).copy()
+    else:
+        top_meta = df_meta.nsmallest(top_n, score_col).copy()
 
     feature_columns_meta = meta_payload.get("feature_columns") if isinstance(meta_payload, dict) else None
     feature_cols: List[str] = []
@@ -394,12 +414,18 @@ def analyze_results(
     top_csv_path = os.path.join(out_dir, "top20_packets.csv")
     top_meta.loc[:, export_cols].to_csv(top_csv_path, index=False, encoding="utf-8")
 
-    score_quantiles = df_meta[score_col].quantile([0.01, 0.05, 0.5, 0.9]).to_dict()
+    quantile_points = [0.01, 0.05, 0.5, 0.9, 0.95, 0.99]
+    score_quantiles = df_meta[score_col].quantile(quantile_points).to_dict()
     train_threshold_val = meta_payload.get("threshold") if isinstance(meta_payload, dict) else None
     if isinstance(train_threshold_val, (int, float)):
         score_threshold = float(train_threshold_val)
     else:
-        score_threshold = float(score_quantiles.get(0.05, float(df_meta[score_col].min())))
+        if descending_scores:
+            score_threshold = float(
+                score_quantiles.get(0.95, float(df_meta[score_col].quantile(0.95)))
+            )
+        else:
+            score_threshold = float(score_quantiles.get(0.05, float(df_meta[score_col].min())))
     ratio_threshold = float(meta_payload.get("ratio_threshold", 0.05)) if isinstance(meta_payload, dict) else 0.05
 
     drift_alerts = None
@@ -431,7 +457,10 @@ def analyze_results(
         summary_lines.append(f"涉及文件数：{unique_files}")
     if label_col:
         summary_lines.append(f"异常样本数量：{malicious_total} ({malicious_ratio:.2%})")
-    summary_lines.append(f"建议异常得分阈值（越小越异常）：≤ {score_threshold:.6f}")
+    if descending_scores:
+        summary_lines.append(f"建议异常得分阈值（越大越异常）：≥ {score_threshold:.6f}")
+    else:
+        summary_lines.append(f"建议异常得分阈值（越小越异常）：≤ {score_threshold:.6f}")
     summary_lines.append(f"文件级判定阈值：恶意占比 ≥ {ratio_threshold:.2%}")
     if drift_alerts:
         summary_lines.append("⚠ 分布漂移告警：" + json.dumps(drift_alerts, ensure_ascii=False))
@@ -454,6 +483,8 @@ def analyze_results(
         "model_metrics": None,
         "roc_auc": None,
         "pr_auc": None,
+        "score_column": score_col,
+        "score_direction": "descending" if descending_scores else "ascending",
     }
 
     export_payload = {
