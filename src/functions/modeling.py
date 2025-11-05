@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from joblib import dump, load
@@ -34,6 +34,7 @@ __all__ = [
     "META_COLUMNS",
     "TrainingSummary",
     "DetectionResult",
+    "write_metadata",
     "ModelTrainer",
     "ModelPredictor",
     "train_hist_gradient_boosting",
@@ -84,6 +85,30 @@ DEFAULT_MODEL_PARAMS: Dict[str, Union[int, float, None]] = {
     "l2_regularization": 0.0,
     "random_state": 1337,
 }
+
+
+def write_metadata(
+    model_path: Union[str, Path],
+    feature_names: Sequence[str],
+    label_mapping: Optional[Dict[int, str]] = None,
+    model_params: Optional[Dict[str, Union[int, float, str, None]]] = None,
+) -> Path:
+    """Persist model metadata required by the UI layer."""
+
+    metadata: Dict[str, object] = {
+        "feature_names": list(feature_names),
+        "label_mapping": label_mapping or {},
+        "model_params": model_params or {},
+        "schema_version": MODEL_SCHEMA_VERSION,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    metadata_path = Path(model_path).with_suffix(".json")
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+    return metadata_path
+
 
 MODEL_SCHEMA_VERSION = "2025.10"
 
@@ -387,6 +412,11 @@ def train_hist_gradient_boosting(
         "label_mapping": label_mapping,
     }
     dump(artifact, model_path)
+    try:
+        model_params = clf.get_params(deep=False)
+    except Exception:  # pragma: no cover - defensive
+        model_params = params
+    write_metadata(model_path, feature_names, label_mapping, model_params)
 
     _write_model_metadata(
         model_path,
@@ -481,9 +511,37 @@ def _load_model_artifact(
     model = artifact.get("model")
     feature_names = artifact.get("feature_names")
     label_mapping = artifact.get("label_mapping")
-    if model is None or feature_names is None:
-        raise ValueError("Model artifact is missing required data")
-    return model, list(feature_names), label_mapping if label_mapping else None
+
+    metadata_path = Path(model_path).with_suffix(".json")
+    metadata: Dict[str, object] = {}
+    if metadata_path.exists():
+        try:
+            with metadata_path.open("r", encoding="utf-8") as handle:
+                metadata = json.load(handle)
+        except Exception:  # pragma: no cover - metadata is optional
+            metadata = {}
+
+    if feature_names is None:
+        feature_names = metadata.get("feature_names") if metadata else None
+    if feature_names is None:
+        raise ValueError("Model artifact is missing required feature names")
+
+    if label_mapping is None and metadata:
+        raw_mapping = metadata.get("label_mapping")
+        if isinstance(raw_mapping, dict):
+            parsed_mapping: Dict[int, str] = {}
+            for key, value in raw_mapping.items():
+                try:
+                    parsed_mapping[int(key)] = str(value)
+                except (TypeError, ValueError):
+                    continue
+            if parsed_mapping:
+                label_mapping = parsed_mapping
+
+    if model is None:
+        raise ValueError("Model artifact is missing the estimator instance")
+
+    return model, [str(name) for name in feature_names], label_mapping if label_mapping else None
 
 
 def _resolve_dataset_path(input_path: Union[str, Path]) -> Path:
