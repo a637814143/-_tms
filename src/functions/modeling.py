@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 from joblib import dump, load
@@ -43,6 +43,46 @@ __all__ = [
     "summarize_prediction_labels",
     "compute_risk_components",
 ]
+
+
+_PARAM_CACHE: Dict[type, Set[str]] = {}
+
+
+def _valid_estimator_param_names(model_class: type) -> Set[str]:
+    """Return the constructor parameter names supported by an estimator."""
+
+    cached = _PARAM_CACHE.get(model_class)
+    if cached is not None:
+        return cached
+
+    try:
+        instance = model_class()
+    except Exception:
+        names: Set[str] = set()
+    else:
+        try:
+            names = set(instance.get_params(deep=False).keys())
+        except Exception:
+            names = set()
+
+    _PARAM_CACHE[model_class] = names
+    return names
+
+
+def _filter_estimator_params(
+    model_class: type, **kwargs: Union[int, float, None]
+) -> Dict[str, Union[int, float, None]]:
+    """Drop unsupported or ``None`` values from estimator kwargs."""
+
+    valid_names = _valid_estimator_param_names(model_class)
+    if not valid_names:
+        return {key: value for key, value in kwargs.items() if value is not None}
+
+    return {
+        key: value
+        for key, value in kwargs.items()
+        if value is not None and key in valid_names
+    }
 
 
 @dataclass
@@ -267,8 +307,10 @@ def train_hist_gradient_boosting(
             )
         raise ValueError("Dataset does not contain labels; cannot train a classifier.")
 
+    filtered_params = _filter_estimator_params(HistGradientBoostingClassifier, **kwargs)
+
     params = DEFAULT_MODEL_PARAMS.copy()
-    params.update(kwargs)
+    params.update(filtered_params)
 
     stratify: Optional[np.ndarray]
     try:
@@ -637,10 +679,22 @@ class ModelTrainer:
 
     def __init__(self, *, model_class=HistGradientBoostingClassifier):
         self.model_class = model_class
+        self._valid_param_names = _valid_estimator_param_names(model_class)
 
     @staticmethod
-    def _filter_params(**kwargs: Union[int, float, None]) -> Dict[str, Union[int, float, None]]:
-        return {key: value for key, value in kwargs.items() if value is not None}
+    def _filter_params_static(
+        valid_names: Set[str], **kwargs: Union[int, float, None]
+    ) -> Dict[str, Union[int, float, None]]:
+        if not valid_names:
+            return {key: value for key, value in kwargs.items() if value is not None}
+        return {
+            key: value
+            for key, value in kwargs.items()
+            if value is not None and key in valid_names
+        }
+
+    def _filter_params(self, **kwargs: Union[int, float, None]) -> Dict[str, Union[int, float, None]]:
+        return self._filter_params_static(self._valid_param_names, **kwargs)
 
     def train(
         self,
