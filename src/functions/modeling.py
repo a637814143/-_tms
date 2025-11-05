@@ -11,6 +11,14 @@ from typing import Dict, Iterable, List, Optional, Tuple, Union
 import numpy as np
 from joblib import dump, load
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import (
+    average_precision_score,
+    confusion_matrix,
+    precision_recall_curve,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
+from sklearn.model_selection import train_test_split
 
 from .feature_extractor import extract_pcap_features
 from .vectorizer import (
@@ -46,6 +54,12 @@ class TrainingSummary:
     flow_count: int
     label_mapping: Optional[Dict[int, str]] = None
     dropped_flows: int = 0
+    decision_threshold: Optional[float] = None
+    positive_label: Optional[str] = None
+    positive_class: Optional[Union[int, str]] = None
+    metrics: Optional[Dict[str, float]] = None
+    class_weights: Optional[Dict[str, float]] = None
+    validation_samples: Optional[int] = None
 
 
 @dataclass
@@ -111,6 +125,105 @@ _NORMAL_KEYWORDS = {
     "false",
 }
 
+_POSITIVE_KEYWORDS = {
+    "异常",
+    "恶意",
+    "malicious",
+    "anomaly",
+    "attack",
+    "1",
+    "-1",
+}
+
+
+@dataclass
+class _PositiveClassInfo:
+    index: Optional[int]
+    value: Optional[Union[int, str]]
+    label: Optional[str]
+
+
+def _resolve_positive_class(
+    model: HistGradientBoostingClassifier,
+    label_mapping: Optional[Dict[int, str]] = None,
+) -> _PositiveClassInfo:
+    classes = getattr(model, "classes_", None)
+    if classes is None:
+        return _PositiveClassInfo(None, None, None)
+
+    class_list = list(classes)
+    pos_idx: Optional[int] = None
+
+    def _label_for(cls_value: Union[int, str]) -> str:
+        if label_mapping:
+            try:
+                mapped = label_mapping.get(int(cls_value))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                mapped = label_mapping.get(str(cls_value))  # type: ignore[arg-type]
+            if mapped is not None:
+                return str(mapped).strip()
+        return str(cls_value).strip()
+
+    for idx, cls_value in enumerate(class_list):
+        lowered = _label_for(cls_value).lower()
+        if lowered in _POSITIVE_KEYWORDS:
+            pos_idx = idx
+            break
+
+    if pos_idx is None:
+        try:
+            if 1 in class_list:
+                pos_idx = class_list.index(1)
+            elif -1 in class_list:
+                pos_idx = class_list.index(-1)
+        except ValueError:
+            pos_idx = None
+
+    if pos_idx is None and class_list:
+        pos_idx = len(class_list) - 1
+
+    if pos_idx is None:
+        return _PositiveClassInfo(None, None, None)
+
+    positive_value = class_list[pos_idx]
+    positive_label = _label_for(positive_value)
+    return _PositiveClassInfo(pos_idx, positive_value, positive_label)
+
+
+def _predict_positive_scores(
+    model: HistGradientBoostingClassifier,
+    X: np.ndarray,
+    label_mapping: Optional[Dict[int, str]] = None,
+) -> Tuple[np.ndarray, _PositiveClassInfo]:
+    info = _resolve_positive_class(model, label_mapping)
+
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)
+        if (
+            info.index is not None
+            and np.ndim(proba) == 2
+            and proba.shape[1] >= 2
+        ):
+            scores = proba[:, info.index]
+        elif np.ndim(proba) == 2:
+            scores = proba.max(axis=1)
+        else:
+            scores = proba
+    elif hasattr(model, "decision_function"):
+        decision = model.decision_function(X)
+        if np.ndim(decision) == 1:
+            scores = 1.0 / (1.0 + np.exp(-decision))
+        else:
+            if info.index is not None and decision.shape[1] > info.index:
+                scores = decision[:, info.index]
+            else:
+                scores = decision.max(axis=1)
+    else:
+        predictions = model.predict(X)
+        scores = predictions
+
+    return np.asarray(scores, dtype=np.float64), info
+
 
 def train_hist_gradient_boosting(
     dataset_path: Union[str, Path],
@@ -132,8 +245,141 @@ def train_hist_gradient_boosting(
     params = DEFAULT_MODEL_PARAMS.copy()
     params.update(kwargs)
 
+    stratify: Optional[np.ndarray]
+    try:
+        unique = np.unique(y)
+    except TypeError:
+        unique = np.unique(y.astype(str))  # type: ignore[attr-defined]
+    use_stratify = len(unique) > 1
+    if use_stratify:
+        stratify = y
+    else:
+        stratify = None
+
+    try:
+        X_train, X_val, y_train, y_val = train_test_split(
+            X,
+            y,
+            test_size=0.2,
+            random_state=int(params.get("random_state", 1337) or 1337),
+            stratify=stratify,
+        )
+    except ValueError:
+        X_train, X_val, y_train, y_val = X, np.empty((0, X.shape[1])), y, np.empty(0)
+
+    class_weights: Dict[str, float] = {}
+    class_weight_values: Optional[Dict[Union[int, str], float]] = None
+    try:
+        unique_full, counts_full = np.unique(y, return_counts=True)
+    except TypeError:
+        unique_full = np.unique(y.astype(str))  # type: ignore[attr-defined]
+        counts_full = np.ones_like(unique_full, dtype=float)
+
+    if len(unique_full) > 1:
+        class_weight_values = {
+            cls: 1.0 / float(cnt) for cls, cnt in zip(unique_full, counts_full)
+        }
+        class_weights = {str(cls): float(weight) for cls, weight in class_weight_values.items()}
+
+    sample_weight_train = None
+    if class_weight_values is not None:
+        sample_weight_train = np.asarray([class_weight_values[val] for val in y_train], dtype=float)
+
     clf = HistGradientBoostingClassifier(**params)
-    clf.fit(X, y)
+    clf.fit(X_train, y_train, sample_weight=sample_weight_train)
+
+    metrics_payload: Dict[str, float] = {}
+    decision_threshold: Optional[float] = None
+    positive_label: Optional[str] = None
+    positive_class: Optional[Union[int, str]] = None
+
+    if X_val.size and y_val.size:
+        scores_val, pos_info = _predict_positive_scores(clf, X_val, label_mapping)
+        positive_label = pos_info.label
+        positive_class = pos_info.value
+        if pos_info.value is not None:
+            y_val_binary = (y_val == pos_info.value).astype(int)
+        else:
+            y_val_binary = (y_val == clf.classes_[-1]).astype(int)
+
+        precision_curve, recall_curve, pr_thresholds = precision_recall_curve(
+            y_val_binary,
+            scores_val,
+        )
+        beta = 0.5
+        if pr_thresholds.size:
+            precision_vals = precision_curve[:-1]
+            recall_vals = recall_curve[:-1]
+            numerator = (1 + beta**2) * precision_vals * recall_vals
+            denominator = (beta**2 * precision_vals) + recall_vals
+            with np.errstate(divide="ignore", invalid="ignore"):
+                f_beta_scores = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator > 0)
+            best_idx = int(np.argmax(f_beta_scores))
+            decision_threshold = float(pr_thresholds[best_idx])
+            metrics_payload["f0_5"] = float(f_beta_scores[best_idx])
+        else:
+            decision_threshold = 0.5
+            metrics_payload["f0_5"] = 0.0
+
+        pred_binary = (scores_val >= float(decision_threshold)).astype(int)
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            y_val_binary,
+            pred_binary,
+            average="binary",
+            zero_division=0,
+        )
+        metrics_payload.update(
+            {
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1": float(f1),
+            }
+        )
+
+        try:
+            roc_auc = roc_auc_score(y_val_binary, scores_val)
+            metrics_payload["roc_auc"] = float(roc_auc)
+        except ValueError:
+            pass
+
+        try:
+            pr_auc = average_precision_score(y_val_binary, scores_val)
+            metrics_payload["pr_auc"] = float(pr_auc)
+        except ValueError:
+            pass
+
+        try:
+            tn, fp, fn, tp = confusion_matrix(y_val_binary, pred_binary).ravel()
+            metrics_payload.update(
+                {
+                    "tp": float(tp),
+                    "fp": float(fp),
+                    "tn": float(tn),
+                    "fn": float(fn),
+                }
+            )
+        except ValueError:
+            pass
+
+        metrics_payload["validation_samples"] = int(len(y_val_binary))
+        metrics_payload["positive_samples"] = int(y_val_binary.sum())
+    else:
+        decision_threshold = 0.5
+        if label_mapping:
+            positive_label = next(iter(label_mapping.values()), None)
+
+    if positive_class is None or positive_label is None:
+        info = _resolve_positive_class(clf, label_mapping)
+        if positive_class is None:
+            positive_class = info.value
+        if positive_label is None:
+            positive_label = info.label
+
+    if class_weight_values is not None:
+        full_weights = np.asarray([class_weight_values[val] for val in y], dtype=float)
+        clf.fit(X, y, sample_weight=full_weights)
+    else:
+        clf.fit(X, y)
 
     artifact = {
         "model": clf,
@@ -146,6 +392,11 @@ def train_hist_gradient_boosting(
         model_path,
         feature_names=feature_names,
         label_mapping=label_mapping,
+        decision_threshold=decision_threshold,
+        positive_label=positive_label,
+        positive_class=positive_class,
+        metrics=metrics_payload,
+        class_weights=class_weights,
     )
 
     if label_mapping:
@@ -160,6 +411,12 @@ def train_hist_gradient_boosting(
         flow_count=X.shape[0],
         label_mapping=label_mapping,
         dropped_flows=int(stats.dropped_rows),
+        decision_threshold=decision_threshold,
+        positive_label=positive_label,
+        positive_class=positive_class,
+        metrics=metrics_payload or None,
+        class_weights=class_weights or None,
+        validation_samples=int(len(y_val)) if X_val.size else None,
     )
 
 
@@ -168,6 +425,11 @@ def _write_model_metadata(
     *,
     feature_names: Iterable[Union[str, bytes]],
     label_mapping: Optional[Dict[int, str]] = None,
+    decision_threshold: Optional[float] = None,
+    positive_label: Optional[str] = None,
+    positive_class: Optional[Union[int, str]] = None,
+    metrics: Optional[Dict[str, float]] = None,
+    class_weights: Optional[Dict[str, float]] = None,
 ) -> Path:
     """Persist metadata alongside the trained model for UI alignment."""
 
@@ -187,7 +449,24 @@ def _write_model_metadata(
         "label_mapping": labels,
         "model_path": str(path.name),
         "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "score_column": "malicious_score",
     }
+
+    if decision_threshold is not None:
+        metadata["threshold"] = float(decision_threshold)
+        metadata["decision_threshold"] = float(decision_threshold)
+    if positive_label:
+        metadata["positive_label"] = str(positive_label)
+    if positive_class is not None:
+        metadata["positive_class"] = (
+            int(positive_class)
+            if isinstance(positive_class, (int, np.integer))
+            else str(positive_class)
+        )
+    if metrics:
+        metadata["model_metrics"] = {key: float(value) for key, value in metrics.items()}
+    if class_weights:
+        metadata["class_weights"] = class_weights
 
     with metadata_path.open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
@@ -259,17 +538,7 @@ def _build_detection_result(
         )
 
     X = vectorized.matrix
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(X)
-        scores = proba.max(axis=1)
-    elif hasattr(model, "decision_function"):
-        decision = model.decision_function(X)
-        if decision.ndim == 1:
-            scores = 1.0 / (1.0 + np.exp(-decision))
-        else:
-            scores = decision.max(axis=1)
-    else:
-        scores = model.predict(X)
+    scores, pos_info = _predict_positive_scores(model, X, label_mapping)
 
     predictions = model.predict(X)
     prediction_labels: List[str] = []
@@ -279,12 +548,18 @@ def _build_detection_result(
     else:
         prediction_labels = [str(value) for value in predictions]
 
+    status_labels, _, _, _ = summarize_prediction_labels(predictions, label_mapping)
+
     annotated_flows: List[Dict[str, object]] = []
-    for flow, label, label_name, score in zip(flows, predictions, prediction_labels, scores):
+    for flow, label, label_name, score, status in zip(
+        flows, predictions, prediction_labels, scores, status_labels
+    ):
         annotated = dict(flow)
         annotated["prediction"] = int(label)
         annotated["prediction_label"] = label_name
         annotated["malicious_score"] = float(score)
+        if status in {"异常", "正常"}:
+            annotated["prediction_status"] = status
         annotated_flows.append(annotated)
 
     return DetectionResult(
@@ -355,6 +630,24 @@ class ModelTrainer:
             "model_metadata_path": str(model_metadata_path),
         }
 
+        metadata["score_column"] = "malicious_score"
+        if summary.decision_threshold is not None:
+            metadata["threshold"] = float(summary.decision_threshold)
+            metadata["decision_threshold"] = float(summary.decision_threshold)
+        if summary.positive_label:
+            metadata["positive_label"] = summary.positive_label
+        if summary.positive_class is not None:
+            if isinstance(summary.positive_class, (np.integer, int)):
+                metadata["positive_class"] = int(summary.positive_class)
+            else:
+                metadata["positive_class"] = str(summary.positive_class)
+        if summary.metrics:
+            metadata["model_metrics"] = summary.metrics
+        if summary.class_weights:
+            metadata["class_weights"] = summary.class_weights
+        if summary.validation_samples is not None:
+            metadata["validation_samples"] = int(summary.validation_samples)
+
         metadata_path = models_root / f"iforest_metadata_{stamp_token}.json"
         latest_metadata_path = models_root / "latest_iforest_metadata.json"
 
@@ -388,6 +681,14 @@ class ModelTrainer:
             "schema_version": MODEL_SCHEMA_VERSION,
             "summary": summary,
             "metadata": metadata,
+            "decision_threshold": summary.decision_threshold,
+            "model_metrics": summary.metrics,
+            "positive_label": summary.positive_label,
+            "positive_class": (
+                int(summary.positive_class)
+                if isinstance(summary.positive_class, (np.integer, int))
+                else summary.positive_class
+            ),
         }
 
 
@@ -404,17 +705,7 @@ class ModelPredictor:
         model = self.model
         predictions = model.predict(matrix)
 
-        if hasattr(model, "predict_proba"):
-            proba = model.predict_proba(matrix)
-            scores = proba.max(axis=1)
-        elif hasattr(model, "decision_function"):
-            decision = model.decision_function(matrix)
-            if np.ndim(decision) == 1:
-                scores = 1.0 / (1.0 + np.exp(-decision))
-            else:
-                scores = decision.max(axis=1)
-        else:
-            scores = predictions
+        scores, _ = _predict_positive_scores(model, matrix, self.label_mapping)
 
         return predictions, np.asarray(scores, dtype=np.float64)
 
