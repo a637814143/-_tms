@@ -3,7 +3,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap
 from pathlib import Path
 import numpy as np
-from typing import Collection, Dict, List, Optional, Set, Tuple
+from typing import Collection, Dict, List, Optional, Set, Tuple, Union
 from datetime import datetime
 
 import yaml
@@ -3711,6 +3711,18 @@ class Ui_MainWindow(object):
             pos_idx = None
             meta_pos_label = ""
             meta_pos_class = None
+            raw_label_mapping = pipeline.get("label_mapping")
+            mapping: Optional[Dict[Union[int, str], str]] = None
+            if isinstance(raw_label_mapping, dict):
+                converted: Dict[Union[int, str], str] = {}
+                for key, value in raw_label_mapping.items():
+                    text_value = str(value)
+                    converted[str(key)] = text_value
+                    try:
+                        converted[int(key)] = text_value
+                    except (TypeError, ValueError):
+                        continue
+                mapping = converted
             if isinstance(metadata, dict):
                 meta_pos_label = str(metadata.get("positive_label", "")).strip().lower()
                 meta_pos_class = metadata.get("positive_class")
@@ -3792,12 +3804,6 @@ class Ui_MainWindow(object):
                 scores = np.asarray(raw_pred, dtype=float)
 
             preds = model.predict(matrix)
-            label_mapping = pipeline.get("label_mapping")
-            mapping: Optional[Dict[int, str]]
-            if isinstance(label_mapping, dict):
-                mapping = {int(key): str(value) for key, value in label_mapping.items()}
-            else:
-                mapping = None
 
             if summarize_prediction_labels is not None:
                 labels, anomaly_count, normal_count, status_text = summarize_prediction_labels(
