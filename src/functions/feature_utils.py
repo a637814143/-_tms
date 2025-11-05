@@ -453,123 +453,12 @@ def build_flows(packets: Iterable[PacketInfo]) -> Dict[str, FlowAccumulator]:
     return flows
 
 
-def flow_to_feature_dict(flow: FlowAccumulator, *, fast: bool = False) -> Dict[str, object]:
+def flow_to_feature_dict(flow: FlowAccumulator) -> Dict[str, object]:
     """Convert an accumulator into the requested feature dictionary."""
 
     duration = (flow.end_time - flow.start_time) if flow.end_time is not None else 0.0
     duration_seconds = max(duration, 0.0)
     duration_microseconds = duration_seconds * _MICROSECONDS
-
-    flow_packets_per_s = flow.total_packets / duration_seconds if duration_seconds > 0 else 0.0
-    flow_bytes_per_s = flow.total_bytes / duration_seconds if duration_seconds > 0 else 0.0
-    fwd_packets_per_s = flow.forward_packets / duration_seconds if duration_seconds > 0 else 0.0
-    bwd_packets_per_s = flow.backward_packets / duration_seconds if duration_seconds > 0 else 0.0
-
-    subflow_fwd_packets = flow.forward_packets
-    subflow_fwd_bytes = flow.forward_bytes
-    subflow_bwd_packets = flow.backward_packets
-    subflow_bwd_bytes = flow.backward_bytes
-    if flow.subflow_forward_packets:
-        subflow_fwd_packets = max(flow.subflow_forward_packets)
-    if flow.subflow_forward_bytes:
-        subflow_fwd_bytes = max(flow.subflow_forward_bytes)
-    if flow.subflow_backward_packets:
-        subflow_bwd_packets = max(flow.subflow_backward_packets)
-    if flow.subflow_backward_bytes:
-        subflow_bwd_bytes = max(flow.subflow_backward_bytes)
-
-    timestamp_str = datetime.utcfromtimestamp(flow.start_time).isoformat() + "Z"
-
-    features: Dict[str, object] = {
-        "Flow ID": flow.flow_id,
-        "Source IP": flow.src_ip,
-        "Source Port": flow.src_port,
-        "Destination IP": flow.dst_ip,
-        "Destination Port": flow.dst_port,
-        "Protocol": flow.protocol,
-        "Timestamp": timestamp_str,
-        "Flow Duration": duration_microseconds,
-        "Total Fwd Packets": flow.forward_packets,
-        "Total Backward Packets": flow.backward_packets,
-        "Total Length of Fwd Packets": flow.forward_bytes,
-        "Total Length of Bwd Packets": flow.backward_bytes,
-        "Flow Bytes/s": flow_bytes_per_s,
-        "Flow Packets/s": flow_packets_per_s,
-        "Fwd PSH Flags": flow.fwd_psh_flags,
-        "Bwd PSH Flags": flow.bwd_psh_flags,
-        "Fwd URG Flags": flow.fwd_urg_flags,
-        "Bwd URG Flags": flow.bwd_urg_flags,
-        "Fwd Header Length": flow.forward_header_bytes,
-        "Fwd Header Length.1": flow.forward_header_bytes,
-        "Bwd Header Length": flow.backward_header_bytes,
-        "Fwd Packets/s": fwd_packets_per_s,
-        "Bwd Packets/s": bwd_packets_per_s,
-        "FIN Flag Count": flow.fin_count,
-        "SYN Flag Count": flow.syn_count,
-        "RST Flag Count": flow.rst_count,
-        "PSH Flag Count": flow.psh_count,
-        "ACK Flag Count": flow.ack_count,
-        "URG Flag Count": flow.urg_count,
-        "CWE Flag Count": flow.cwr_count,
-        "ECE Flag Count": flow.ece_count,
-        "Down/Up Ratio": flow.down_up_ratio,
-        "Average Packet Size": flow.avg_packet_size,
-        "Avg Fwd Segment Size": flow.avg_fwd_segment_size,
-        "Avg Bwd Segment Size": flow.avg_bwd_segment_size,
-        "Fwd Avg Bytes/Bulk": 0.0,
-        "Fwd Avg Packets/Bulk": 0.0,
-        "Fwd Avg Bulk Rate": 0.0,
-        "Bwd Avg Bytes/Bulk": 0.0,
-        "Bwd Avg Packets/Bulk": 0.0,
-        "Bwd Avg Bulk Rate": 0.0,
-        "Subflow Fwd Packets": subflow_fwd_packets,
-        "Subflow Fwd Bytes": subflow_fwd_bytes,
-        "Subflow Bwd Packets": subflow_bwd_packets,
-        "Subflow Bwd Bytes": subflow_bwd_bytes,
-        "Init_Win_bytes_forward": flow.init_win_bytes_forward,
-        "Init_Win_bytes_backward": flow.init_win_bytes_backward,
-        "act_data_pkt_fwd": flow.act_data_pkt_fwd,
-        "min_seg_size_forward": flow.min_seg_size_forward,
-        "Fwd Packet Length Max": 0.0,
-        "Fwd Packet Length Min": 0.0,
-        "Fwd Packet Length Mean": 0.0,
-        "Fwd Packet Length Std": 0.0,
-        "Bwd Packet Length Max": 0.0,
-        "Bwd Packet Length Min": 0.0,
-        "Bwd Packet Length Mean": 0.0,
-        "Bwd Packet Length Std": 0.0,
-        "Flow IAT Mean": 0.0,
-        "Flow IAT Std": 0.0,
-        "Flow IAT Max": 0.0,
-        "Flow IAT Min": 0.0,
-        "Fwd IAT Total": 0.0,
-        "Fwd IAT Mean": 0.0,
-        "Fwd IAT Std": 0.0,
-        "Fwd IAT Max": 0.0,
-        "Fwd IAT Min": 0.0,
-        "Bwd IAT Total": 0.0,
-        "Bwd IAT Mean": 0.0,
-        "Bwd IAT Std": 0.0,
-        "Bwd IAT Max": 0.0,
-        "Bwd IAT Min": 0.0,
-        "Min Packet Length": 0.0,
-        "Max Packet Length": 0.0,
-        "Packet Length Mean": 0.0,
-        "Packet Length Std": 0.0,
-        "Packet Length Variance": 0.0,
-        "Active Mean": 0.0,
-        "Active Std": 0.0,
-        "Active Max": 0.0,
-        "Active Min": 0.0,
-        "Idle Mean": 0.0,
-        "Idle Std": 0.0,
-        "Idle Max": 0.0,
-        "Idle Min": 0.0,
-        "Label": 0,
-    }
-
-    if fast:
-        return features
 
     flow_iat_mean, flow_iat_std, flow_iat_max, flow_iat_min = _stats(flow.flow_iats)
     fwd_iat_mean, fwd_iat_std, fwd_iat_max, fwd_iat_min = _stats(flow.forward_iats)
@@ -592,6 +481,11 @@ def flow_to_feature_dict(flow: FlowAccumulator, *, fast: bool = False) -> Dict[s
     bwd_iat_std *= _MICROSECONDS
     bwd_iat_max *= _MICROSECONDS
     bwd_iat_min *= _MICROSECONDS
+
+    flow_packets_per_s = flow.total_packets / duration_seconds if duration_seconds > 0 else 0.0
+    flow_bytes_per_s = flow.total_bytes / duration_seconds if duration_seconds > 0 else 0.0
+    fwd_packets_per_s = flow.forward_packets / duration_seconds if duration_seconds > 0 else 0.0
+    bwd_packets_per_s = flow.backward_packets / duration_seconds if duration_seconds > 0 else 0.0
 
     min_packet_length = min(flow.packet_lengths) if flow.packet_lengths else 0
     max_packet_length = max(flow.packet_lengths) if flow.packet_lengths else 0
@@ -630,51 +524,104 @@ def flow_to_feature_dict(flow: FlowAccumulator, *, fast: bool = False) -> Dict[s
     idle_max *= _MICROSECONDS
     idle_min *= _MICROSECONDS
 
-    features.update(
-        {
-            "Fwd Packet Length Max": fwd_packet_length_max,
-            "Fwd Packet Length Min": fwd_packet_length_min,
-            "Fwd Packet Length Mean": fwd_packet_length_mean,
-            "Fwd Packet Length Std": fwd_packet_length_std,
-            "Bwd Packet Length Max": bwd_packet_length_max,
-            "Bwd Packet Length Min": bwd_packet_length_min,
-            "Bwd Packet Length Mean": bwd_packet_length_mean,
-            "Bwd Packet Length Std": bwd_packet_length_std,
-            "Flow IAT Mean": flow_iat_mean,
-            "Flow IAT Std": flow_iat_std,
-            "Flow IAT Max": flow_iat_max,
-            "Flow IAT Min": flow_iat_min,
-            "Fwd IAT Total": fwd_iat_total,
-            "Fwd IAT Mean": fwd_iat_mean,
-            "Fwd IAT Std": fwd_iat_std,
-            "Fwd IAT Max": fwd_iat_max,
-            "Fwd IAT Min": fwd_iat_min,
-            "Bwd IAT Total": bwd_iat_total,
-            "Bwd IAT Mean": bwd_iat_mean,
-            "Bwd IAT Std": bwd_iat_std,
-            "Bwd IAT Max": bwd_iat_max,
-            "Bwd IAT Min": bwd_iat_min,
-            "Min Packet Length": min_packet_length,
-            "Max Packet Length": max_packet_length,
-            "Packet Length Mean": packet_length_mean,
-            "Packet Length Std": packet_length_std,
-            "Packet Length Variance": packet_length_variance,
-            "Active Mean": active_mean,
-            "Active Std": active_std,
-            "Active Max": active_max,
-            "Active Min": active_min,
-            "Idle Mean": idle_mean,
-            "Idle Std": idle_std,
-            "Idle Max": idle_max,
-            "Idle Min": idle_min,
-        }
-    )
+    subflow_fwd_packets = max(flow.subflow_forward_packets) if flow.subflow_forward_packets else flow.forward_packets
+    subflow_fwd_bytes = max(flow.subflow_forward_bytes) if flow.subflow_forward_bytes else flow.forward_bytes
+    subflow_bwd_packets = max(flow.subflow_backward_packets) if flow.subflow_backward_packets else flow.backward_packets
+    subflow_bwd_bytes = max(flow.subflow_backward_bytes) if flow.subflow_backward_bytes else flow.backward_bytes
 
-    return features
+    timestamp_str = datetime.utcfromtimestamp(flow.start_time).isoformat() + "Z"
+
+    return {
+        "Flow ID": flow.flow_id,
+        "Source IP": flow.src_ip,
+        "Source Port": flow.src_port,
+        "Destination IP": flow.dst_ip,
+        "Destination Port": flow.dst_port,
+        "Protocol": flow.protocol,
+        "Timestamp": timestamp_str,
+        "Flow Duration": duration_microseconds,
+        "Total Fwd Packets": flow.forward_packets,
+        "Total Backward Packets": flow.backward_packets,
+        "Total Length of Fwd Packets": flow.forward_bytes,
+        "Total Length of Bwd Packets": flow.backward_bytes,
+        "Fwd Packet Length Max": fwd_packet_length_max,
+        "Fwd Packet Length Min": fwd_packet_length_min,
+        "Fwd Packet Length Mean": fwd_packet_length_mean,
+        "Fwd Packet Length Std": fwd_packet_length_std,
+        "Bwd Packet Length Max": bwd_packet_length_max,
+        "Bwd Packet Length Min": bwd_packet_length_min,
+        "Bwd Packet Length Mean": bwd_packet_length_mean,
+        "Bwd Packet Length Std": bwd_packet_length_std,
+        "Flow Bytes/s": flow_bytes_per_s,
+        "Flow Packets/s": flow_packets_per_s,
+        "Flow IAT Mean": flow_iat_mean,
+        "Flow IAT Std": flow_iat_std,
+        "Flow IAT Max": flow_iat_max,
+        "Flow IAT Min": flow_iat_min,
+        "Fwd IAT Total": fwd_iat_total,
+        "Fwd IAT Mean": fwd_iat_mean,
+        "Fwd IAT Std": fwd_iat_std,
+        "Fwd IAT Max": fwd_iat_max,
+        "Fwd IAT Min": fwd_iat_min,
+        "Bwd IAT Total": bwd_iat_total,
+        "Bwd IAT Mean": bwd_iat_mean,
+        "Bwd IAT Std": bwd_iat_std,
+        "Bwd IAT Max": bwd_iat_max,
+        "Bwd IAT Min": bwd_iat_min,
+        "Fwd PSH Flags": flow.fwd_psh_flags,
+        "Bwd PSH Flags": flow.bwd_psh_flags,
+        "Fwd URG Flags": flow.fwd_urg_flags,
+        "Bwd URG Flags": flow.bwd_urg_flags,
+        "Fwd Header Length": flow.forward_header_bytes,
+        "Bwd Header Length": flow.backward_header_bytes,
+        "Fwd Packets/s": fwd_packets_per_s,
+        "Bwd Packets/s": bwd_packets_per_s,
+        "Min Packet Length": min_packet_length,
+        "Max Packet Length": max_packet_length,
+        "Packet Length Mean": packet_length_mean,
+        "Packet Length Std": packet_length_std,
+        "Packet Length Variance": packet_length_variance,
+        "FIN Flag Count": flow.fin_count,
+        "SYN Flag Count": flow.syn_count,
+        "RST Flag Count": flow.rst_count,
+        "PSH Flag Count": flow.psh_count,
+        "ACK Flag Count": flow.ack_count,
+        "URG Flag Count": flow.urg_count,
+        "CWE Flag Count": flow.cwr_count,
+        "ECE Flag Count": flow.ece_count,
+        "Down/Up Ratio": flow.down_up_ratio,
+        "Average Packet Size": flow.avg_packet_size,
+        "Avg Fwd Segment Size": flow.avg_fwd_segment_size,
+        "Avg Bwd Segment Size": flow.avg_bwd_segment_size,
+        "Fwd Header Length.1": flow.forward_header_bytes,
+        "Fwd Avg Bytes/Bulk": 0.0,
+        "Fwd Avg Packets/Bulk": 0.0,
+        "Fwd Avg Bulk Rate": 0.0,
+        "Bwd Avg Bytes/Bulk": 0.0,
+        "Bwd Avg Packets/Bulk": 0.0,
+        "Bwd Avg Bulk Rate": 0.0,
+        "Subflow Fwd Packets": subflow_fwd_packets,
+        "Subflow Fwd Bytes": subflow_fwd_bytes,
+        "Subflow Bwd Packets": subflow_bwd_packets,
+        "Subflow Bwd Bytes": subflow_bwd_bytes,
+        "Init_Win_bytes_forward": flow.init_win_bytes_forward,
+        "Init_Win_bytes_backward": flow.init_win_bytes_backward,
+        "act_data_pkt_fwd": flow.act_data_pkt_fwd,
+        "min_seg_size_forward": flow.min_seg_size_forward,
+        "Active Mean": active_mean,
+        "Active Std": active_std,
+        "Active Max": active_max,
+        "Active Min": active_min,
+        "Idle Mean": idle_mean,
+        "Idle Std": idle_std,
+        "Idle Max": idle_max,
+        "Idle Min": idle_min,
+        "Label": 0,
+    }
 
 
-def extract_flow_features(pcap_path: Path, *, fast: bool = False) -> List[Dict[str, object]]:
+def extract_flow_features(pcap_path: Path) -> List[Dict[str, object]]:
     """Read a PCAP file and return flow features for each bidirectional stream."""
 
     flows = build_flows(iterate_packets(pcap_path))
-    return [flow_to_feature_dict(flow, fast=fast) for flow in flows.values()]
+    return [flow_to_feature_dict(flow) for flow in flows.values()]

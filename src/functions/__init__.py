@@ -27,6 +27,7 @@ _safe_export(
     (
         "DetectionResult",
         "TrainingSummary",
+        "write_metadata",
         "ModelTrainer",
         "ModelPredictor",
         "detect_pcap_with_model",
@@ -42,11 +43,13 @@ _safe_export(
 _safe_export(
     "feature_extractor",
     (
-        "FeatureExtractor",
         "extract_pcap_features",
         "extract_pcap_features_to_file",
         "extract_sources_to_jsonl",
         "list_pcap_sources",
+        "extract_features",
+        "extract_features_dir",
+        "get_loaded_plugin_info",
     ),
 )
 
