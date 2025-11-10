@@ -3,12 +3,20 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap
 from pathlib import Path
 import numpy as np
-from typing import Collection, Dict, List, Optional, Set, Tuple, Union
+from typing import Callable, Collection, Dict, List, Optional, Set, Tuple, Union
 from datetime import datetime
 
 import yaml
 import matplotlib
 matplotlib.use("Agg")
+matplotlib.rcParams["font.sans-serif"] = [
+    "Microsoft YaHei",
+    "PingFang SC",
+    "SimHei",
+    "Arial Unicode MS",
+    "Noto Sans CJK SC",
+]
+matplotlib.rcParams["axes.unicode_minus"] = False
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 from joblib import load as joblib_load
@@ -579,15 +587,42 @@ class AnomalyDetailDialog(QtWidgets.QDialog):
 
 
 class ConfigEditorDialog(QtWidgets.QDialog):
-    def __init__(self, *, title: str, text: str, parent=None) -> None:
+    def __init__(
+        self,
+        *,
+        title: str = "编辑全局配置",
+        text: str = "",
+        path: Optional[Path] = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(700, 520)
+        self.resize(760, 560)
+        self.setModal(True)
+
         layout = QtWidgets.QVBoxLayout(self)
+
+        if path is not None:
+            path_label = QtWidgets.QLabel(f"配置文件：{path}")
+            path_label.setWordWrap(True)
+            path_label.setStyleSheet("color: #4B5563;")
+            layout.addWidget(path_label)
+
         self.editor = QtWidgets.QPlainTextEdit(self)
-        self.editor.setPlainText(text)
+        try:
+            fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+            self.editor.setFont(fixed_font)
+        except Exception:
+            pass
+        if hasattr(self.editor, "setTabStopDistance"):
+            metrics = self.editor.fontMetrics()
+            self.editor.setTabStopDistance(metrics.horizontalAdvance(" ") * 4)
+        self.editor.setPlainText(text or "")
         layout.addWidget(self.editor)
-        btn_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel)
+
+        btn_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Save | QtWidgets.QDialogButtonBox.Cancel
+        )
         layout.addWidget(btn_box)
         btn_box.accepted.connect(self.accept)
         btn_box.rejected.connect(self.reject)
@@ -595,6 +630,139 @@ class ConfigEditorDialog(QtWidgets.QDialog):
     def text(self) -> str:
         return self.editor.toPlainText()
 
+
+class LogViewerDialog(QtWidgets.QDialog):
+    def __init__(
+        self,
+        log_dir: Path,
+        *,
+        reveal_callback: Optional[Callable[[str], None]] = None,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._log_dir = Path(log_dir)
+        self._reveal_callback = reveal_callback
+
+        self.setWindowTitle("查看日志")
+        self.resize(900, 620)
+        self.setModal(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        header = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("日志文件列表")
+        title.setStyleSheet("font-weight: 600; color: #0F172A;")
+        header.addWidget(title)
+        header.addStretch(1)
+        self.refresh_btn = QtWidgets.QPushButton("刷新")
+        self.refresh_btn.setObjectName("secondary")
+        header.addWidget(self.refresh_btn)
+        layout.addLayout(header)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.file_list = QtWidgets.QListWidget()
+        self.file_list.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.file_list.setMinimumWidth(260)
+        splitter.addWidget(self.file_list)
+
+        self.viewer = QtWidgets.QPlainTextEdit()
+        self.viewer.setReadOnly(True)
+        splitter.addWidget(self.viewer)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter)
+
+        footer = QtWidgets.QHBoxLayout()
+        footer.addStretch(1)
+        self.open_btn = QtWidgets.QPushButton("在资源管理器中打开")
+        footer.addWidget(self.open_btn)
+        layout.addLayout(footer)
+
+        self.refresh_btn.clicked.connect(self._reload)
+        self.file_list.currentItemChanged.connect(self._display_file)
+        self.open_btn.clicked.connect(self._open_in_explorer)
+
+        self._reload()
+
+    def _reload(self) -> None:
+        self.file_list.clear()
+        self.viewer.clear()
+
+        if not self._log_dir.exists():
+            self.viewer.setPlainText(f"日志目录不存在：{self._log_dir}")
+            return
+
+        candidates: Set[Path] = set()
+        for pattern in ("*.log", "*.txt", "*.json", "*.yaml", "*.yml"):
+            candidates.update(self._log_dir.rglob(pattern))
+        if not candidates:
+            candidates.update(p for p in self._log_dir.rglob("*") if p.is_file())
+
+        entries: List[Tuple[float, Path]] = []
+        for path in sorted(candidates):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            entries.append((stat.st_mtime, path))
+
+        if not entries:
+            self.viewer.setPlainText("日志目录中暂无文件。")
+            return
+
+        entries.sort(key=lambda item: item[0], reverse=True)
+
+        for mtime, path in entries[:200]:
+            timestamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+            item = QtWidgets.QListWidgetItem(f"{path.name}  ({timestamp})")
+            item.setToolTip(str(path))
+            item.setData(QtCore.Qt.UserRole, str(path))
+            self.file_list.addItem(item)
+
+        if self.file_list.count():
+            self.file_list.setCurrentRow(0)
+
+    def _display_file(self, current: Optional[QtWidgets.QListWidgetItem]) -> None:
+        if current is None:
+            self.viewer.clear()
+            return
+
+        path = current.data(QtCore.Qt.UserRole)
+        if not path:
+            self.viewer.clear()
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                text = fh.read()
+        except UnicodeDecodeError:
+            try:
+                with open(path, "r", encoding="gb18030", errors="replace") as fh:
+                    text = fh.read()
+            except Exception as exc:
+                self.viewer.setPlainText(f"无法读取日志文件：{exc}")
+                return
+        except Exception as exc:
+            self.viewer.setPlainText(f"无法读取日志文件：{exc}")
+            return
+
+        max_len = 200_000
+        if len(text) > max_len:
+            text = text[-max_len:]
+            text = "...\n" + text
+        self.viewer.setPlainText(text)
+        self.viewer.moveCursor(QtGui.QTextCursor.End)
+
+    def _open_in_explorer(self) -> None:
+        current = self.file_list.currentItem()
+        if current is None:
+            return
+        path = current.data(QtCore.Qt.UserRole)
+        if not path:
+            return
+        if self._reveal_callback:
+            self._reveal_callback(path)
+            return
+        QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(os.path.dirname(path)))
 
 class OnlineDetectionWorker(QtCore.QThread):
     new_file = QtCore.pyqtSignal(str)
@@ -1320,8 +1488,8 @@ class Ui_MainWindow(object):
 
         model_group, model_layout = self._create_collapsible_group("模型阶段")
         model_layout.addWidget(self.btn_train)
-        model_layout.addWidget(self.btn_analysis)
         model_layout.addWidget(self.btn_predict)
+        model_layout.addWidget(self.btn_analysis)
         model_layout.addStretch(1)
         self.right_layout.addWidget(model_group)
 
@@ -1400,10 +1568,70 @@ class Ui_MainWindow(object):
             lines.append(f"{module}: {desc}")
         self.plugin_label.setText("\n".join(lines))
 
+    def _active_config_path(self) -> Path:
+        env_value = os.getenv("MALDET_CONFIG")
+        if env_value and str(env_value).strip():
+            candidate = Path(str(env_value)).expanduser()
+            if candidate.is_dir():
+                for name in ("config.yaml", "default.yaml", "settings.yaml"):
+                    probe = candidate / name
+                    if probe.exists():
+                        return probe
+                return candidate / "config.yaml"
+            return candidate
+        default_path = project_root() / "config" / "default.yaml"
+        return default_path
+
     def _open_config_editor_dialog(self) -> None:
-        dialog = ConfigEditorDialog(self.right_frame)
+        config_path = self._active_config_path()
+        config_path_parent = config_path.parent
+
+        try:
+            if config_path.exists():
+                text = config_path.read_text(encoding="utf-8")
+            else:
+                sample = load_config() or {}
+                if isinstance(sample, dict) and sample:
+                    text = yaml.safe_dump(sample, allow_unicode=True, sort_keys=False)
+                else:
+                    text = "# 在此编写全局配置（YAML 格式）\npaths:\n  data_dir: data\n"
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法加载配置文件：{exc}")
+            return
+
+        dialog = ConfigEditorDialog(
+            title="编辑全局配置",
+            text=text,
+            path=config_path,
+            parent=self,
+        )
         result = dialog.exec_()
         if result != QtWidgets.QDialog.Accepted:
+            return
+
+        new_text = dialog.text().strip()
+        if not new_text:
+            QtWidgets.QMessageBox.warning(None, "内容为空", "配置内容不能为空。")
+            return
+
+        try:
+            parsed = yaml.safe_load(new_text) or {}
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(None, "格式错误", f"配置内容不是有效的 YAML：{exc}")
+            return
+
+        if not isinstance(parsed, dict):
+            QtWidgets.QMessageBox.critical(None, "格式错误", "配置文件的根节点必须是一个字典。")
+            return
+
+        try:
+            config_path_parent.mkdir(parents=True, exist_ok=True)
+            with open(config_path, "w", encoding="utf-8") as fh:
+                fh.write(new_text)
+                if not new_text.endswith("\n"):
+                    fh.write("\n")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(None, "保存失败", f"无法写入配置文件：{exc}")
             return
 
         try:
@@ -1415,7 +1643,7 @@ class Ui_MainWindow(object):
         self._update_plugin_summary()
         self._refresh_model_versions()
         self._update_status_message()
-        self.display_result("[INFO] 配置已更新，相关目录和插件信息已刷新。")
+        self.display_result(f"[INFO] 配置已更新并保存至：{config_path}")
 
     def _toggle_online_detection(self) -> None:
         if pd is None:
@@ -2580,99 +2808,297 @@ class Ui_MainWindow(object):
         if not file_path.lower().endswith(".pdf"):
             file_path += ".pdf"
 
-        metadata = self._selected_metadata if isinstance(self._selected_metadata, dict) else analysis.get("metadata")
-        prediction = self._latest_prediction_summary if isinstance(self._latest_prediction_summary, dict) else None
+        metadata = (
+            self._selected_metadata if isinstance(self._selected_metadata, dict) else analysis.get("metadata")
+        )
+        prediction = (
+            self._latest_prediction_summary if isinstance(self._latest_prediction_summary, dict) else None
+        )
         try:
             annot_info = annotation_summary()
         except Exception:
             annot_info = {}
 
+        metrics = analysis.get("metrics") if isinstance(analysis.get("metrics"), dict) else {}
+        summary_text = str(analysis.get("summary_text") or "").strip()
+        summary_lines = [line for line in summary_text.splitlines() if line.strip()]
+        export_payload = (
+            analysis.get("export_payload") if isinstance(analysis.get("export_payload"), dict) else {}
+        )
+
+        def _fmt_percent(value: object, digits: int = 2) -> Optional[str]:
+            try:
+                return format(float(value), f".{digits}%")
+            except Exception:
+                return None
+
+        def _fmt_float(value: object, digits: int = 3) -> Optional[str]:
+            try:
+                return format(float(value), f".{digits}f")
+            except Exception:
+                return None
+
         try:
             with PdfPages(file_path) as pdf:
-                fig, ax = plt.subplots(figsize=(8.27, 11.69))
-                ax.axis("off")
-                y_pos = 0.95
-                ax.text(0.5, y_pos, "恶意流量检测自动化报告", ha="center", va="top", fontsize=20, weight="bold")
-                y_pos -= 0.06
 
-                def add_line(text_line: str, *, indent: float = 0.0, fontsize: int = 12) -> None:
+                def _new_page() -> Tuple[plt.Figure, plt.Axes]:
+                    fig_obj, ax_obj = plt.subplots(figsize=(8.27, 11.69))
+                    fig_obj.patch.set_facecolor("#FFFFFF")
+                    ax_obj.axis("off")
+                    return fig_obj, ax_obj
+
+                fig, ax = _new_page()
+                y_pos = 0.94
+
+                ax.text(
+                    0.5,
+                    y_pos,
+                    "恶意流量检测分析报告",
+                    ha="center",
+                    va="top",
+                    fontsize=22,
+                    weight="bold",
+                    color="#0F172A",
+                )
+                y_pos -= 0.08
+                ax.text(
+                    0.5,
+                    y_pos,
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    ha="center",
+                    va="top",
+                    fontsize=12,
+                    color="#4B5563",
+                )
+                y_pos -= 0.05
+
+                def _ensure_space(lines: float = 1.0) -> None:
                     nonlocal fig, ax, y_pos
-                    if y_pos < 0.08:
+                    required = lines * 0.032 + 0.04
+                    if y_pos - required < 0.08:
                         pdf.savefig(fig, bbox_inches="tight")
                         plt.close(fig)
-                        fig, ax = plt.subplots(figsize=(8.27, 11.69))
-                        ax.axis("off")
-                        y_pos = 0.95
-                    ax.text(0.05 + indent, y_pos, text_line, fontsize=fontsize, va="top")
-                    y_pos -= 0.035
+                        fig, ax = _new_page()
+                        y_pos = 0.94
 
-                add_line(f"报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                def _add_section(title: str, rows: List[Union[str, Tuple[str, str]]]) -> None:
+                    nonlocal fig, ax, y_pos
+                    content = [row for row in rows if row]
+                    if not content:
+                        return
+                    estimated_lines = 1.0
+                    for row in content:
+                        if isinstance(row, tuple):
+                            text_value = str(row[1])
+                        else:
+                            text_value = str(row)
+                        wrapped = textwrap.wrap(text_value, width=70) or [text_value]
+                        estimated_lines += max(1, len(wrapped))
+                    _ensure_space(estimated_lines)
+                    ax.text(
+                        0.05,
+                        y_pos,
+                        title,
+                        fontsize=14,
+                        weight="bold",
+                        color="#0F172A",
+                        va="top",
+                    )
+                    y_pos -= 0.045
+                    for row in content:
+                        if isinstance(row, tuple):
+                            label, value = row
+                            wrapped = textwrap.wrap(str(value), width=64) or [""]
+                            ax.text(
+                                0.06,
+                                y_pos,
+                                f"{label}：",
+                                fontsize=12,
+                                weight="bold",
+                                color="#111827",
+                                va="top",
+                            )
+                            ax.text(
+                                0.22,
+                                y_pos,
+                                wrapped[0],
+                                fontsize=12,
+                                color="#111827",
+                                va="top",
+                            )
+                            y_pos -= 0.032
+                            for extra_line in wrapped[1:]:
+                                _ensure_space(1)
+                                ax.text(
+                                    0.22,
+                                    y_pos,
+                                    extra_line,
+                                    fontsize=12,
+                                    color="#111827",
+                                    va="top",
+                                )
+                                y_pos -= 0.032
+                        else:
+                            wrapped = textwrap.wrap(str(row), width=72) or [""]
+                            for line in wrapped:
+                                ax.text(
+                                    0.06,
+                                    y_pos,
+                                    line,
+                                    fontsize=12,
+                                    color="#111827",
+                                    va="top",
+                                )
+                                y_pos -= 0.032
+                    y_pos -= 0.02
+
+                base_rows: List[Tuple[str, str]] = []
                 if metadata:
                     if metadata.get("timestamp"):
-                        add_line(f"模型训练时间：{metadata['timestamp']}")
+                        base_rows.append(("模型训练时间", str(metadata.get("timestamp"))))
                     if metadata.get("contamination") is not None:
-                        add_line(f"训练污染率：{float(metadata['contamination']):.2%}")
+                        percent = _fmt_percent(metadata.get("contamination"))
+                        if percent:
+                            base_rows.append(("训练污染率", percent))
                     if metadata.get("training_anomaly_ratio") is not None:
-                        add_line(f"训练异常占比：{float(metadata['training_anomaly_ratio']):.2%}")
+                        percent = _fmt_percent(metadata.get("training_anomaly_ratio"))
+                        if percent:
+                            base_rows.append(("训练异常占比", percent))
                     if metadata.get("estimated_precision") is not None:
-                        add_line(f"估计精度：{float(metadata['estimated_precision']):.2%}")
+                        percent = _fmt_percent(metadata.get("estimated_precision"))
+                        if percent:
+                            base_rows.append(("模型估计精度", percent))
                 if analysis.get("out_dir"):
-                    add_line(f"分析输出目录：{analysis.get('out_dir')}")
+                    base_rows.append(("分析输出目录", str(analysis.get("out_dir"))))
+                if base_rows:
+                    _add_section("基础信息", base_rows)
 
-                summary_text = analysis.get("summary_text")
-                if summary_text:
-                    add_line("分析摘要：")
-                    for line in textwrap.wrap(str(summary_text), width=68):
-                        add_line(line, indent=0.02)
+                if summary_lines:
+                    _add_section("分析结论摘要", summary_lines)
 
-                metrics = analysis.get("metrics") if isinstance(analysis.get("metrics"), dict) else {}
+                metric_rows: List[Union[str, Tuple[str, str]]] = []
                 if metrics:
-                    add_line("关键指标：")
-                    if metrics.get("malicious_ratio") is not None:
-                        add_line(f"当前异常占比：{float(metrics['malicious_ratio']):.2%}", indent=0.02)
-                    if metrics.get("anomaly_count") is not None:
-                        add_line(f"异常样本数量：{int(metrics['anomaly_count'])}", indent=0.02)
-                    if metrics.get("total_count") is not None:
-                        add_line(f"总样本数量：{int(metrics['total_count'])}", indent=0.02)
-                    drift_block = metrics.get("drift") if isinstance(metrics.get("drift"), dict) else {}
-                    if drift_block:
-                        add_line("漂移检测：", indent=0.02)
+                    if metrics.get("total_rows") is not None:
+                        metric_rows.append(("检测样本总数", str(metrics.get("total_rows"))))
+                    if metrics.get("malicious_total") is not None:
+                        detail = str(metrics.get("malicious_total"))
+                        ratio = _fmt_percent(metrics.get("malicious_ratio"))
+                        if ratio:
+                            detail = f"{detail}（异常占比 {ratio}）"
+                        metric_rows.append(("异常样本数量", detail))
+                    if metrics.get("anomaly_count") is not None and metrics.get("anomaly_count") != metrics.get("malicious_total"):
+                        metric_rows.append(("疑似异常数量", str(metrics.get("anomaly_count"))))
+                    if metrics.get("score_threshold") is not None:
+                        formatted = _fmt_float(metrics.get("score_threshold"), 6)
+                        if formatted:
+                            metric_rows.append(("建议异常得分阈值", formatted))
+                    if metrics.get("ratio_threshold") is not None:
+                        percent = _fmt_percent(metrics.get("ratio_threshold"))
+                        if percent:
+                            metric_rows.append(("文件级异常阈值", f"恶意占比 ≥ {percent}"))
+                    drift_alerts = metrics.get("drift_alerts")
+                    if isinstance(drift_alerts, dict) and drift_alerts:
+                        metric_rows.append(
+                            (
+                                "分布漂移告警",
+                                ", ".join(f"{k}: {_fmt_percent(v, 2) or v}" for k, v in drift_alerts.items()),
+                            )
+                        )
+                    model_metrics = metrics.get("model_metrics")
+                    if isinstance(model_metrics, dict) and model_metrics:
+                        parts = []
                         for key, label in (
-                            ("kl_divergence", "KL 散度"),
-                            ("psi", "PSI"),
-                            ("p_value", "p-value"),
+                            ("precision", "Precision"),
+                            ("recall", "Recall"),
+                            ("f1", "F1"),
+                            ("roc_auc", "ROC-AUC"),
+                            ("pr_auc", "PR-AUC"),
                         ):
-                            if drift_block.get(key) is not None:
-                                add_line(f"{label}：{float(drift_block[key]):.4f}", indent=0.04)
-                    eval_block = metrics.get("model_metrics") if isinstance(metrics.get("model_metrics"), dict) else {}
-                    if eval_block:
-                        add_line("模型评估：", indent=0.02)
-                        for key in ("precision", "recall", "f1", "roc_auc", "pr_auc"):
-                            if eval_block.get(key) is None:
+                            value = model_metrics.get(key)
+                            if value is None:
                                 continue
-                            value = eval_block[key]
                             if key in {"precision", "recall", "f1"}:
-                                add_line(f"{key.upper()}：{float(value):.2%}", indent=0.04)
+                                formatted = _fmt_percent(value)
                             else:
-                                add_line(f"{key.upper()}：{float(value):.3f}", indent=0.04)
+                                formatted = _fmt_float(value, 3)
+                            if formatted:
+                                parts.append(f"{label} {formatted}")
+                        if parts:
+                            metric_rows.append(("模型评估", "，".join(parts)))
+                if metric_rows:
+                    _add_section("关键指标", metric_rows)
 
                 if annot_info and annot_info.get("total"):
-                    add_line(
-                        "人工标注累计：{} 条（异常 {}，正常 {}）".format(
-                            int(annot_info.get("total", 0)),
-                            int(annot_info.get("anomalies", 0)),
-                            int(annot_info.get("normals", 0)),
-                        ),
-                        indent=0.02,
+                    total = annot_info.get("total", 0)
+                    anomalies = annot_info.get("anomalies", 0)
+                    normals = annot_info.get("normals", 0)
+                    _add_section(
+                        "人工标注统计",
+                        [
+                            (
+                                "累计标注",
+                                f"共 {total} 条（异常 {anomalies}，正常 {normals}）",
+                            )
+                        ],
                     )
 
                 if prediction and prediction.get("summary"):
-                    add_line("最近一次预测：")
-                    for line in prediction.get("summary") or []:
-                        add_line(str(line), indent=0.02)
+                    lines = [str(item) for item in prediction.get("summary") if item]
+                    if lines:
+                        _add_section("最近一次模型预测", lines)
+
+                export_rows: List[Tuple[str, str]] = []
+                if metrics.get("summary_csv"):
+                    export_rows.append(("总体统计 CSV", str(metrics.get("summary_csv"))))
+                if metrics.get("top_csv"):
+                    export_rows.append(("Top 异常 CSV", str(metrics.get("top_csv"))))
+                if analysis.get("summary_json"):
+                    export_rows.append(("分析摘要 JSON", str(analysis.get("summary_json"))))
+                if export_payload and export_payload.get("status_text"):
+                    export_rows.append(("整体判断", str(export_payload.get("status_text"))))
+                if export_rows:
+                    _add_section("输出文件", export_rows)
 
                 pdf.savefig(fig, bbox_inches="tight")
                 plt.close(fig)
+
+                preview_df = None
+                top_csv = metrics.get("top_csv") or analysis.get("top20_csv")
+                if top_csv and os.path.exists(str(top_csv)) and pd is not None:
+                    try:
+                        preview_df = read_csv_flexible(top_csv, nrows=8)
+                    except Exception:
+                        preview_df = None
+                if preview_df is not None and not preview_df.empty:
+                    fig_table, ax_table = _new_page()
+                    ax_table.set_title("Top 异常样本预览", fontsize=16, pad=20)
+                    display_df = preview_df.head(8)
+                    max_cols = min(6, len(display_df.columns))
+                    columns = [str(col) for col in display_df.columns[:max_cols]]
+                    data = [
+                        [str(value)[:80] for value in row]
+                        for row in display_df.iloc[:, :max_cols].itertuples(index=False)
+                    ]
+                    table = ax_table.table(
+                        cellText=data,
+                        colLabels=columns,
+                        loc="center",
+                        cellLoc="left",
+                    )
+                    table.auto_set_font_size(False)
+                    table.set_fontsize(10)
+                    table.scale(1.0, 1.3)
+                    ax_table.axis("off")
+                    ax_table.text(
+                        0.5,
+                        0.05,
+                        f"数据来源：{os.path.basename(str(top_csv))}",
+                        ha="center",
+                        fontsize=10,
+                        color="#4B5563",
+                    )
+                    pdf.savefig(fig_table, bbox_inches="tight")
+                    plt.close(fig_table)
 
                 plot_candidates: List[str] = []
                 timeline_path = analysis.get("timeline_plot")
@@ -2690,16 +3116,23 @@ class Ui_MainWindow(object):
                     if abs_path in seen or not os.path.exists(abs_path):
                         continue
                     seen.add(abs_path)
-                    fig, ax = plt.subplots(figsize=(8.27, 11.69))
-                    ax.axis("off")
+                    fig_plot, ax_plot = _new_page()
                     try:
                         image = plt.imread(abs_path)
-                        ax.imshow(image)
-                        ax.set_title(os.path.basename(abs_path), fontsize=12)
+                        ax_plot.imshow(image)
+                        ax_plot.axis("off")
+                        ax_plot.set_title(os.path.basename(abs_path), fontsize=12)
                     except Exception as exc:
-                        ax.text(0.5, 0.5, f"无法加载图像：{os.path.basename(abs_path)}\n{exc}", ha="center", va="center")
-                    pdf.savefig(fig, bbox_inches="tight")
-                    plt.close(fig)
+                        ax_plot.axis("off")
+                        ax_plot.text(
+                            0.5,
+                            0.5,
+                            f"无法加载图像：{os.path.basename(abs_path)}\n{exc}",
+                            ha="center",
+                            va="center",
+                        )
+                    pdf.savefig(fig_plot, bbox_inches="tight")
+                    plt.close(fig_plot)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(None, "导出失败", f"生成报告时出错：{exc}")
             return
@@ -3975,7 +4408,8 @@ class Ui_MainWindow(object):
         self._reveal_in_folder(self._default_results_dir())
 
     def _open_logs_dir(self):
-        self._reveal_in_folder(str(LOGS_DIR))
+        dialog = LogViewerDialog(LOGS_DIR, reveal_callback=self._reveal_in_folder, parent=self)
+        dialog.exec_()
 
     def _on_output_double_click(self, it):
         self._reveal_in_folder(it.data(QtCore.Qt.UserRole))
