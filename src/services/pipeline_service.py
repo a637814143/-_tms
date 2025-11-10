@@ -41,12 +41,9 @@ try:
         train_unsupervised_on_split,
     )
 except ModuleNotFoundError:  # pragma: no cover - triggered in lightweight envs
-    from src.functions.simple_unsupervised import (
-        compute_risk_components,
-        simple_predict,
-        train_unsupervised_on_split,
-        load_simple_model,
-    )
+    compute_risk_components = None  # type: ignore[assignment]
+    train_unsupervised_on_split = None  # type: ignore[assignment]
+
     def summarize_prediction_labels(
         predictions: Iterable[object],
         label_mapping: Optional[Dict[int, str]] = None,
@@ -71,11 +68,15 @@ except ModuleNotFoundError:  # pragma: no cover - triggered in lightweight envs
         normal_count = max(len(labels) - anomaly_count, 0)
         status = "异常" if anomaly_count > 0 else ("正常" if labels else None)
         return labels, anomaly_count, normal_count, status
-else:
+
+try:  # Optional lightweight inference helpers.
     from src.functions.simple_unsupervised import (
         simple_predict,
         load_simple_model,
     )
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    simple_predict = None  # type: ignore[assignment]
+    load_simple_model = None  # type: ignore[assignment]
 
 logger = get_logger(__name__)
 
@@ -120,6 +121,10 @@ def _run_prediction(
         raise FileNotFoundError(f"未找到特征 CSV: {feature_csv}")
 
     if pipeline_path.lower().endswith(".json"):
+        if load_simple_model is None or simple_predict is None:
+            raise RuntimeError(
+                "当前环境不支持 JSON 模型推理，请安装 simple_unsupervised 模块或提供完整模型管线。"
+            )
         model = load_simple_model(pipeline_path)
         output_path, _ = simple_predict(
             model,
@@ -133,6 +138,10 @@ def _run_prediction(
             "normal_count": None,
         }
     else:
+        if compute_risk_components is None or train_unsupervised_on_split is None:
+            raise RuntimeError(
+                "缺少建模依赖（如 scikit-learn），无法加载完整模型。"
+            )
         if joblib_load is None or pd is None or np is None:
             raise RuntimeError(
                 "缺少 numpy/pandas/joblib 依赖，无法加载完整模型。"
@@ -310,6 +319,8 @@ def _handle_extract(args: argparse.Namespace) -> int:
 
 
 def _handle_train(args: argparse.Namespace) -> int:
+    if train_unsupervised_on_split is None:
+        raise RuntimeError("缺少建模依赖（如 scikit-learn），无法执行训练流程。")
     disabled_steps = args.disable_step or []
     pipeline_components = _build_pipeline_components(disabled_steps)
     speed_config = _build_speed_config(
