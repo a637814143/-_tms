@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Set
 
@@ -411,8 +412,14 @@ def analyze_results(
             export_cols.append(name)
     export_cols.append("top_reasons")
     export_cols = [col for col in export_cols if col in top_meta.columns]
-    top_csv_path = os.path.join(out_dir, "top20_packets.csv")
-    top_meta.loc[:, export_cols].to_csv(top_csv_path, index=False, encoding="utf-8")
+    top_csv_base = "top20_packets.csv"
+    top_csv_path = os.path.join(out_dir, top_csv_base)
+    try:
+        top_meta.loc[:, export_cols].to_csv(top_csv_path, index=False, encoding="utf-8")
+    except PermissionError:
+        alt_name = f"top20_packets_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        top_csv_path = os.path.join(out_dir, alt_name)
+        top_meta.loc[:, export_cols].to_csv(top_csv_path, index=False, encoding="utf-8")
 
     quantile_points = [0.01, 0.05, 0.5, 0.9, 0.95, 0.99]
     score_quantiles = df_meta[score_col].quantile(quantile_points).to_dict()
@@ -451,7 +458,7 @@ def analyze_results(
 
     summary_lines = [
         f"总检测样本数：{total_rows}",
-        f"Top {top_n} 异常样本已导出至 top20_packets.csv",
+        f"Top {top_n} 异常样本已导出至 {os.path.basename(top_csv_path)}",
     ]
     if unique_files:
         summary_lines.append(f"涉及文件数：{unique_files}")
