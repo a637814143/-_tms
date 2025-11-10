@@ -1097,6 +1097,7 @@ class Ui_MainWindow(object):
         self._last_out_csv: Optional[str] = None
         self._analysis_summary: Optional[dict] = None
         self._latest_prediction_summary: Optional[dict] = None
+        self._auto_analyze_tip_shown: bool = False
 
         # 分页状态
         self._csv_paged_path: Optional[str] = None
@@ -3510,17 +3511,26 @@ class Ui_MainWindow(object):
         QtWidgets.QMessageBox.critical(None, "训练失败", msg)
         self.display_result(f"[错误] 训练失败: {msg}")
 
-    def _auto_analyze(self, csv_path: str) -> None:
+    def _auto_analyze(self, csv_path: str) -> bool:
         btn = getattr(self, "btn_analysis", None)
         if not csv_path or not os.path.exists(csv_path) or btn is None:
-            return
+            return False
 
         settings = getattr(self, "_settings", None)
-        if settings is not None and not bool(settings.get("auto_analyze_after_predict", True)):
-            return
+        auto_enabled = False
+        if settings is not None:
+            try:
+                auto_enabled = bool(settings.get("auto_analyze_after_predict"))
+            except Exception:
+                auto_enabled = False
 
-        if not btn.isEnabled():
-            return
+        if not auto_enabled or not btn.isEnabled():
+            if not getattr(self, "_auto_analyze_tip_shown", False):
+                self.display_result(
+                    "[INFO] 预测结果已生成，如需分析请点击右侧的“运行分析”按钮。"
+                )
+                self._auto_analyze_tip_shown = True
+            return False
 
         out_dir = self._analysis_out_dir()
         os.makedirs(out_dir, exist_ok=True)
@@ -3532,7 +3542,7 @@ class Ui_MainWindow(object):
                 meta_path = latest_meta
 
         if not meta_path or not os.path.exists(meta_path):
-            return
+            return False
 
         self.display_result(f"[INFO] 自动分析预测结果 -> {out_dir}")
         self._analysis_summary = None
@@ -3558,6 +3568,7 @@ class Ui_MainWindow(object):
             self._on_analysis_error,
             lambda p: self.set_button_progress(btn, p),
         )
+        return True
 
     # --------- 运行分析 ----------
     def _on_run_analysis(self):
@@ -4408,8 +4419,34 @@ class Ui_MainWindow(object):
         self._reveal_in_folder(self._default_results_dir())
 
     def _open_logs_dir(self):
-        dialog = LogViewerDialog(LOGS_DIR, reveal_callback=self._reveal_in_folder, parent=self)
-        dialog.exec_()
+        try:
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        try:
+            sample_file = next((p for p in LOGS_DIR.rglob("*") if p.is_file()), None)
+        except Exception:
+            sample_file = None
+
+        try:
+            dialog = LogViewerDialog(LOGS_DIR, reveal_callback=self._reveal_in_folder, parent=self)
+            if dialog.exec_() == 0 and sample_file is None:
+                QtWidgets.QMessageBox.information(
+                    None,
+                    "暂无日志",
+                    "当前日志目录为空，已自动为您打开日志目录。",
+                )
+                self._reveal_in_folder(str(LOGS_DIR))
+            return
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(
+                None,
+                "查看失败",
+                f"内置日志查看器无法启动：{exc}\n已尝试直接打开日志目录。",
+            )
+
+        self._reveal_in_folder(str(LOGS_DIR))
 
     def _on_output_double_click(self, it):
         self._reveal_in_folder(it.data(QtCore.Qt.UserRole))
