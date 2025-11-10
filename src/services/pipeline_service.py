@@ -80,12 +80,7 @@ else:
 logger = get_logger(__name__)
 
 PIPELINE_STEPS = {
-    "feature_weighter",
-    "variance_filter",
     "scaler",
-    "deep_features",
-    "gaussianizer",
-    "rbf_expander",
 }
 
 
@@ -327,8 +322,6 @@ def _handle_train(args: argparse.Namespace) -> int:
         args.results_dir,
         args.models_dir,
         contamination=args.contamination,
-        rbf_components=args.rbf_components,
-        rbf_gamma=args.rbf_gamma,
         fusion_alpha=args.fusion_alpha,
         enable_supervised_fusion=not args.no_fusion,
         feature_selection_ratio=args.feature_ratio,
@@ -411,8 +404,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("results_dir", help="训练结果目录")
     p_train.add_argument("models_dir", help="模型输出目录")
     p_train.add_argument("--contamination", type=float, default=0.05, help="预期异常比例")
-    p_train.add_argument("--rbf-components", type=int, default=None, help="RBF 特征数量")
-    p_train.add_argument("--rbf-gamma", type=float, default=None, help="RBF γ 参数")
     p_train.add_argument("--fusion-alpha", type=float, default=0.5, help="半监督融合权重")
     p_train.add_argument("--no-fusion", action="store_true", help="禁用半监督融合")
     p_train.add_argument(
@@ -486,8 +477,6 @@ if FastAPI is not None:
         results_dir: str
         models_dir: str
         contamination: float = 0.05
-        rbf_components: Optional[int] = None
-        rbf_gamma: Optional[float] = None
         fusion_alpha: float = 0.5
         fusion_enabled: bool = True
         feature_ratio: Optional[float] = None
@@ -525,8 +514,6 @@ if FastAPI is not None:
                     req.results_dir,
                     req.models_dir,
                     contamination=req.contamination,
-                    rbf_components=req.rbf_components,
-                    rbf_gamma=req.rbf_gamma,
                     fusion_alpha=req.fusion_alpha,
                     enable_supervised_fusion=req.fusion_enabled,
                     feature_selection_ratio=req.feature_ratio,
