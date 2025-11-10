@@ -1381,12 +1381,7 @@ class Ui_MainWindow(object):
         self.right_layout.addWidget(dashboard_group)
 
         pipeline_options = [
-            ("feature_weighter", "特征加权"),
-            ("variance_filter", "低方差过滤"),
             ("scaler", "标准化"),
-            ("deep_features", "深度表征 (AutoEncoder)"),
-            ("gaussianizer", "分位数正态化"),
-            ("rbf_expander", "RBF 特征扩展"),
         ]
         self.pipeline_labels = {key: label for key, label in pipeline_options}
         self.pipeline_group, pipeline_layout = self._create_collapsible_group(
@@ -1424,17 +1419,6 @@ class Ui_MainWindow(object):
         two_stage_layout.addWidget(self.two_stage_ratio_spin)
         two_stage_row.setMinimumHeight(38)
 
-        self.rbf_components_spin = QtWidgets.QSpinBox()
-        self.rbf_components_spin.setRange(0, 2048)
-        self.rbf_components_spin.setSingleStep(32)
-        self.rbf_components_spin.setSpecialValueText("自动")
-        self.rbf_components_spin.setValue(384)
-        self.rbf_gamma_spin = QtWidgets.QDoubleSpinBox()
-        self.rbf_gamma_spin.setRange(0.0, 5.0)
-        self.rbf_gamma_spin.setDecimals(4)
-        self.rbf_gamma_spin.setSingleStep(0.05)
-        self.rbf_gamma_spin.setSpecialValueText("自动 (≈1/√d)")
-        self.rbf_gamma_spin.setValue(0.0)
         self.fusion_checkbox = QtWidgets.QCheckBox("启用半监督融合")
         self.fusion_checkbox.setChecked(True)
         self.fusion_alpha_spin = QtWidgets.QDoubleSpinBox()
@@ -1471,8 +1455,6 @@ class Ui_MainWindow(object):
         feature_slider_row.setMinimumHeight(38)
         ag_layout.addRow("极速模式：", self.speed_mode_checkbox)
         ag_layout.addRow("两阶段精排：", two_stage_row)
-        ag_layout.addRow("RBF 维度：", self.rbf_components_spin)
-        ag_layout.addRow("RBF γ：", self.rbf_gamma_spin)
         ag_layout.addRow("半监督融合：", self.fusion_checkbox)
         ag_layout.addRow("融合权重 α：", self.fusion_alpha_spin)
         ag_layout.addRow("特征筛选阈值：", feature_slider_row)
@@ -1481,8 +1463,6 @@ class Ui_MainWindow(object):
         self._on_feature_slider_changed(self.feature_slider.value())
         self._update_two_stage_controls()
         for widget in (
-            self.rbf_components_spin,
-            self.rbf_gamma_spin,
             self.fusion_alpha_spin,
             self.memory_ceiling_combo,
             self.two_stage_ratio_spin,
@@ -1491,8 +1471,6 @@ class Ui_MainWindow(object):
         for field in (
             self.speed_mode_checkbox,
             two_stage_row,
-            self.rbf_components_spin,
-            self.rbf_gamma_spin,
             self.fusion_checkbox,
             self.fusion_alpha_spin,
             self.memory_ceiling_combo,
@@ -1787,8 +1765,6 @@ class Ui_MainWindow(object):
         self.btn_page_next.clicked.connect(self._on_page_next)
         self.page_size_spin.valueChanged.connect(self._on_page_size_changed)
         self.btn_show_all.clicked.connect(self._show_full_preview)
-        self.rbf_components_spin.valueChanged.connect(self._on_training_settings_changed)
-        self.rbf_gamma_spin.valueChanged.connect(self._on_training_settings_changed)
         self.fusion_checkbox.toggled.connect(lambda checked: self.fusion_alpha_spin.setEnabled(checked))
         self.fusion_checkbox.toggled.connect(self._on_training_settings_changed)
         self.fusion_alpha_spin.valueChanged.connect(self._on_training_settings_changed)
@@ -3106,8 +3082,6 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 开始训练，输入: {path}")
         self._set_action_buttons_enabled(False)
         self.btn_train.setEnabled(False); self.set_button_progress(self.btn_train, 1)
-        comp = self.rbf_components_spin.value()
-        gamma = self.rbf_gamma_spin.value()
         fusion_enabled = self.fusion_checkbox.isChecked()
         fusion_alpha = self.fusion_alpha_spin.value()
         feature_ratio = self.feature_slider.value()
@@ -3120,8 +3094,6 @@ class Ui_MainWindow(object):
             path,
             res_dir,
             mdl_dir,
-            rbf_components=int(comp) if comp > 0 else None,
-            rbf_gamma=float(gamma) if gamma > 0 else None,
             enable_supervised_fusion=bool(fusion_enabled),
             fusion_alpha=float(fusion_alpha),
             feature_selection_ratio=feature_ratio,
@@ -3209,21 +3181,6 @@ class Ui_MainWindow(object):
             msg_lines.append(f"得分阈值={threshold:.6f}")
         if vote_thr is not None:
             msg_lines.append(f"投票阈值={vote_thr:.3f}")
-        if res.get("rbf_components"):
-            msg_lines.append(f"RBF 维度={int(res['rbf_components'])}")
-        if res.get("expanded_dim"):
-            msg_lines.append(f"展开后维度={int(res['expanded_dim'])}")
-        gamma_val = res.get("rbf_gamma")
-        if gamma_val is not None:
-            gamma_line = f"RBF γ={float(gamma_val):.3f}"
-            source = res.get("rbf_gamma_source")
-            if source == "auto":
-                gamma_line += "（自动）"
-            elif source == "manual":
-                gamma_line += "（手动）"
-            msg_lines.append(gamma_line)
-        if res.get("rbf_gamma_auto") is not None:
-            msg_lines.append(f"自动γ估计≈{float(res['rbf_gamma_auto']):.3f}")
         fusion_enabled = res.get("fusion_enabled")
         if fusion_enabled is not None:
             if fusion_enabled:
@@ -3273,14 +3230,6 @@ class Ui_MainWindow(object):
             msg_lines.append(f"稳健裁剪列={len(wins_cols)}")
         if res.get("estimated_precision") is not None:
             msg_lines.append(f"异常置信度均值≈{res.get('estimated_precision'):.2%}")
-        weight_info = res.get("feature_weighting") or {}
-        if isinstance(weight_info, dict) and weight_info.get("ratio"):
-            ratio_val = float(weight_info.get("ratio", 0.0))
-            selected = weight_info.get("selected_features") or []
-            total_feats = len(res.get("feature_columns") or [])
-            msg_lines.append(
-                f"特征筛选≈{ratio_val * 100:.0f}% (保留 {len(selected)}/{total_feats})"
-            )
         if res.get("active_learning_csv"):
             msg_lines.append(f"主动学习候选: {res['active_learning_csv']}")
         pseudo_info = res.get("pseudo_labels") or {}
@@ -3366,18 +3315,6 @@ class Ui_MainWindow(object):
                 except Exception:
                     pass
             msg_lines.append(line)
-        compute_device = res.get("compute_device") or res.get("deep_features", {}).get("device")
-        backend_name = None
-        deep_info = res.get("deep_features") or {}
-        if isinstance(deep_info, dict):
-            backend_name = deep_info.get("backend") or res.get("deep_backend")
-            loss_val = deep_info.get("training_loss")
-            if loss_val is not None:
-                msg_lines.append(f"自编码器训练误差≈{float(loss_val):.4f}")
-        if compute_device or backend_name:
-            msg_lines.append(
-                f"深度特征运行于 {backend_name or 'numpy'} @ {compute_device or 'CPU'}"
-            )
         feature_importances = res.get("feature_importances_topk") or []
         if feature_importances:
             preview_items = []
@@ -4355,8 +4292,6 @@ class Ui_MainWindow(object):
         self.fusion_alpha_spin.setEnabled(self.fusion_checkbox.isChecked())
         self._update_two_stage_controls()
         try:
-            self._settings.set("rbf_components", int(self.rbf_components_spin.value()))
-            self._settings.set("rbf_gamma", float(self.rbf_gamma_spin.value()))
             self._settings.set("fusion_enabled", bool(self.fusion_checkbox.isChecked()))
             self._settings.set("fusion_alpha", float(self.fusion_alpha_spin.value()))
             self._settings.set("memory_ceiling_idx", int(self.memory_ceiling_combo.currentIndex()))
@@ -4375,16 +4310,6 @@ class Ui_MainWindow(object):
             last_path = self._settings.get("last_input_path")
             if isinstance(last_path, str) and last_path:
                 self.file_edit.setText(last_path)
-            saved_components = self._settings.get("rbf_components", 0) or 0
-            saved_gamma = self._settings.get("rbf_gamma", 0.0) or 0.0
-            try:
-                self.rbf_components_spin.setValue(int(saved_components))
-            except Exception:
-                self.rbf_components_spin.setValue(0)
-            try:
-                self.rbf_gamma_spin.setValue(float(saved_gamma))
-            except Exception:
-                self.rbf_gamma_spin.setValue(0.0)
             fusion_enabled = self._settings.get("fusion_enabled", True)
             self.fusion_checkbox.setChecked(bool(fusion_enabled))
             saved_alpha = self._settings.get("fusion_alpha", 0.5)
