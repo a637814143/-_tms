@@ -1584,45 +1584,70 @@ class Ui_MainWindow(object):
         return default_path
 
     def _open_config_editor_dialog(self) -> None:
-        config_path = self._active_config_path()
+        try:
+            config_path = self._active_config_path()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "定位失败", f"无法确定配置文件路径：{exc}")
+            return
+
         config_path_parent = config_path.parent
+
+        text = ""
+        warning: Optional[str] = None
 
         try:
             if config_path.exists():
-                text = config_path.read_text(encoding="utf-8")
+                try:
+                    text = config_path.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    with open(config_path, "r", encoding="utf-8", errors="replace") as fh:
+                        text = fh.read()
+                    warning = "检测到非 UTF-8 字符，已自动替换为占位符显示。"
             else:
                 sample = load_config() or {}
                 if isinstance(sample, dict) and sample:
-                    text = yaml.safe_dump(sample, allow_unicode=True, sort_keys=False)
-                else:
+                    dump_kwargs = {"allow_unicode": True}
+                    try:
+                        text = yaml.safe_dump(sample, sort_keys=False, **dump_kwargs)
+                    except TypeError:
+                        text = yaml.safe_dump(sample, **dump_kwargs)
+                if not text:
                     text = "# 在此编写全局配置（YAML 格式）\npaths:\n  data_dir: data\n"
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法加载配置文件：{exc}")
+            warning = f"无法加载配置文件：{exc}"
+            text = "# 在此编写全局配置（YAML 格式）\npaths:\n  data_dir: data\n"
+
+        try:
+            dialog = ConfigEditorDialog(
+                title="编辑全局配置",
+                text=text,
+                path=config_path,
+                parent=self,
+            )
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "初始化失败", f"无法打开配置编辑器：{exc}")
             return
 
-        dialog = ConfigEditorDialog(
-            title="编辑全局配置",
-            text=text,
-            path=config_path,
-            parent=self,
-        )
+        if warning:
+            QtWidgets.QMessageBox.warning(self, "读取提示", warning)
+
         result = dialog.exec_()
         if result != QtWidgets.QDialog.Accepted:
             return
 
         new_text = dialog.text().strip()
         if not new_text:
-            QtWidgets.QMessageBox.warning(None, "内容为空", "配置内容不能为空。")
+            QtWidgets.QMessageBox.warning(self, "内容为空", "配置内容不能为空。")
             return
 
         try:
             parsed = yaml.safe_load(new_text) or {}
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(None, "格式错误", f"配置内容不是有效的 YAML：{exc}")
+            QtWidgets.QMessageBox.critical(self, "格式错误", f"配置内容不是有效的 YAML：{exc}")
             return
 
         if not isinstance(parsed, dict):
-            QtWidgets.QMessageBox.critical(None, "格式错误", "配置文件的根节点必须是一个字典。")
+            QtWidgets.QMessageBox.critical(self, "格式错误", "配置文件的根节点必须是一个字典。")
             return
 
         try:
@@ -1632,12 +1657,33 @@ class Ui_MainWindow(object):
                 if not new_text.endswith("\n"):
                     fh.write("\n")
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(None, "保存失败", f"无法写入配置文件：{exc}")
+            QtWidgets.QMessageBox.critical(self, "保存失败", f"无法写入配置文件：{exc}")
             return
 
         try:
             if hasattr(load_config, "cache_clear"):
                 load_config.cache_clear()
+        except Exception:
+            pass
+
+        try:
+            refreshed = get_paths(
+                {
+                    "split": "split_dir",
+                    "csv_info": "csv_info_dir",
+                    "csv_feature": "csv_feature_dir",
+                    "csv_preprocess": "csv_preprocess_dir",
+                    "models": "models_dir",
+                    "results_analysis": "results_analysis_dir",
+                    "results_pred": "results_prediction_dir",
+                    "results_abnormal": "results_abnormal_dir",
+                    "results": "results_dir",
+                    "logs": "logs_dir",
+                    "settings": "settings_dir",
+                }
+            )
+            if isinstance(refreshed, dict):
+                PATHS.update(refreshed)
         except Exception:
             pass
 
