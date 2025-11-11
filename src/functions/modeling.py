@@ -20,7 +20,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import train_test_split
 
-from .static_features import extract_pcap_features
+from .feature_extractor import extract_pcap_features
 from .vectorizer import (
     VectorizationResult,
     load_vectorized_dataset,

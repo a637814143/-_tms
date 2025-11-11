@@ -27,7 +27,7 @@ import os
 import numpy as np
 
 from .csv_utils import read_csv_flexible
-from .static_features import extract_pcap_features
+from .feature_extractor import extract_pcap_features
 
 try:  # Optional dependency for command-line progress bars.
     from tqdm import tqdm
