@@ -13,8 +13,16 @@ DEFAULTS = dict(
     SCAN_TARGETS = 30,       # 同一 src 连接的不同 dst_port 或不同 dst_ip 的数量阈值
     BEACON_STD_MAX = 0.005,  # 到达间隔方差很小（单位：秒），视作周期性
     BEACON_MIN_PKTS = 20,    # 需要一定包数才算有意义
-    EXFIL_BPS_RATIO = 0.8,   # 近似：bps 很高 + （若有 up/down 列）上行比例高
+    EXFIL_BPS_RATIO = 0.8,   # bps 的经验百分位阈值（兼容旧逻辑）
+    EXFIL_UP_RATIO = 0.8,    # 上行/总流量占比异常阈值
     SYN_HEAVY = 15,          # SYN 明显多于 ACK 的简易阈
+    RATE_SPIKE_ABS = 1000.0, # 速率突增阈值（bytes/s）
+    SMALL_PKT_MEAN = 50.0,   # 小包均值阈值（字节）
+    SMALL_PKT_PPS = 100.0,   # 小包高频阈值（包/秒）
+    ICMP_BPS_HI = 50000.0,   # ICMP 流量速率异常阈值
+    TLS_DURATION_MAX = 1.0,  # TLS 握手极短持续时间阈值
+    PORT_SCAN_UNIQUE_PORTS = 10,  # 同一 src 访问端口数量阈值
+    BPS_SIGMA_MULT = 3.0,    # 动态带宽阈值：均值+N*std
 )
 
 # 规则判定异常时的默认触发阈值
@@ -38,7 +46,7 @@ def score_rules(df: pd.DataFrame, params: Dict=None) -> Tuple[pd.Series, pd.Seri
     reasons: List[List[str]] = [[] for _ in range(n)]
 
     # 统一需要的列
-    col = lambda name: _to_float(df[name]) if name in df.columns else np.zeros(n, dtype=np.float32)
+    col = lambda name: _to_float(df[name]) if name in df.columns else pd.Series(np.zeros(n, dtype=np.float32), index=df.index)
     proto = df["protocol"].astype(str) if "protocol" in df.columns else pd.Series([""]*n)
 
     pps = col("pps")
@@ -47,6 +55,13 @@ def score_rules(df: pd.DataFrame, params: Dict=None) -> Tuple[pd.Series, pd.Seri
     inter_mean = col("inter_arrival_mean")
     inter_std  = col("inter_arrival_std")
     tcp_flags_count = col("tcp_flag_count")
+    flow_bytes = col("flow_bytes")
+    flow_up_bytes = col("flow_up_bytes")
+    flow_rate = col("flow_byts_per_s") if "flow_byts_per_s" in df.columns else bps
+    flow_pkts_per_s = col("flow_pkts_per_s")
+    packet_len_mean = col("packet_length_mean")
+    flow_duration = col("flow_duration")
+    unique_ports = col("unique_ports_accessed")
 
     # 1) UDP Flood：UDP 且包速高
     udp_mask = proto.isin(["17", "udp", "UDP", "Udp"])
@@ -78,17 +93,81 @@ def score_rules(df: pd.DataFrame, params: Dict=None) -> Tuple[pd.Series, pd.Seri
             reasons[i].append("周期心跳(Beacon)")
 
     # 4) 外泄：bps 高 + （如果存在上/下行）上行占比高
-    # 你当前没有 up/down 列，这里先用 bps 高做近似；若将来加上 bytes_up/bytes_down 再增强
-    exfil_mask = (bps >= np.percentile(bps[bps>0], 90) if (bps>0).any() else (bps > 0))
-    score[exfil_mask] += 20
+    if (bps > 0).any():
+        percentile_param = params["EXFIL_BPS_RATIO"]
+        percentile_value = percentile_param * 100 if percentile_param <= 1 else percentile_param
+        valid_bps = bps[bps > 0].to_numpy()
+        percentile_threshold = np.percentile(valid_bps, percentile_value)
+        exfil_mask = bps >= percentile_threshold
+    else:
+        exfil_mask = bps > 0
     for i in np.where(exfil_mask)[0]:
+        score[i] += 20
         reasons[i].append("大带宽传输(疑似外泄)")
+
+    if _exists(df, ["flow_bytes", "flow_up_bytes"]):
+        total = flow_bytes.to_numpy()
+        up_bytes = flow_up_bytes.to_numpy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = np.divide(up_bytes, total, out=np.zeros(n, dtype=np.float32), where=total > 0)
+        exfil_up_mask = (total > 0) & (ratio >= params["EXFIL_UP_RATIO"])
+        for i in np.where(exfil_up_mask)[0]:
+            score[i] += 15
+            reasons[i].append("上行占比异常(疑似外泄)")
+
+    # 动态检测异常高带宽
+    valid_rate = flow_rate[flow_rate > 0]
+    if len(valid_rate) > 1:
+        mean_rate = valid_rate.mean()
+        std_rate = valid_rate.std(ddof=0)
+        dynamic_threshold = mean_rate + params["BPS_SIGMA_MULT"] * std_rate
+        sigma_mask = flow_rate >= dynamic_threshold
+        for i in np.where(sigma_mask)[0]:
+            score[i] += 20
+            reasons[i].append("瞬时带宽异常高")
 
     # 5) SYN 异常（近似）：tcp_flag_count 不为 0 且超过阈值（如果你后续把各 flag 单独计数，这里可更精准）
     synheavy_mask = (tcp_flags_count >= params["SYN_HEAVY"])
-    score[synheavy_mask] += 20
     for i in np.where(synheavy_mask)[0]:
+        score[i] += 20
         reasons[i].append("SYN 异常")
+
+    # 6) 流量速率突增（DoS/Bot 异常指征）
+    if "src_ip" in df.columns:
+        previous_rate = flow_rate.groupby(df["src_ip"]).shift(1)
+    else:
+        previous_rate = flow_rate.shift(1)
+    previous_rate = previous_rate.fillna(flow_rate)
+    flow_rate_arr = flow_rate.to_numpy()
+    spike_mask = np.abs(flow_rate_arr - previous_rate.to_numpy()) > params["RATE_SPIKE_ABS"]
+    for i in np.where(spike_mask)[0]:
+        score[i] += 20
+        reasons[i].append("流量速率突增")
+
+    # 7) 小包泛洪
+    small_packet_mask = (packet_len_mean > 0) & (packet_len_mean < params["SMALL_PKT_MEAN"]) & (flow_pkts_per_s > params["SMALL_PKT_PPS"])
+    for i in np.where(small_packet_mask)[0]:
+        score[i] += 25
+        reasons[i].append("小包高频(疑似洪泛)")
+
+    # 8) 协议分布异常（ICMP 突出）
+    icmp_mask = proto.str.upper().eq("ICMP") & (flow_rate > params["ICMP_BPS_HI"])
+    for i in np.where(icmp_mask.values)[0]:
+        score[i] += 30
+        reasons[i].append("异常 ICMP 流量")
+
+    # 9) TLS 握手异常
+    tls_mask = proto.str.upper().eq("TLS") & (flow_duration > 0) & (flow_duration < params["TLS_DURATION_MAX"])
+    for i in np.where(tls_mask.values)[0]:
+        score[i] += 30
+        reasons[i].append("TLS 握手持续时间过短")
+
+    # 10) 端口扫描 - 独立字段支持
+    if "unique_ports_accessed" in df.columns:
+        port_scan_mask = unique_ports >= params["PORT_SCAN_UNIQUE_PORTS"]
+        for i in np.where(port_scan_mask)[0]:
+            score[i] += 35
+            reasons[i].append("端口扫描(统计)")
 
     # 归一 & 文本
     score = np.clip(score, 0, 100).astype(np.float32)
