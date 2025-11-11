@@ -54,6 +54,19 @@ _safe_export(
 )
 
 _safe_export(
+    "static_features",
+    (
+        "extract_pcap_features",
+        "extract_pcap_features_to_file",
+        "extract_sources_to_jsonl",
+        "list_pcap_sources",
+        "extract_features",
+        "extract_features_dir",
+        "get_loaded_plugin_info",
+    ),
+)
+
+_safe_export(
     "vectorizer",
     (
         "CSVDatasetSummary",
