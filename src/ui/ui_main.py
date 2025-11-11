@@ -4352,6 +4352,314 @@ class Ui_MainWindow(object):
                 "\n".join(result.get("summary") or ["模型预测已完成并写出结果。"]),
             )
 
+    def _sanitize_prediction_input_frame(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        """Remove derived prediction columns before rerunning model inference."""
+
+        if pd is None or not isinstance(df, pd.DataFrame):
+            return df
+
+        cleaned = df.copy()
+        drop_columns = {
+            "prediction",
+            "prediction_label",
+            "prediction_status",
+            "malicious_score",
+            "anomaly_score",
+            "anomaly_confidence",
+            "vote_ratio",
+            "risk_score",
+            "is_malicious",
+            "manual_label",
+        }
+        try:
+            cleaned.drop(
+                columns=[col for col in drop_columns if col in cleaned.columns],
+                inplace=True,
+                errors="ignore",
+            )
+        except TypeError:
+            for col in list(drop_columns):
+                if col in cleaned.columns:
+                    cleaned.drop(columns=[col], inplace=True)
+
+        cleaned.reset_index(drop=True, inplace=True)
+        return cleaned
+
+    def _match_rows_from_latest(
+        self, selected_df: "pd.DataFrame"
+    ) -> Optional["pd.DataFrame"]:
+        """Match table selections against the last full prediction result."""
+
+        if pd is None or not isinstance(selected_df, pd.DataFrame) or selected_df.empty:
+            return None
+
+        snapshot = (
+            self._latest_prediction_summary
+            if isinstance(self._latest_prediction_summary, dict)
+            else None
+        )
+        if not snapshot:
+            return None
+
+        reference = snapshot.get("dataframe")
+        if not isinstance(reference, pd.DataFrame) or reference.empty:
+            return None
+
+        key_candidates: List[List[str]] = [
+            ["__source_path__", "flow_id"],
+            ["__source_file__", "flow_id"],
+            ["pcap_file", "flow_id"],
+            ["pcap_name", "flow_id"],
+            ["flow_id"],
+            ["frame_time_epoch", "src_ip", "dst_ip", "src_port", "dst_port"],
+        ]
+
+        usable_keys = [
+            keys
+            for keys in key_candidates
+            if all(key in selected_df.columns and key in reference.columns for key in keys)
+        ]
+
+        if not usable_keys:
+            return None
+
+        matched_rows: List[pd.Series] = []
+        used_indices: Set[int] = set()
+
+        for _, row in selected_df.iterrows():
+            match_index: Optional[int] = None
+            for keys in usable_keys:
+                mask = pd.Series(True, index=reference.index)
+                skip = False
+                for key in keys:
+                    value = row.get(key)
+                    try:
+                        is_missing = pd.isna(value)
+                    except Exception:
+                        is_missing = value in (None, "")
+                    if is_missing:
+                        skip = True
+                        break
+                    try:
+                        mask &= reference[key] == value
+                    except Exception:
+                        skip = True
+                        break
+                    if not mask.any():
+                        skip = True
+                        break
+                if skip or not mask.any():
+                    continue
+                candidate_indices = [
+                    int(idx)
+                    for idx in reference.index[mask]
+                    if int(idx) not in used_indices
+                ]
+                if candidate_indices:
+                    match_index = candidate_indices[0]
+                    break
+            if match_index is None:
+                return None
+            matched_rows.append(reference.loc[match_index])
+            used_indices.add(match_index)
+
+        if not matched_rows:
+            return None
+
+        rebuilt = pd.DataFrame(matched_rows).reset_index(drop=True)
+        return rebuilt
+
+    def _collect_anomaly_details(
+        self,
+        prediction: Optional[dict],
+        *,
+        source_name: str,
+        limit: int = 3,
+    ) -> Tuple[List[str], int]:
+        """Gather anomaly rows for batch summary dialogs."""
+
+        if not isinstance(prediction, dict):
+            return ([], 0)
+
+        metadata = (
+            prediction.get("metadata")
+            if isinstance(prediction.get("metadata"), dict)
+            else {}
+        )
+        frame = prediction.get("dataframe")
+        if not isinstance(frame, pd.DataFrame):
+            frame = None
+
+        row_messages = prediction.get("row_messages")
+        if not isinstance(row_messages, (list, tuple)):
+            row_messages = []
+        labels = prediction.get("labels")
+        if not isinstance(labels, (list, tuple)):
+            labels = []
+        predictions = prediction.get("predictions")
+        if not isinstance(predictions, (list, tuple)):
+            predictions = []
+
+        positive_tokens = {
+            "异常",
+            "恶意",
+            "malicious",
+            "anomaly",
+            "attack",
+            "threat",
+            "abnormal",
+            "positive",
+        }
+        meta_label = str(metadata.get("positive_label", "")).strip().lower()
+        if meta_label:
+            positive_tokens.add(meta_label)
+
+        positive_numeric_values: Set[int] = set()
+        meta_class = metadata.get("positive_class")
+        if isinstance(meta_class, (int, np.integer)):
+            positive_numeric_values.add(int(meta_class))
+        else:
+            try:
+                if meta_class is not None:
+                    positive_numeric_values.add(int(str(meta_class).strip()))
+            except (TypeError, ValueError):
+                pass
+        positive_numeric_values.update({1, -1})
+
+        def _value_is_positive(value: object) -> bool:
+            if value is None:
+                return False
+            text = str(value).strip()
+            if not text:
+                return False
+            lower = text.lower()
+            if any(token in lower for token in positive_tokens):
+                return True
+            numeric_value: Optional[int] = None
+            if isinstance(value, (int, np.integer)):
+                numeric_value = int(value)
+            else:
+                try:
+                    maybe_float = float(text)
+                except (TypeError, ValueError):
+                    maybe_float = None
+                if maybe_float is not None and not math.isnan(maybe_float):
+                    if abs(maybe_float - round(maybe_float)) < 1e-6:
+                        numeric_value = int(round(maybe_float))
+            if numeric_value is not None and numeric_value in positive_numeric_values:
+                return True
+            return False
+
+        indices: List[int] = []
+        if frame is not None and not frame.empty:
+            try:
+                if "prediction_status" in frame.columns:
+                    status_mask = (
+                        frame["prediction_status"].astype(str).str.contains("异常", na=False)
+                    )
+                    indices = [
+                        idx for idx, flag in enumerate(status_mask.to_numpy()) if bool(flag)
+                    ]
+                if not indices and "prediction_label" in frame.columns:
+                    label_mask = frame["prediction_label"].astype(str).str.lower().apply(
+                        lambda text: any(token in text for token in positive_tokens)
+                    )
+                    indices = [
+                        idx for idx, flag in enumerate(label_mask.to_numpy()) if bool(flag)
+                    ]
+                if not indices and "prediction" in frame.columns:
+                    pred_mask = frame["prediction"].apply(_value_is_positive)
+                    indices = [
+                        idx for idx, flag in enumerate(pred_mask.to_numpy()) if bool(flag)
+                    ]
+            except Exception:
+                indices = []
+
+        if not indices and labels:
+            for idx, label in enumerate(labels):
+                if _value_is_positive(label):
+                    indices.append(idx)
+
+        if not indices and predictions:
+            for idx, value in enumerate(predictions):
+                if _value_is_positive(value):
+                    indices.append(idx)
+
+        if not indices:
+            return ([], 0)
+
+        identifier_columns = (
+            "flow_id",
+            "__source_file__",
+            "__source_path__",
+            "pcap_file",
+            "pcap_name",
+            "file_name",
+            "src_ip",
+            "dst_ip",
+            "src_port",
+            "dst_port",
+        )
+
+        samples: List[str] = []
+        sample_limit = max(1, limit)
+        for idx in indices[:sample_limit]:
+            detail = ""
+            if row_messages and idx < len(row_messages):
+                detail = str(row_messages[idx])
+            elif frame is not None and idx < len(frame):
+                row = frame.iloc[idx]
+                identifier = None
+                for column in identifier_columns:
+                    if column not in frame.columns:
+                        continue
+                    value = row.get(column)
+                    try:
+                        missing = pd.isna(value)
+                    except Exception:
+                        missing = value in (None, "")
+                    if missing:
+                        continue
+                    text_value = str(value).strip()
+                    if text_value:
+                        identifier = f"{column}={text_value}"
+                        break
+                if identifier is None:
+                    identifier = f"第{idx + 1}行"
+
+                label_value = None
+                if "prediction_label" in frame.columns:
+                    label_value = row.get("prediction_label")
+                if label_value is None and labels and idx < len(labels):
+                    label_value = labels[idx]
+                if label_value is None:
+                    label_value = row.get("prediction")
+                label_text = str(label_value)
+
+                score_value = row.get("malicious_score")
+                if score_value is None:
+                    score_value = row.get("anomaly_score")
+                try:
+                    score_float = float(score_value)
+                except Exception:
+                    score_float = None
+                score_text = (
+                    f" 分数={score_float:.4f}"
+                    if score_float is not None and not math.isnan(score_float)
+                    else ""
+                )
+                detail = f"{identifier} -> 预测={label_text}{score_text}"
+
+            if not detail:
+                detail = f"第{idx + 1}行 -> 预测=异常"
+
+            if detail.startswith(f"{source_name}:"):
+                samples.append(detail)
+            else:
+                samples.append(f"{source_name}: {detail}")
+
+        return samples, len(indices)
+
     def _predict_pcap_batch(
         self,
         paths: List[str],
@@ -4379,6 +4687,7 @@ class Ui_MainWindow(object):
         successes = 0
         total_rows = 0
         total_malicious = 0
+        anomaly_samples: List[str] = []
         failed: List[Tuple[str, str]] = []
 
         try:
@@ -4428,10 +4737,17 @@ class Ui_MainWindow(object):
                     total_rows += int(prediction.get("total", 0))  # type: ignore[arg-type]
                 except Exception:
                     pass
+                sample_lines, sample_count = self._collect_anomaly_details(
+                    prediction,
+                    source_name=source_name,
+                    limit=3,
+                )
+                if sample_lines:
+                    anomaly_samples.extend(sample_lines)
                 try:
-                    total_malicious += int(prediction.get("malicious", 0))  # type: ignore[arg-type]
+                    total_malicious += int(prediction.get("malicious", sample_count))
                 except Exception:
-                    pass
+                    total_malicious += sample_count
 
             if successes == 0:
                 error_lines = [f"- {os.path.basename(path)}: {reason}" for path, reason in failed[:5]]
@@ -4457,6 +4773,15 @@ class Ui_MainWindow(object):
                 if len(failed) > 3:
                     sample += " ..."
                 summary_lines.append(f"失败样例：{sample}")
+
+            if anomaly_samples:
+                summary_lines.append("异常详情（最多展示前几条）：")
+                preview = anomaly_samples[:5]
+                summary_lines.extend(f"- {line}" for line in preview)
+                if len(anomaly_samples) > 5:
+                    summary_lines.append(
+                        f"... 另有 {len(anomaly_samples) - 5} 条异常未显示"
+                    )
 
             QtWidgets.QMessageBox.information(parent_widget, "预测完成", "\n".join(summary_lines))
         finally:
@@ -4503,27 +4828,28 @@ class Ui_MainWindow(object):
                     if row_numbers:
                         valid_rows = sorted({row for row in row_numbers if 0 <= row < len(df_source)})
                         if valid_rows:
-                            selected_df = df_source.iloc[valid_rows].copy()
-                            drop_columns = {
-                                "prediction",
-                                "prediction_label",
-                                "prediction_status",
-                                "malicious_score",
-                                "anomaly_score",
-                                "anomaly_confidence",
-                                "vote_ratio",
-                                "risk_score",
-                                "is_malicious",
-                                "manual_label",
-                            }
-                            try:
-                                selected_df.drop(columns=[col for col in drop_columns if col in selected_df], inplace=True, errors="ignore")
-                            except TypeError:
-                                # pandas<1.0 无 errors 参数
-                                for col in list(drop_columns):
-                                    if col in selected_df:
-                                        selected_df.drop(columns=[col], inplace=True)
-                            selected_df.reset_index(drop=True, inplace=True)
+                            base_index = getattr(df_source, "index", None)
+                            candidate_df: Optional["pd.DataFrame"] = None
+                            if pd is not None and isinstance(base_index, pd.Index):
+                                try:
+                                    index_values = [base_index[row] for row in valid_rows]
+                                except Exception:
+                                    index_values = []
+                                else:
+                                    full_df = getattr(self, "_last_preview_df", None)
+                                    if isinstance(full_df, pd.DataFrame) and index_values:
+                                        try:
+                                            candidate_df = full_df.loc[index_values].copy()
+                                        except Exception:
+                                            candidate_df = None
+                            if candidate_df is None:
+                                candidate_df = df_source.iloc[valid_rows].copy()
+                            selected_df = candidate_df
+
+        if selected_df is not None and not selected_df.empty:
+            selected_df = self._sanitize_prediction_input_frame(selected_df)
+            if not isinstance(selected_df, pd.DataFrame) or selected_df.empty:
+                selected_df = None
 
         if selected_df is not None and not selected_df.empty:
             metadata_override = None
@@ -4545,18 +4871,47 @@ class Ui_MainWindow(object):
                     pass
                 QtWidgets.QApplication.processEvents()
 
+            selection_count = len(selected_df)
+            result: Optional[dict] = None
+            error_message: Optional[str] = None
             try:
                 result = self._predict_dataframe(
                     selected_df,
-                    source_name=f"选中流量({len(selected_df)})",
+                    source_name=f"选中流量({selection_count})",
                     metadata_override=metadata_override,
                     silent=True,
                 )
             except Exception as exc:
+                fallback_frame = self._match_rows_from_latest(selected_df)
+                if isinstance(fallback_frame, pd.DataFrame) and not fallback_frame.empty:
+                    fallback_cleaned = self._sanitize_prediction_input_frame(fallback_frame)
+                    if isinstance(fallback_cleaned, pd.DataFrame) and not fallback_cleaned.empty:
+                        self.display_result(
+                            "[WARN] 所选流量缺少完整特征，已根据最近预测的原始特征补全后重试。"
+                        )
+                        try:
+                            result = self._predict_dataframe(
+                                fallback_cleaned,
+                                source_name=f"选中流量({selection_count})",
+                                metadata_override=metadata_override,
+                                silent=True,
+                            )
+                        except Exception as exc_inner:
+                            error_message = str(exc_inner)
+                    else:
+                        error_message = str(exc)
+                else:
+                    error_message = str(exc)
+
+            if result is None:
                 if button is not None:
                     button.setEnabled(True)
                     self.reset_button_progress(button)
-                QtWidgets.QMessageBox.critical(parent_widget, "预测失败", str(exc))
+                QtWidgets.QMessageBox.critical(
+                    parent_widget,
+                    "预测失败",
+                    error_message or "所选流量无法重新预测，请检查特征列是否完整。",
+                )
                 return
 
             if button is not None:
@@ -4569,7 +4924,7 @@ class Ui_MainWindow(object):
 
             self._present_prediction_result(
                 result,
-                source_name=f"选中流量({len(selected_df)})",
+                source_name=f"选中流量({selection_count})",
                 metadata_override=metadata_override,
                 show_dialog=True,
             )
