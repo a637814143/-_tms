@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 from PyQt5 import QtCore, QtGui, QtWidgets
-import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap
+import sys, os, platform, subprocess, math, shutil, json, textwrap
 from pathlib import Path
 import numpy as np
 from typing import Callable, Collection, Dict, List, Optional, Set, Tuple, Union
 from datetime import datetime
+from functools import partial
 
 import yaml
 import matplotlib
@@ -69,6 +70,72 @@ try:
     import pandas as pd
 except Exception:
     pd = None
+
+try:
+    from src.functions.risk_rules import (
+        DEFAULT_TRIGGER_THRESHOLD,
+        DEFAULT_MODEL_WEIGHT,
+        DEFAULT_RULE_WEIGHT,
+        DEFAULT_FUSION_THRESHOLD,
+        fuse_model_rule_votes,
+        score_rules as apply_risk_rules,
+    )
+except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
+    apply_risk_rules = None  # type: ignore
+    DEFAULT_TRIGGER_THRESHOLD = 60.0  # type: ignore
+    DEFAULT_MODEL_WEIGHT = 0.6  # type: ignore
+    DEFAULT_RULE_WEIGHT = 0.4  # type: ignore
+    DEFAULT_FUSION_THRESHOLD = 0.5  # type: ignore
+
+    def fuse_model_rule_votes(
+        model_flags: "np.ndarray | List[float] | List[int] | List[bool]",
+        rule_scores: "Optional[np.ndarray | List[float]]",
+        *,
+        model_weight: float = DEFAULT_MODEL_WEIGHT,
+        rule_weight: float = DEFAULT_RULE_WEIGHT,
+        threshold: float = DEFAULT_FUSION_THRESHOLD,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        model_arr = np.asarray(model_flags, dtype=float).reshape(-1)
+        if model_arr.size == 0:
+            empty = np.zeros(0, dtype=float)
+            return empty, empty.astype(bool)
+
+        model_arr = np.clip(model_arr, 0.0, 1.0)
+
+        if rule_scores is None:
+            normalized_rules = np.zeros_like(model_arr)
+            active_rule_weight = 0.0
+        else:
+            try:
+                rule_arr = np.asarray(rule_scores, dtype=float).reshape(-1)
+            except Exception:
+                rule_arr = None
+            if rule_arr is None or rule_arr.size == 0:
+                normalized_rules = np.zeros_like(model_arr)
+                active_rule_weight = 0.0
+            else:
+                if rule_arr.size != model_arr.size:
+                    if rule_arr.size < model_arr.size:
+                        padded = np.zeros_like(model_arr)
+                        padded[: rule_arr.size] = rule_arr
+                        rule_arr = padded
+                    else:
+                        rule_arr = rule_arr[: model_arr.size]
+                normalized_rules = np.clip(rule_arr / 100.0, 0.0, 1.0)
+                active_rule_weight = float(rule_weight)
+
+        total_weight = float(model_weight + active_rule_weight)
+        if not math.isfinite(total_weight) or total_weight <= 0.0:
+            model_w = 1.0
+            rule_w = 0.0
+        else:
+            model_w = float(model_weight) / total_weight
+            rule_w = float(active_rule_weight) / total_weight
+
+        fused_scores = model_w * model_arr + rule_w * normalized_rules
+        fused_flags = fused_scores >= float(threshold)
+
+        return fused_scores, fused_flags
 
 
 # ---- 简化的通用工具（保持在单文件中）----
@@ -824,6 +891,8 @@ def _resolve_data_base() -> Path:
 
 # 仅表格预览上限（全部数据都会落盘）
 PREVIEW_LIMIT_FOR_TABLE = 50
+MAX_INFO_FLOW_RECORDS = 5000
+MAX_INFO_PACKET_SAMPLES = 200_000
 
 DATA_BASE = _resolve_data_base()
 PATHS = get_paths(
@@ -1009,11 +1078,53 @@ def _align_input_features(
 
 # =============== 主 UI ===============
 class Ui_MainWindow(object):
+    _ANOMALY_HINTS = {
+        "异常",
+        "恶意",
+        "malicious",
+        "anomaly",
+        "attack",
+        "threat",
+        "abnormal",
+        "可疑",
+        "suspect",
+        "intrusion",
+    }
+
+    _NORMAL_HINTS = {
+        "正常",
+        "normal",
+        "benign",
+        "legit",
+        "legitimate",
+        "safe",
+        "良性",
+        "clean",
+    }
+
+    _ACTION_HANDLER_MAP = {
+        "btn_view": "_on_view_info",
+        "btn_fe": "_on_extract_features",
+        "btn_vector": "_on_preprocess_features",
+        "btn_train": "_on_train_model",
+        "btn_analysis": "_on_run_analysis",
+        "btn_predict": "_on_predict",
+        "btn_export": "_on_export_results",
+        "btn_open_results": "_open_results_dir",
+        "btn_view_logs": "_open_logs_dir",
+        "btn_clear": "_on_clear",
+        "btn_export_report": "_on_export_report",
+        "btn_config_editor": "_open_config_editor_dialog",
+        "btn_online_toggle": "_toggle_online_detection",
+    }
+
     # --------- 基本结构 ----------
     def setupUi(self, MainWindow):
+        self._main_window = MainWindow
         MainWindow.setObjectName("MainWindow")
         MainWindow.resize(1400, 840)
         MainWindow.setStyleSheet(APP_STYLE)
+        self._action_bindings_verified = False
 
         self.centralwidget = QtWidgets.QWidget(MainWindow)
         self.main_layout = QtWidgets.QVBoxLayout(self.centralwidget)
@@ -1111,6 +1222,7 @@ class Ui_MainWindow(object):
         self.preprocess_worker: Optional[FunctionThread] = None
         self.thread_pool = QtCore.QThreadPool.globalInstance()
         self._running_tasks: Set[BackgroundTask] = set()
+        self._progress_states: Dict[QtWidgets.QPushButton, Dict[str, object]] = {}
 
         # 用户偏好
         self._settings = AppSettings(SETTINGS_PATH)
@@ -1132,6 +1244,15 @@ class Ui_MainWindow(object):
 
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
+
+    def _parent_widget(self):
+        parent = getattr(self, "_main_window", None)
+        if isinstance(parent, QtWidgets.QWidget):
+            return parent
+        central = getattr(self, "centralwidget", None)
+        if isinstance(central, QtWidgets.QWidget):
+            return central
+        return None
 
     def _build_path_bar(self):
         self.file_group = QtWidgets.QGroupBox("数据源选择")
@@ -1161,11 +1282,9 @@ class Ui_MainWindow(object):
         row.addWidget(self.file_edit, 1)
         row.addStretch(1)
 
-        self.btn_pick_file = QtWidgets.QPushButton("选文件")
-        self.btn_pick_dir = QtWidgets.QPushButton("选目录")
-        self.btn_browse = QtWidgets.QPushButton("浏览")
-        for btn in (self.btn_pick_file, self.btn_pick_dir, self.btn_browse):
-            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.btn_pick_file = self._make_button("选文件")
+        self.btn_pick_dir = self._make_button("选目录")
+        self.btn_browse = self._make_button("浏览")
         row.addWidget(self.btn_pick_file)
         row.addWidget(self.btn_pick_dir)
         row.addWidget(self.btn_browse)
@@ -1222,8 +1341,8 @@ class Ui_MainWindow(object):
         ):
             widget.setMinimumHeight(38)
 
-        self.btn_prev = QtWidgets.QPushButton("上一批")
-        self.btn_next = QtWidgets.QPushButton("下一批")
+        self.btn_prev = self._make_button("上一批", object_name="secondary")
+        self.btn_next = self._make_button("下一批", object_name="secondary")
         for btn in (self.btn_prev, self.btn_next):
             btn.setMinimumWidth(120)
         nav_widget = QtWidgets.QWidget()
@@ -1232,9 +1351,6 @@ class Ui_MainWindow(object):
         nav_layout.setSpacing(12)
         nav_layout.addWidget(self.btn_prev, 1)
         nav_layout.addWidget(self.btn_next, 1)
-
-        for btn in (self.btn_prev, self.btn_next):
-            btn.setObjectName("secondary")
 
         pg.addRow("处理模式：", self.mode_combo)
         pg.addRow("批处理数量", self.batch_spin)
@@ -1300,8 +1416,8 @@ class Ui_MainWindow(object):
         hb.setContentsMargins(12, 0, 12, 0)
         hb.setSpacing(10)
 
-        self.btn_page_prev = QtWidgets.QPushButton("上一页")
-        self.btn_page_next = QtWidgets.QPushButton("下一页")
+        self.btn_page_prev = self._make_button("上一页", object_name="secondary")
+        self.btn_page_next = self._make_button("下一页", object_name="secondary")
         self.page_info = QtWidgets.QLabel("第 0/0 页")
         self.page_size_label = QtWidgets.QLabel("每页行数：")
         self.page_size_label.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight)
@@ -1309,11 +1425,9 @@ class Ui_MainWindow(object):
         self.page_size_spin.setRange(20, 200000)
         self.page_size_spin.setSingleStep(10)
         self.page_size_spin.setValue(50)
-        self.btn_show_all = QtWidgets.QPushButton("显示全部（可能较慢）")
+        self.btn_show_all = self._make_button("显示全部（可能较慢）", object_name="secondary")
 
         for btn in (self.btn_page_prev, self.btn_page_next, self.btn_show_all):
-            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-            btn.setObjectName("secondary")
             btn.setMinimumWidth(120)
 
         self.page_size_spin.setMinimumHeight(38)
@@ -1397,6 +1511,25 @@ class Ui_MainWindow(object):
         else:
             label.setText(base)
 
+    def _make_button(
+        self,
+        text: str,
+        *,
+        object_name: Optional[str] = None,
+        tooltip: Optional[str] = None,
+        icon: Optional[QtGui.QIcon] = None,
+        cursor: QtCore.Qt.CursorShape = QtCore.Qt.PointingHandCursor,
+    ) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(text)
+        if object_name:
+            button.setObjectName(object_name)
+        if tooltip:
+            button.setToolTip(tooltip)
+        if icon is not None:
+            button.setIcon(icon)
+        button.setCursor(QtGui.QCursor(cursor))
+        return button
+
     def _create_collapsible_group(
         self,
         title: str,
@@ -1435,6 +1568,30 @@ class Ui_MainWindow(object):
         _toggle(True)
         return group, inner_layout
 
+    def _add_group_with_controls(
+        self,
+        title: str,
+        controls: Collection[QtWidgets.QWidget],
+        *,
+        spacing: int = 8,
+        add_stretch: bool = True,
+    ) -> Tuple[QtWidgets.QGroupBox, QtWidgets.QLayout]:
+        group, layout = self._create_collapsible_group(title, spacing=spacing)
+        for widget in controls:
+            layout.addWidget(widget)
+        if add_stretch:
+            layout.addStretch(1)
+        self.right_layout.addWidget(group)
+        return group, layout
+
+    def _bind_button_actions(
+        self, bindings: Dict[QtWidgets.QAbstractButton, Callable[[], None]]
+    ) -> None:
+        for button, handler in bindings.items():
+            if button is None or handler is None:
+                continue
+            button.clicked.connect(handler)
+
     def _build_right_panel(self):
         self.right_scroll = QtWidgets.QScrollArea(self.centralwidget)
         self.right_scroll.setWidgetResizable(True)
@@ -1450,61 +1607,44 @@ class Ui_MainWindow(object):
 
         self.right_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
 
-        self.btn_view = QtWidgets.QPushButton("查看流量信息")
-        self.btn_fe = QtWidgets.QPushButton("提取特征")
-        self.btn_vector = QtWidgets.QPushButton("数据预处理")
-        self.btn_train = QtWidgets.QPushButton("训练模型")
-        self.btn_analysis = QtWidgets.QPushButton("运行分析")
-        self.btn_predict = QtWidgets.QPushButton("加载模型预测")
-        self.btn_export = QtWidgets.QPushButton("导出结果（异常）")
-        self.btn_open_results = QtWidgets.QPushButton("打开结果目录")
-        self.btn_view_logs = QtWidgets.QPushButton("查看日志")
-        self.btn_clear = QtWidgets.QPushButton("清空显示")
-        self.btn_export_report = QtWidgets.QPushButton("导出 PDF 报告")
-        self.btn_config_editor = QtWidgets.QPushButton("编辑全局配置")
-        self.btn_online_toggle = QtWidgets.QPushButton("开启在线检测")
-        for btn in (
-            self.btn_view,
-            self.btn_fe,
-            self.btn_vector,
-            self.btn_train,
-            self.btn_analysis,
-            self.btn_predict,
-            self.btn_export,
-            self.btn_open_results,
-            self.btn_view_logs,
-            self.btn_clear,
-            self.btn_export_report,
-            self.btn_config_editor,
-            self.btn_online_toggle,
-        ):
-            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        button_specs = (
+            ("btn_view", "查看流量信息"),
+            ("btn_fe", "提取特征"),
+            ("btn_vector", "数据预处理"),
+            ("btn_train", "训练模型"),
+            ("btn_analysis", "运行分析"),
+            ("btn_predict", "加载模型预测"),
+            ("btn_export", "导出结果（异常）"),
+            ("btn_open_results", "打开结果目录"),
+            ("btn_view_logs", "查看日志"),
+            ("btn_clear", "清空显示"),
+            ("btn_export_report", "导出 PDF 报告"),
+            ("btn_config_editor", "编辑全局配置"),
+            ("btn_online_toggle", "开启在线检测"),
+        )
+        for attr, text in button_specs:
+            setattr(self, attr, self._make_button(text))
 
-        data_group, data_layout = self._create_collapsible_group("数据阶段")
-        data_layout.addWidget(self.btn_view)
-        data_layout.addWidget(self.btn_fe)
-        data_layout.addWidget(self.btn_vector)
-        data_layout.addStretch(1)
-        self.right_layout.addWidget(data_group)
+        self._add_group_with_controls(
+            "数据阶段",
+            (self.btn_view, self.btn_fe, self.btn_vector),
+        )
 
-        model_group, model_layout = self._create_collapsible_group("模型阶段")
-        model_layout.addWidget(self.btn_train)
-        model_layout.addWidget(self.btn_predict)
-        model_layout.addWidget(self.btn_analysis)
-        model_layout.addStretch(1)
-        self.right_layout.addWidget(model_group)
+        self._add_group_with_controls(
+            "模型阶段",
+            (self.btn_train, self.btn_predict, self.btn_analysis),
+        )
 
-        output_group, output_layout = self._create_collapsible_group("输出管理")
-        output_layout.addWidget(self.btn_export)
-        output_layout.addWidget(self.btn_open_results)
-        output_layout.addWidget(self.btn_view_logs)
-        output_layout.addStretch(1)
-        self.right_layout.addWidget(output_group)
+        self._add_group_with_controls(
+            "输出管理",
+            (self.btn_export, self.btn_open_results, self.btn_view_logs),
+        )
 
-        utility_group, utility_layout = self._create_collapsible_group("系统与维护")
-        utility_layout.addWidget(self.btn_export_report)
-        utility_layout.addWidget(self.btn_config_editor)
-        utility_layout.addWidget(self.btn_online_toggle)
+        utility_group, utility_layout = self._add_group_with_controls(
+            "系统与维护",
+            (self.btn_export_report, self.btn_config_editor, self.btn_online_toggle),
+            add_stretch=False,
+        )
         self.online_status_label = QtWidgets.QLabel("在线检测未启动")
         self.online_status_label.setAlignment(QtCore.Qt.AlignCenter)
         self.online_status_label.setObjectName("OnlineStatusLabel")
@@ -1514,9 +1654,12 @@ class Ui_MainWindow(object):
         self.right_layout.addWidget(utility_group)
 
         self.dashboard = ResultsDashboard()
-        dashboard_group, dashboard_layout = self._create_collapsible_group("训练监控", spacing=10)
-        dashboard_layout.addWidget(self.dashboard)
-        self.right_layout.addWidget(dashboard_group)
+        self._add_group_with_controls(
+            "训练监控",
+            (self.dashboard,),
+            spacing=10,
+            add_stretch=False,
+        )
 
         self.model_group, mg_layout = self._create_collapsible_group("模型版本管理")
         model_row = QtWidgets.QHBoxLayout()
@@ -1524,9 +1667,7 @@ class Ui_MainWindow(object):
         model_row.setSpacing(8)
         self.model_combo = QtWidgets.QComboBox()
         self.model_combo.setMinimumHeight(38)
-        self.model_refresh_btn = QtWidgets.QPushButton("刷新")
-        self.model_refresh_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.model_refresh_btn.setObjectName("secondary")
+        self.model_refresh_btn = self._make_button("刷新", object_name="secondary")
         self.model_refresh_btn.setMinimumWidth(120)
         model_row.addWidget(self.model_combo)
         model_row.addWidget(self.model_refresh_btn)
@@ -1584,10 +1725,11 @@ class Ui_MainWindow(object):
         return default_path
 
     def _open_config_editor_dialog(self) -> None:
+        parent_widget = self._parent_widget()
         try:
             config_path = self._active_config_path()
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "定位失败", f"无法确定配置文件路径：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "定位失败", f"无法确定配置文件路径：{exc}")
             return
 
         config_path_parent = config_path.parent
@@ -1622,14 +1764,14 @@ class Ui_MainWindow(object):
                 title="编辑全局配置",
                 text=text,
                 path=config_path,
-                parent=self,
+                parent=parent_widget,
             )
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "初始化失败", f"无法打开配置编辑器：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "初始化失败", f"无法打开配置编辑器：{exc}")
             return
 
         if warning:
-            QtWidgets.QMessageBox.warning(self, "读取提示", warning)
+            QtWidgets.QMessageBox.warning(parent_widget, "读取提示", warning)
 
         result = dialog.exec_()
         if result != QtWidgets.QDialog.Accepted:
@@ -1637,17 +1779,17 @@ class Ui_MainWindow(object):
 
         new_text = dialog.text().strip()
         if not new_text:
-            QtWidgets.QMessageBox.warning(self, "内容为空", "配置内容不能为空。")
+            QtWidgets.QMessageBox.warning(parent_widget, "内容为空", "配置内容不能为空。")
             return
 
         try:
             parsed = yaml.safe_load(new_text) or {}
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "格式错误", f"配置内容不是有效的 YAML：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "格式错误", f"配置内容不是有效的 YAML：{exc}")
             return
 
         if not isinstance(parsed, dict):
-            QtWidgets.QMessageBox.critical(self, "格式错误", "配置文件的根节点必须是一个字典。")
+            QtWidgets.QMessageBox.critical(parent_widget, "格式错误", "配置文件的根节点必须是一个字典。")
             return
 
         try:
@@ -1657,7 +1799,7 @@ class Ui_MainWindow(object):
                 if not new_text.endswith("\n"):
                     fh.write("\n")
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "保存失败", f"无法写入配置文件：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "保存失败", f"无法写入配置文件：{exc}")
             return
 
         try:
@@ -1693,8 +1835,9 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 配置已更新并保存至：{config_path}")
 
     def _toggle_online_detection(self) -> None:
+        parent_widget = self._parent_widget()
         if pd is None:
-            QtWidgets.QMessageBox.warning(None, "缺少依赖", "当前环境未安装 pandas，无法执行在线检测。")
+            QtWidgets.QMessageBox.warning(parent_widget, "缺少依赖", "当前环境未安装 pandas，无法执行在线检测。")
             return
 
         worker = getattr(self, "_online_worker", None)
@@ -1737,8 +1880,9 @@ class Ui_MainWindow(object):
             self.online_status_label.setText(message)
 
     def _on_online_error(self, message: str) -> None:
+        parent_widget = self._parent_widget()
         self.display_result(f"[错误] 在线检测：{message}")
-        QtWidgets.QMessageBox.warning(None, "在线检测错误", message)
+        QtWidgets.QMessageBox.warning(parent_widget, "在线检测错误", message)
 
     def _on_online_stopped(self) -> None:
         self._online_worker = None
@@ -1873,44 +2017,75 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 在线检测完成：{payload.get('pcap_path')}")
 
     def _on_online_prediction_error(self, message: str) -> None:
+        parent_widget = self._parent_widget()
         self.display_result(f"[错误] 在线检测任务失败：{message}")
-        QtWidgets.QMessageBox.warning(None, "在线检测任务失败", message)
+        QtWidgets.QMessageBox.warning(parent_widget, "在线检测任务失败", message)
         self.online_status_label.setText(f"检测任务失败：{message}")
 
-    def _bind_signals(self):
-        self.btn_pick_file.clicked.connect(self._choose_file)
-        self.btn_pick_dir.clicked.connect(self._choose_dir)
-        self.btn_browse.clicked.connect(self._browse_compat)
-        self.path_tool_button.clicked.connect(self._browse_compat)
+    def _verify_action_bindings(self) -> None:
+        mapping = getattr(self, "_ACTION_HANDLER_MAP", {})
+        if not mapping:
+            return
+        issues: List[str] = []
+        for button_attr, handler_name in mapping.items():
+            button = getattr(self, button_attr, None)
+            handler = getattr(self, handler_name, None)
+            if button is None:
+                issues.append(f"缺少按钮 {button_attr}")
+                continue
+            if not callable(handler):
+                issues.append(f"{button_attr} 未实现处理函数 {handler_name}")
+                continue
+            try:
+                button.setProperty("action_handler", handler_name)
+                if not button.toolTip():
+                    button.setToolTip(f"点击执行：{button.text()}")
+            except Exception:
+                pass
+        if issues:
+            message = "；".join(issues)
+            self.display_result(f"[WARN] 功能绑定检查未通过：{message}")
+        else:
+            self._action_bindings_verified = True
 
-        self.btn_prev.clicked.connect(self._on_prev_batch)
-        self.btn_next.clicked.connect(self._on_next_batch)
+    def _bind_signals(self):
+        self._bind_button_actions(
+            {
+                self.btn_pick_file: self._choose_file,
+                self.btn_pick_dir: self._choose_dir,
+                self.btn_browse: self._browse_compat,
+                self.path_tool_button: self._browse_compat,
+                self.btn_prev: self._on_prev_batch,
+                self.btn_next: self._on_next_batch,
+                self.btn_view: self._on_view_info,
+                self.btn_export: self._on_export_results,
+                self.btn_clear: self._on_clear,
+                self.btn_fe: self._on_extract_features,
+                self.btn_vector: self._on_preprocess_features,
+                self.btn_train: self._on_train_model,
+                self.btn_analysis: self._on_run_analysis,
+                self.btn_predict: self._on_predict,
+                self.btn_open_results: self._open_results_dir,
+                self.btn_view_logs: self._open_logs_dir,
+                self.btn_export_report: self._on_export_report,
+                self.btn_config_editor: self._open_config_editor_dialog,
+                self.btn_online_toggle: self._toggle_online_detection,
+                self.model_refresh_btn: self._refresh_model_versions,
+                self.btn_page_prev: self._on_page_prev,
+                self.btn_page_next: self._on_page_next,
+                self.btn_show_all: self._show_full_preview,
+            }
+        )
 
         # 所有功能均使用顶部路径
-        self.btn_view.clicked.connect(self._on_view_info)
-        self.btn_export.clicked.connect(self._on_export_results)
-        self.btn_clear.clicked.connect(self._on_clear)
-        self.btn_fe.clicked.connect(self._on_extract_features)
-        self.btn_vector.clicked.connect(self._on_preprocess_features)
-        self.btn_train.clicked.connect(self._on_train_model)
-        self.btn_analysis.clicked.connect(self._on_run_analysis)
-        self.btn_predict.clicked.connect(self._on_predict)
-        self.btn_open_results.clicked.connect(self._open_results_dir)
-        self.btn_view_logs.clicked.connect(self._open_logs_dir)
-        self.btn_export_report.clicked.connect(self._on_export_report)
-        self.btn_config_editor.clicked.connect(self._open_config_editor_dialog)
-        self.btn_online_toggle.clicked.connect(self._toggle_online_detection)
         self.model_combo.currentIndexChanged.connect(self._on_model_combo_changed)
-        self.model_refresh_btn.clicked.connect(self._refresh_model_versions)
-
-        self.btn_page_prev.clicked.connect(self._on_page_prev)
-        self.btn_page_next.clicked.connect(self._on_page_next)
         self.page_size_spin.valueChanged.connect(self._on_page_size_changed)
-        self.btn_show_all.clicked.connect(self._show_full_preview)
 
         self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
         self.output_list.itemDoubleClicked.connect(self._on_output_double_click)
         self.table_view.doubleClicked.connect(self._on_table_double_click)
+
+        self._verify_action_bindings()
 
     # --------- 路径小工具 ----------
     _PATH_RESOLVERS = {
@@ -2390,13 +2565,94 @@ class Ui_MainWindow(object):
         p = max(0, min(100, int(progress))) / 100.0
         button.setStyleSheet(
             f'QPushButton{{border:0;border-radius:10px;padding:8px 12px;'
-            f'background:qlineargradient(x1:0,y1:0,x2:1,y2:0,' 
+            f'background:qlineargradient(x1:0,y1:0,x2:1,y2:0,'
             f'stop:0 #69A1FF, stop:{p:.3f} #69A1FF, stop:{p:.3f} #EEF1F6, stop:1 #EEF1F6);}}'
             'QPushButton:hover{background:#E2E8F0;} QPushButton:pressed{background:#D9E0EA;}'
         )
 
     def reset_button_progress(self, button: QtWidgets.QPushButton):
         button.setStyleSheet("")
+
+    def _ensure_progress_state(self, button: QtWidgets.QPushButton) -> Dict[str, object]:
+        states = getattr(self, "_progress_states", None)
+        if states is None:
+            states = {}
+            self._progress_states = states
+        state = states.get(button)
+        if state is None:
+            state = {"current": 0, "target": 0, "timer": None, "done": False}
+            states[button] = state
+        return state
+
+    def _stop_progress_timer(self, state: Dict[str, object]) -> None:
+        timer = state.get("timer")
+        if isinstance(timer, QtCore.QTimer):
+            timer.stop()
+            timer.deleteLater()
+        state["timer"] = None
+
+    def _tick_task_progress(self, button: QtWidgets.QPushButton) -> None:
+        states = getattr(self, "_progress_states", {})
+        state = states.get(button)
+        if not state or state.get("done"):
+            return
+        current = int(state.get("current", 0))
+        target = int(state.get("target", 0))
+        if current < target:
+            current = target
+        elif current < 95:
+            increment = max(1, int((95 - current) * 0.08))
+            current = min(95, current + increment)
+        else:
+            return
+        state["current"] = current
+        self.set_button_progress(button, current)
+
+    def _start_task_progress(self, button: QtWidgets.QPushButton, initial: int = 1) -> None:
+        state = self._ensure_progress_state(button)
+        self._stop_progress_timer(state)
+        value = max(0, min(99, int(initial)))
+        state.update({"current": value, "target": value, "done": False})
+        self.set_button_progress(button, value)
+        timer = QtCore.QTimer()
+        parent = self._parent_widget()
+        if isinstance(parent, QtCore.QObject):
+            timer.setParent(parent)
+        timer.setInterval(280)
+        timer.timeout.connect(lambda b=button: self._tick_task_progress(b))
+        timer.start()
+        state["timer"] = timer
+
+    def _update_task_progress(self, button: QtWidgets.QPushButton, value: int) -> None:
+        state = self._ensure_progress_state(button)
+        val = max(0, min(100, int(value)))
+        state["target"] = max(int(state.get("target", 0)), val)
+        if val >= 100:
+            self._finish_task_progress(button)
+            return
+        if val > int(state.get("current", 0)):
+            state["current"] = val
+            self.set_button_progress(button, val)
+
+    def _finish_task_progress(self, button: QtWidgets.QPushButton, *, success: bool = True) -> None:
+        state = self._ensure_progress_state(button)
+        if not state.get("done"):
+            self._stop_progress_timer(state)
+        state["done"] = True
+        final_value = 100 if success else max(0, int(state.get("current", 0)))
+        state["current"] = final_value
+        state["target"] = final_value
+        if success:
+            self.set_button_progress(button, 100)
+            QtCore.QTimer.singleShot(300, lambda b=button: self.reset_button_progress(b))
+        else:
+            self.reset_button_progress(button)
+
+    def _fail_task_progress(self, button: QtWidgets.QPushButton) -> None:
+        state = self._ensure_progress_state(button)
+        self._stop_progress_timer(state)
+        state.update({"current": 0, "target": 0, "done": True})
+        self.reset_button_progress(button)
 
     # --------- 分页器 ----------
     def _open_csv_paged(self, csv_path: str):
@@ -2644,7 +2900,8 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 正在解析 {path} ...", True)
 
         self._set_action_buttons_enabled(False)
-        self.btn_view.setEnabled(False); self.set_button_progress(self.btn_view, 0)
+        self.btn_view.setEnabled(False)
+        self._start_task_progress(self.btn_view)
 
         self.worker = FunctionThread(
             info,
@@ -2662,17 +2919,18 @@ class Ui_MainWindow(object):
             port_whitelist_text=wl,
             port_blacklist_text=bl,
             fast=True,
+            record_limit=MAX_INFO_FLOW_RECORDS,
+            packet_limit=MAX_INFO_PACKET_SAMPLES,
             cancel_arg="cancel_cb",
         )
-        self.worker.progress.connect(lambda p: self.set_button_progress(self.btn_view, p))
+        self.worker.progress.connect(partial(self._update_task_progress, self.btn_view))
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.error.connect(self._on_worker_error)
         self.worker.start()
 
     def _on_worker_finished(self, df):
         self.btn_view.setEnabled(True)
-        self.set_button_progress(self.btn_view, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_view))
+        self._finish_task_progress(self.btn_view)
         self.worker = None
         self._set_action_buttons_enabled(True)
 
@@ -2682,6 +2940,10 @@ class Ui_MainWindow(object):
         out_csv = getattr(df, "attrs", {}).get("out_csv", None)
         files_total = getattr(df, "attrs", {}).get("files_total", None)
         errs = getattr(df, "attrs", {}).get("errors", "")
+        limited_flag = bool(getattr(df, "attrs", {}).get("limited"))
+        limit_notes = getattr(df, "attrs", {}).get("limit_notes", [])
+        record_cap = getattr(df, "attrs", {}).get("record_limit")
+        packet_cap = getattr(df, "attrs", {}).get("packet_limit")
 
         dst_dir = self._default_csv_info_dir()
         os.makedirs(dst_dir, exist_ok=True)
@@ -2708,16 +2970,36 @@ class Ui_MainWindow(object):
                 head_txt = df.head(20).to_string()
             except Exception:
                 head_txt = "(预览生成失败)"
-            self.display_result(f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}", append=False)
+            self.display_result(
+                f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}",
+                append=False,
+            )
             rows = len(df) if hasattr(df, "__len__") else 0
             status = f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个"
             self._update_status_message(status)
+        if limited_flag:
+            if record_cap:
+                self.display_result(
+                    f"[提示] 为提升速度，仅展示前 {int(record_cap)} 条流量记录。"
+                )
+            elif packet_cap:
+                self.display_result(
+                    f"[提示] 为提升速度，仅解析了前 {int(packet_cap)} 个数据包。"
+                )
+            for note in limit_notes or []:
+                if note:
+                    self.display_result(f"[提示] {note}")
         if errs:
+            seen_notes = {str(note).strip() for note in (limit_notes or []) if note}
             for e in errs.split("\n"):
-                if e.strip(): self.display_result(e)
+                line = e.strip()
+                if not line or line in seen_notes:
+                    continue
+                self.display_result(line)
 
     def _on_worker_error(self, msg):
-        self.btn_view.setEnabled(True); self.reset_button_progress(self.btn_view)
+        self.btn_view.setEnabled(True)
+        self._fail_task_progress(self.btn_view)
         self._set_action_buttons_enabled(True)
         self.worker = None
         QtWidgets.QMessageBox.critical(None, "解析失败", msg)
@@ -3204,14 +3486,15 @@ class Ui_MainWindow(object):
         self._set_action_buttons_enabled(False)
         if os.path.isdir(path):
             self.display_result(f"[INFO] 目录特征提取：{path} -> {out_dir}")
-            self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
+            self.btn_fe.setEnabled(False)
+            self._start_task_progress(self.btn_fe)
             self.dir_fe_worker = FunctionThread(
                 fe_dir,
                 path,
                 out_dir,
                 workers=self.workers_spin.value(),
             )
-            self.dir_fe_worker.progress.connect(lambda p: self.set_button_progress(self.btn_fe, p))
+            self.dir_fe_worker.progress.connect(partial(self._update_task_progress, self.btn_fe))
             self.dir_fe_worker.finished.connect(self._on_fe_dir_finished)
             self.dir_fe_worker.error.connect(self._on_fe_error)
             self.dir_fe_worker.start()
@@ -3219,17 +3502,17 @@ class Ui_MainWindow(object):
             base = os.path.splitext(os.path.basename(path))[0]
             csv = os.path.join(out_dir, f"{base}_features_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
             self.display_result(f"[INFO] 单文件特征提取：{path} -> {csv}")
-            self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
+            self.btn_fe.setEnabled(False)
+            self._start_task_progress(self.btn_fe)
             self.fe_worker = FunctionThread(fe_single, path, csv)
-            self.fe_worker.progress.connect(lambda p: self.set_button_progress(self.btn_fe, p))
+            self.fe_worker.progress.connect(partial(self._update_task_progress, self.btn_fe))
             self.fe_worker.finished.connect(self._on_fe_finished)
             self.fe_worker.error.connect(self._on_fe_error)
             self.fe_worker.start()
 
     def _on_fe_finished(self, csv):
         self.btn_fe.setEnabled(True)
-        self.set_button_progress(self.btn_fe, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
+        self._finish_task_progress(self.btn_fe)
         self._set_action_buttons_enabled(True)
         self.display_result(f"[INFO] 特征提取完成，CSV已保存: {csv}")
         self._add_output(csv)
@@ -3243,8 +3526,7 @@ class Ui_MainWindow(object):
 
     def _on_fe_dir_finished(self, csv_list: List[str]):
         self.btn_fe.setEnabled(True)
-        self.set_button_progress(self.btn_fe, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
+        self._finish_task_progress(self.btn_fe)
         self._set_action_buttons_enabled(True)
         self.display_result(f"[INFO] 目录特征提取完成：共 {len(csv_list)} 个 CSV")
         for p in csv_list:
@@ -3260,7 +3542,8 @@ class Ui_MainWindow(object):
                 pass
 
     def _on_fe_error(self, msg):
-        self.btn_fe.setEnabled(True); self.reset_button_progress(self.btn_fe)
+        self.btn_fe.setEnabled(True)
+        self._fail_task_progress(self.btn_fe)
         self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "特征提取失败", msg)
         self.display_result(f"[错误] 特征提取失败: {msg}")
@@ -3327,21 +3610,21 @@ class Ui_MainWindow(object):
 
         self.display_result(f"[INFO] 数据预处理：{preview} -> {out_dir}")
         self._set_action_buttons_enabled(False)
-        self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
+        self.btn_vector.setEnabled(False)
+        self._start_task_progress(self.btn_vector)
         self.preprocess_worker = FunctionThread(
             preprocess_dir,
             feature_source,
             out_dir,
         )
-        self.preprocess_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
+        self.preprocess_worker.progress.connect(partial(self._update_task_progress, self.btn_vector))
         self.preprocess_worker.finished.connect(self._on_preprocess_finished)
         self.preprocess_worker.error.connect(self._on_preprocess_error)
         self.preprocess_worker.start()
 
     def _on_preprocess_finished(self, result):
         self.btn_vector.setEnabled(True)
-        self.set_button_progress(self.btn_vector, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_vector))
+        self._finish_task_progress(self.btn_vector)
         self.preprocess_worker = None
         self._set_action_buttons_enabled(True)
 
@@ -3373,7 +3656,7 @@ class Ui_MainWindow(object):
 
     def _on_preprocess_error(self, msg):
         self.btn_vector.setEnabled(True)
-        self.reset_button_progress(self.btn_vector)
+        self._fail_task_progress(self.btn_vector)
         self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "数据预处理失败", msg)
         self.display_result(f"[错误] 数据预处理失败: {msg}")
@@ -3397,7 +3680,8 @@ class Ui_MainWindow(object):
 
         self.display_result(f"[INFO] 开始训练，输入: {path}")
         self._set_action_buttons_enabled(False)
-        self.btn_train.setEnabled(False); self.set_button_progress(self.btn_train, 1)
+        self.btn_train.setEnabled(False)
+        self._start_task_progress(self.btn_train)
         train_task = BackgroundTask(
             run_train,
             path,
@@ -3408,13 +3692,12 @@ class Ui_MainWindow(object):
             train_task,
             self._on_train_finished,
             self._on_train_error,
-            lambda p: self.set_button_progress(self.btn_train, p),
+            partial(self._update_task_progress, self.btn_train),
         )
 
     def _on_train_finished(self, res):
         self.btn_train.setEnabled(True)
-        self.set_button_progress(self.btn_train, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_train))
+        self._finish_task_progress(self.btn_train)
         self._set_action_buttons_enabled(True)
         if not isinstance(res, dict):
             res = {} if res is None else {"result": res}
@@ -3552,7 +3835,8 @@ class Ui_MainWindow(object):
             self._add_output(res["active_learning_csv"])
 
     def _on_train_error(self, msg):
-        self.btn_train.setEnabled(True); self.reset_button_progress(self.btn_train)
+        self.btn_train.setEnabled(True)
+        self._fail_task_progress(self.btn_train)
         self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "训练失败", msg)
         self.display_result(f"[错误] 训练失败: {msg}")
@@ -3594,7 +3878,7 @@ class Ui_MainWindow(object):
         self._analysis_summary = None
         self._set_action_buttons_enabled(False)
         btn.setEnabled(False)
-        self.set_button_progress(btn, 1)
+        self._start_task_progress(btn)
 
         def _finished(result):
             payload = result if isinstance(result, dict) else {"out_dir": out_dir}
@@ -3612,7 +3896,7 @@ class Ui_MainWindow(object):
             analysis_task,
             _finished,
             self._on_analysis_error,
-            lambda p: self.set_button_progress(btn, p),
+            partial(self._update_task_progress, btn),
         )
         return True
 
@@ -3633,7 +3917,8 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 正在分析结果 -> {out_dir}")
         self._analysis_summary = None
         self._set_action_buttons_enabled(False)
-        self.btn_analysis.setEnabled(False); self.set_button_progress(self.btn_analysis, 1)
+        self.btn_analysis.setEnabled(False)
+        self._start_task_progress(self.btn_analysis)
         meta_path = self._selected_metadata_path
         if not meta_path or not os.path.exists(meta_path):
             _, meta_path = self._latest_pipeline_bundle()
@@ -3655,13 +3940,12 @@ class Ui_MainWindow(object):
             analysis_task,
             _analysis_finished,
             self._on_analysis_error,
-            lambda p: self.set_button_progress(self.btn_analysis, p),
+            partial(self._update_task_progress, self.btn_analysis),
         )
 
     def _on_analysis_finished(self, result):
         self.btn_analysis.setEnabled(True)
-        self.set_button_progress(self.btn_analysis, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_analysis))
+        self._finish_task_progress(self.btn_analysis)
         self._set_action_buttons_enabled(True)
         out_dir = None
         plot_paths: List[str] = []
@@ -3762,7 +4046,8 @@ class Ui_MainWindow(object):
         )
 
     def _on_analysis_error(self, msg):
-        self.btn_analysis.setEnabled(True); self.reset_button_progress(self.btn_analysis)
+        self.btn_analysis.setEnabled(True)
+        self._fail_task_progress(self.btn_analysis)
         self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "分析失败", msg)
         self.display_result(f"[错误] 分析失败: {msg}")
@@ -3780,6 +4065,213 @@ class Ui_MainWindow(object):
     ) -> dict:
         if pd is None:
             raise RuntimeError("pandas 未安装，无法执行预测。")
+
+        def _status_from_text(value: object) -> Optional[str]:
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text:
+                return None
+            lowered = text.lower()
+            if any(token in lowered for token in self._ANOMALY_HINTS):
+                return "异常"
+            if any(token in lowered for token in self._NORMAL_HINTS):
+                return "正常"
+            return None
+
+        def _status_from_numeric(value: object, positive_classes: Set[int]) -> Optional[str]:
+            if value is None:
+                return None
+            candidates: List[int] = []
+            if isinstance(value, (int, np.integer)):
+                candidates.append(int(value))
+            else:
+                text = str(value).strip()
+                if text:
+                    try:
+                        maybe_float = float(text)
+                    except (TypeError, ValueError):
+                        maybe_float = None
+                    if maybe_float is not None and not math.isnan(maybe_float):
+                        if abs(maybe_float - round(maybe_float)) < 1e-6:
+                            candidates.append(int(round(maybe_float)))
+            if not candidates:
+                return None
+            for candidate in candidates:
+                if candidate in positive_classes:
+                    return "异常"
+            if positive_classes:
+                return "正常"
+            return None
+
+        def _derive_positive_tokens(
+            metadata_obj: Optional[dict],
+            mapping_obj: Optional[Dict[Union[int, str], str]],
+        ) -> Set[str]:
+            tokens = {token for token in self._ANOMALY_HINTS}
+            metadata_obj = metadata_obj or {}
+            raw_label = metadata_obj.get("positive_label")
+            if raw_label:
+                tokens.add(str(raw_label).strip().lower())
+            extra_tokens = metadata_obj.get("positive_keywords")
+            if isinstance(extra_tokens, (list, tuple, set)):
+                for token in extra_tokens:
+                    if token:
+                        tokens.add(str(token).strip().lower())
+            if isinstance(mapping_obj, dict):
+                for label in mapping_obj.values():
+                    status = _status_from_text(label)
+                    if status == "异常":
+                        tokens.add(str(label).strip().lower())
+            return {token for token in tokens if token}
+
+        def _derive_positive_classes(
+            metadata_obj: Optional[dict],
+            mapping_obj: Optional[Dict[Union[int, str], str]],
+        ) -> Set[int]:
+            classes: Set[int] = set()
+            metadata_obj = metadata_obj or {}
+            candidate = metadata_obj.get("positive_class")
+            try:
+                if isinstance(candidate, (int, np.integer)):
+                    classes.add(int(candidate))
+                elif candidate is not None and str(candidate).strip():
+                    classes.add(int(str(candidate).strip()))
+            except (TypeError, ValueError):
+                pass
+            if not classes and isinstance(mapping_obj, dict):
+                for key, label in mapping_obj.items():
+                    status = _status_from_text(label)
+                    if status != "异常":
+                        continue
+                    try:
+                        classes.add(int(key))
+                    except (TypeError, ValueError):
+                        try:
+                            classes.add(int(str(key).strip()))
+                        except (TypeError, ValueError):
+                            continue
+            return classes
+
+        def _derive_row_status(
+            label_value: object,
+            prediction_value: object,
+            *,
+            positive_tokens: Set[str],
+            positive_classes: Set[int],
+        ) -> Optional[str]:
+            status = _status_from_text(label_value)
+            if status is None:
+                status = _status_from_text(prediction_value)
+            if status == "异常":
+                return status
+            if status == "正常":
+                return status
+
+            if label_value is not None:
+                text = str(label_value).strip().lower()
+                if text in positive_tokens:
+                    return "异常"
+            if prediction_value is not None:
+                text = str(prediction_value).strip().lower()
+                if text in positive_tokens:
+                    return "异常"
+
+            numeric_status = _status_from_numeric(prediction_value, positive_classes)
+            if numeric_status is not None:
+                return numeric_status
+            numeric_status = _status_from_numeric(label_value, positive_classes)
+            if numeric_status is not None:
+                return numeric_status
+            return None
+
+        def _format_row_messages(frame: "pd.DataFrame") -> List[str]:
+            if pd is None or frame is None or not isinstance(frame, pd.DataFrame):
+                return []
+            max_preview = 200
+            if len(frame) > max_preview:
+                return []
+
+            identifier_columns = [
+                "flow_id",
+                "__source_file__",
+                "__source_path__",
+                "pcap_file",
+                "pcap_name",
+                "file_name",
+                "src_ip",
+                "dst_ip",
+                "src_port",
+                "dst_port",
+            ]
+
+            messages: List[str] = []
+            for idx, row in frame.iterrows():
+                identifier = None
+                for column in identifier_columns:
+                    if column not in frame.columns:
+                        continue
+                    value = row.get(column)
+                    try:
+                        is_valid = pd.notna(value)
+                    except Exception:
+                        is_valid = value not in (None, "")
+                    if is_valid:
+                        text_value = str(value).strip()
+                        if text_value:
+                            identifier = f"{column}={text_value}"
+                            break
+                if identifier is None:
+                    identifier = f"第{idx + 1}行"
+
+                status_value = row.get("prediction_status")
+                if isinstance(status_value, str) and status_value.strip():
+                    status_prefix = f"[{status_value.strip()}] "
+                else:
+                    status_prefix = ""
+
+                label = row.get("prediction_label")
+                if not label:
+                    label = row.get("prediction")
+
+                score_value = row.get("malicious_score")
+                if score_value is None:
+                    score_value = row.get("anomaly_score")
+                try:
+                    score_float = float(score_value)
+                except Exception:
+                    score_float = None
+
+                if score_float is not None and not math.isnan(score_float):
+                    score_text = f" 分数={score_float:.4f}"
+                else:
+                    score_text = ""
+
+                rule_note = ""
+                if "rules_triggered" in frame.columns or "rule_triggered" in frame.columns:
+                    triggered_value = row.get("rules_triggered")
+                    if triggered_value is None:
+                        triggered_value = row.get("rule_triggered")
+                    try:
+                        triggered_bool = bool(int(triggered_value))
+                    except Exception:
+                        triggered_bool = bool(triggered_value)
+                    if triggered_bool:
+                        score_value = row.get("rules_score")
+                        try:
+                            rule_score_text = f" 规则分={float(score_value):.1f}"
+                        except Exception:
+                            rule_score_text = ""
+                        reason_value = row.get("rules_reasons")
+                        reason_text = str(reason_value).strip() if reason_value is not None else ""
+                        if reason_text:
+                            rule_note = f" [规则]{reason_text}{rule_score_text}"
+                        else:
+                            rule_note = f" [规则命中]{rule_score_text}"
+
+                messages.append(f"{status_prefix}{identifier} -> 预测={label}{score_text}{rule_note}")
+
+            return messages
 
         bundle = self._resolve_prediction_bundle(df, metadata_override=metadata_override)
         if not bundle:
@@ -3964,39 +4456,172 @@ class Ui_MainWindow(object):
 
             preds = model.predict(matrix)
 
+            display_labels = [
+                mapping.get(int(value), str(value)) if mapping is not None else str(value)
+                for value in preds
+            ]
+
+            normalized_labels: List[str]
+            anomaly_count: Optional[int]
+            normal_count: Optional[int]
+            status_text: Optional[str]
             if summarize_prediction_labels is not None:
-                labels, anomaly_count, normal_count, status_text = summarize_prediction_labels(
+                normalized_labels, anomaly_count, normal_count, status_text = summarize_prediction_labels(
                     preds,
                     mapping,
                 )
             else:
-                labels = [
-                    mapping.get(int(value), str(value)) if mapping is not None else str(value)
-                    for value in preds
-                ]
-                anomaly_count = None
-                normal_count = None
-                status_text = None
-                if labels:
-                    abnormal = sum(1 for label in labels if str(label) == "异常")
-                    normal = sum(1 for label in labels if str(label) == "正常")
-                    if abnormal:
-                        anomaly_count = abnormal
-                        normal_count = normal
-                        status_text = "异常"
-                    elif normal:
-                        anomaly_count = 0
-                        normal_count = normal
-                        status_text = "正常"
+                normalized_labels = []
+                for label in display_labels:
+                    status = _status_from_text(label)
+                    if status is None:
+                        normalized_labels.append(str(label))
+                    else:
+                        normalized_labels.append(status)
+                anomaly_count = sum(1 for label in normalized_labels if label == "异常") if normalized_labels else 0
+                normal_count = sum(1 for label in normalized_labels if label == "正常") if normalized_labels else 0
+                if anomaly_count:
+                    status_text = "异常"
+                elif normal_count and normal_count == len(normalized_labels):
+                    status_text = "正常"
+                else:
+                    status_text = None
+
+            positive_tokens = _derive_positive_tokens(metadata, mapping)
+            positive_classes = _derive_positive_classes(metadata, mapping)
+
+            row_statuses: List[Optional[str]] = []
+            model_statuses: List[str] = []
+            anomaly_flags: List[bool] = []
+
+            total_predictions = len(preds)
+            for idx in range(total_predictions):
+                label_candidate: Optional[object] = None
+                if normalized_labels and idx < len(normalized_labels):
+                    label_candidate = normalized_labels[idx]
+                status = None
+                if isinstance(label_candidate, str) and label_candidate in {"异常", "正常"}:
+                    status = label_candidate
+                else:
+                    status = _derive_row_status(
+                        label_candidate,
+                        preds[idx],
+                        positive_tokens=positive_tokens,
+                        positive_classes=positive_classes,
+                    )
+                if status is None and display_labels and idx < len(display_labels):
+                    status = _derive_row_status(
+                        display_labels[idx],
+                        preds[idx],
+                        positive_tokens=positive_tokens,
+                        positive_classes=positive_classes,
+                    )
+                if status is None:
+                    status = _status_from_text(preds[idx])
+                if status is None and display_labels and idx < len(display_labels):
+                    status = _status_from_text(display_labels[idx])
+
+                is_anomaly = status == "异常"
+                anomaly_flags.append(is_anomaly)
+                row_statuses.append(status)
+                if isinstance(status, str) and status in {"异常", "正常"}:
+                    model_statuses.append(status)
+                else:
+                    model_statuses.append("异常" if is_anomaly else "正常")
+
+            model_flag_values = [1 if flag else 0 for flag in anomaly_flags]
+            raw_statuses = list(row_statuses)
+
+            computed_anomalies = sum(1 for flag in anomaly_flags if flag)
+            computed_normals = sum(1 for status in row_statuses if status == "正常")
+            anomaly_count = computed_anomalies
+            normal_count = computed_normals
+            if status_text is None:
+                if computed_anomalies > 0:
+                    status_text = "异常"
+                elif total_predictions and computed_normals == total_predictions:
+                    status_text = "正常"
 
             out_df = df.copy()
+            rule_threshold_raw = None
+            if isinstance(metadata, dict):
+                rule_threshold_raw = metadata.get("rule_threshold")
+            rule_threshold = float(rule_threshold_raw) if rule_threshold_raw not in (None, "") else float(DEFAULT_TRIGGER_THRESHOLD)
+            rule_scores_series = None
+            rule_reasons_series = None
+            rule_flags = np.zeros(total_predictions, dtype=bool)
+            if apply_risk_rules is not None and pd is not None and total_predictions:
+                try:
+                    score_series, reason_series = apply_risk_rules(out_df)
+                except Exception:
+                    score_series = None
+                    reason_series = None
+                if score_series is not None:
+                    try:
+                        rule_scores_series = score_series.astype(float, copy=False)
+                    except Exception:
+                        rule_scores_series = pd.Series(score_series, dtype=float)
+                    rule_flags = rule_scores_series.to_numpy(dtype=float) >= rule_threshold
+                    if reason_series is not None:
+                        rule_reasons_series = reason_series.astype(str, copy=False)
+
+            rule_scores_array = (
+                rule_scores_series.to_numpy(dtype=float)
+                if rule_scores_series is not None
+                else None
+            )
+
+            model_flag_array = np.asarray(model_flag_values, dtype=np.float64)
+            fusion_scores_array, fusion_flags_array = fuse_model_rule_votes(
+                model_flag_array,
+                rule_scores_array,
+                model_weight=float(DEFAULT_MODEL_WEIGHT),
+                rule_weight=float(DEFAULT_RULE_WEIGHT),
+                threshold=float(DEFAULT_FUSION_THRESHOLD),
+            )
+            fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
+            fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
+
+            if fusion_scores_array.size < total_predictions:
+                fusion_scores_array = np.pad(
+                    fusion_scores_array,
+                    (0, total_predictions - fusion_scores_array.size),
+                    "edge",
+                )
+            if fusion_flags_array.size < total_predictions:
+                fusion_flags_array = np.pad(
+                    fusion_flags_array,
+                    (0, total_predictions - fusion_flags_array.size),
+                    "edge",
+                )
+
+            final_flags = [bool(flag) for flag in fusion_flags_array[:total_predictions]]
+            final_statuses = ["异常" if flag else "正常" for flag in final_flags]
+            fusion_scores = fusion_scores_array[:total_predictions]
+
+            anomaly_flags = final_flags
+            row_statuses = final_statuses
+            anomaly_count = sum(1 for flag in anomaly_flags if flag)
+            normal_count = total_predictions - anomaly_count
+            if anomaly_count:
+                status_text = "异常"
+            elif total_predictions:
+                status_text = "正常"
+
             out_df["prediction"] = [int(value) if isinstance(value, (int, np.integer)) else value for value in preds]
-            out_df["prediction_label"] = labels
+            out_df["prediction_label"] = display_labels
             out_df["malicious_score"] = [float(value) for value in np.asarray(scores, dtype=float)]
-            if status_text is not None:
-                out_df["prediction_status"] = [
-                    label if label in {"异常", "正常"} else status_text for label in labels
-                ]
+            out_df["model_status"] = pd.Series(model_statuses, dtype=object)
+            out_df["model_flag"] = pd.Series(model_flag_values, dtype=int)
+            if row_statuses:
+                out_df["prediction_status"] = pd.Series(row_statuses, dtype=object)
+            out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
+            out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
+            if rule_scores_series is not None:
+                out_df["rules_score"] = rule_scores_series
+                out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
+                if rule_reasons_series is not None:
+                    out_df["rules_reasons"] = rule_reasons_series
 
             if output_dir is None:
                 output_dir = self._prediction_out_dir()
@@ -4007,6 +4632,8 @@ class Ui_MainWindow(object):
             out_df.to_csv(out_csv, index=False, encoding="utf-8")
 
             total_rows = int(len(out_df))
+            out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
+
             summary_lines = [
                 f"模型预测完成：{source_name}",
                 f"输出行数：{total_rows}",
@@ -4020,11 +4647,37 @@ class Ui_MainWindow(object):
                     summary_line += f"，正常数量：{int(normal_count)}"
                 summary_lines.append(summary_line)
                 if total_rows:
-                    ratio = float(anomaly_count) / float(total_rows)
+                    ratio = float(anomaly_count) / float(max(total_rows, 1))
+            rule_hits = int(rule_flags.sum()) if rule_flags.size else 0
+            if rule_hits:
+                summary_lines.append(
+                    f"规则命中：{rule_hits} 条 (阈值 {rule_threshold:.1f})"
+                )
             messages.extend(summary_lines)
             if not silent:
                 for msg in summary_lines:
                     self.display_result(f"[INFO] {msg}")
+
+            row_messages = _format_row_messages(out_df)
+
+            active_rule_weight = float(DEFAULT_RULE_WEIGHT) if (
+                rule_scores_array is not None and rule_scores_array.size
+            ) else 0.0
+            total_weight = float(DEFAULT_MODEL_WEIGHT + active_rule_weight)
+            if not math.isfinite(total_weight) or total_weight <= 0.0:
+                fusion_weight_model = 1.0
+                fusion_weight_rules = 0.0
+            else:
+                fusion_weight_model = float(DEFAULT_MODEL_WEIGHT) / total_weight
+                fusion_weight_rules = active_rule_weight / total_weight
+
+            fusion_scores_list = [float(value) for value in fusion_scores]
+            fusion_flags_list = [bool(flag) for flag in anomaly_flags]
+            rule_scores_list = (
+                [float(value) for value in rule_scores_array[:total_predictions]]
+                if rule_scores_array is not None
+                else None
+            )
 
             return {
                 "output_csv": out_csv,
@@ -4040,7 +4693,28 @@ class Ui_MainWindow(object):
                 "normal_count": int(normal_count) if normal_count is not None else None,
                 "predictions": [int(value) if isinstance(value, (int, np.integer)) else value for value in preds],
                 "scores": [float(value) for value in np.asarray(scores, dtype=float)],
-                "labels": labels,
+                "labels": display_labels,
+                "normalized_labels": normalized_labels,
+                "row_messages": row_messages,
+                "anomaly_flags": fusion_flags_list,
+                "anomaly_indices": [idx for idx, flag in enumerate(fusion_flags_list) if flag],
+                "positive_tokens": sorted(positive_tokens),
+                "positive_classes": sorted(positive_classes),
+                "prediction_statuses": row_statuses,
+                "model_statuses": model_statuses,
+                "raw_statuses": raw_statuses,
+                "fusion_scores": fusion_scores_list,
+                "fusion_flags": fusion_flags_list,
+                "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+                "fusion_weights": {
+                    "model": fusion_weight_model,
+                    "rules": fusion_weight_rules,
+                },
+                "model_flags": [bool(flag) for flag in model_flag_values],
+                "rule_flags": [bool(flag) for flag in rule_flags],
+                "rule_scores": rule_scores_list,
+                "rule_threshold": rule_threshold,
+                "rule_hits": rule_hits,
             }
 
         models_dir = self._default_models_dir()
@@ -4153,15 +4827,86 @@ class Ui_MainWindow(object):
             )
 
         out_df = df.copy()
+        pred_array = np.asarray(preds)
+        model_flags = np.zeros(pred_array.shape[0], dtype=bool)
+        try:
+            model_flags = pred_array.astype(int) == -1
+        except Exception:
+            model_flags = np.array([str(value).strip() in {"-1", "异常"} for value in pred_array], dtype=bool)
+        model_flag_values = model_flags.astype(int)
+        model_statuses = ["异常" if flag else "正常" for flag in model_flags]
+
+        rule_threshold_raw = metadata.get("rule_threshold") if isinstance(metadata, dict) else None
+        rule_threshold = float(rule_threshold_raw) if rule_threshold_raw not in (None, "") else float(DEFAULT_TRIGGER_THRESHOLD)
+        rule_scores_series = None
+        rule_reasons_series = None
+        total = int(len(out_df))
+        rule_flags = np.zeros(total, dtype=bool)
+        if apply_risk_rules is not None and pd is not None and total:
+            try:
+                score_series, reason_series = apply_risk_rules(out_df)
+            except Exception:
+                score_series = None
+                reason_series = None
+            if score_series is not None:
+                try:
+                    rule_scores_series = score_series.astype(float, copy=False)
+                except Exception:
+                    rule_scores_series = pd.Series(score_series, dtype=float)
+                rule_flags = rule_scores_series.to_numpy(dtype=float) >= rule_threshold
+                if reason_series is not None:
+                    rule_reasons_series = reason_series.astype(str, copy=False)
+
+        rule_scores_array = (
+            rule_scores_series.to_numpy(dtype=float)
+            if rule_scores_series is not None
+            else None
+        )
+
+        fusion_scores_array, fusion_flags_array = fuse_model_rule_votes(
+            model_flag_values.astype(float),
+            rule_scores_array,
+            model_weight=float(DEFAULT_MODEL_WEIGHT),
+            rule_weight=float(DEFAULT_RULE_WEIGHT),
+            threshold=float(DEFAULT_FUSION_THRESHOLD),
+        )
+        fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
+        fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
+        if fusion_scores_array.size < total:
+            fusion_scores_array = np.pad(
+                fusion_scores_array,
+                (0, total - fusion_scores_array.size),
+                "edge",
+            )
+        if fusion_flags_array.size < total:
+            fusion_flags_array = np.pad(
+                fusion_flags_array,
+                (0, total - fusion_flags_array.size),
+                "edge",
+            )
+        fusion_flags = fusion_flags_array[:total]
+        fusion_scores = fusion_scores_array[:total]
+        final_statuses = ["异常" if flag else "正常" for flag in fusion_flags]
+
         out_df["prediction"] = preds
-        out_df["is_malicious"] = (preds == -1).astype(int)
         out_df["anomaly_score"] = scores
         out_df["anomaly_confidence"] = risk_score
         out_df["vote_ratio"] = vote_ratio
         out_df["risk_score"] = risk_score
+        out_df["model_anomaly"] = pd.Series(model_flag_values, dtype=int)
+        out_df["model_status"] = pd.Series(model_statuses, dtype=object)
+        out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
+        out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
+        out_df["prediction_status"] = pd.Series(final_statuses, dtype=object)
+        if rule_scores_series is not None:
+            out_df["rules_score"] = rule_scores_series
+            out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
+            if rule_reasons_series is not None:
+                out_df["rules_reasons"] = rule_reasons_series
 
-        malicious = int(out_df["is_malicious"].sum())
-        total = int(len(out_df))
+        out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
+
+        malicious = int(np.count_nonzero(fusion_flags))
         ratio = (malicious / total) if total else 0.0
 
         score_min = float(np.min(scores)) if len(scores) else 0.0
@@ -4177,6 +4922,10 @@ class Ui_MainWindow(object):
             f"平均风险分：{float(risk_score.mean()):.2%}",
         ]
 
+        rule_hits = int(rule_flags.sum()) if total else 0
+        if rule_hits:
+            summary_lines.append(f"规则命中：{rule_hits} 条 (阈值 {rule_threshold:.1f})")
+
         if output_dir is None:
             output_dir = self._prediction_out_dir()
         os.makedirs(output_dir, exist_ok=True)
@@ -4190,6 +4939,25 @@ class Ui_MainWindow(object):
             for msg in messages:
                 self.display_result(f"[INFO] {msg}")
 
+        row_messages = _format_row_messages(out_df)
+
+        active_rule_weight = float(DEFAULT_RULE_WEIGHT) if (
+            rule_scores_array is not None and rule_scores_array.size
+        ) else 0.0
+        total_weight = float(DEFAULT_MODEL_WEIGHT + active_rule_weight)
+        if not math.isfinite(total_weight) or total_weight <= 0.0:
+            fusion_weight_model = 1.0
+            fusion_weight_rules = 0.0
+        else:
+            fusion_weight_model = float(DEFAULT_MODEL_WEIGHT) / total_weight
+            fusion_weight_rules = active_rule_weight / total_weight
+
+        rule_scores_list = (
+            [float(value) for value in rule_scores_array[:total]]
+            if rule_scores_array is not None
+            else None
+        )
+
         return {
             "output_csv": out_csv,
             "dataframe": out_df,
@@ -4199,6 +4967,21 @@ class Ui_MainWindow(object):
             "malicious": malicious,
             "total": total,
             "ratio": ratio,
+            "row_messages": row_messages,
+            "anomaly_flags": [bool(flag) for flag in fusion_flags],
+            "fusion_flags": [bool(flag) for flag in fusion_flags],
+            "fusion_scores": [float(value) for value in fusion_scores],
+            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+            "fusion_weights": {
+                "model": fusion_weight_model,
+                "rules": fusion_weight_rules,
+            },
+            "model_flags": [bool(flag) for flag in model_flags],
+            "model_statuses": model_statuses,
+            "rule_flags": [bool(flag) for flag in rule_flags],
+            "rule_scores": rule_scores_list,
+            "rule_threshold": rule_threshold,
+            "rule_hits": rule_hits,
         }
 
 
@@ -4215,10 +4998,17 @@ class Ui_MainWindow(object):
         if not isinstance(result, dict):
             return
 
+        parent_widget = self._parent_widget()
+
         messages = result.get("messages") or []
         if messages:
             lines = [f"[INFO] [{source_name}] {line}" for line in messages]
             self.display_result("\n".join(lines))
+
+        row_messages = result.get("row_messages") or []
+        if row_messages:
+            detailed_lines = [f"[INFO] [{source_name}] {line}" for line in row_messages]
+            self.display_result("\n".join(detailed_lines))
 
         output_csv = result.get("output_csv")
         if output_csv and os.path.exists(output_csv):
@@ -4260,10 +5050,434 @@ class Ui_MainWindow(object):
 
         if show_dialog:
             QtWidgets.QMessageBox.information(
-                None,
+                parent_widget,
                 "预测完成",
                 "\n".join(result.get("summary") or ["模型预测已完成并写出结果。"]),
             )
+
+    def _sanitize_prediction_input_frame(self, df: "pd.DataFrame") -> "pd.DataFrame":
+        """Remove derived prediction columns before rerunning model inference."""
+
+        if pd is None or not isinstance(df, pd.DataFrame):
+            return df
+
+        cleaned = df.copy()
+        drop_columns = {
+            "prediction",
+            "prediction_label",
+            "prediction_status",
+            "malicious_score",
+            "anomaly_score",
+            "anomaly_confidence",
+            "vote_ratio",
+            "risk_score",
+            "is_malicious",
+            "fusion_score",
+            "fusion_decision",
+            "model_status",
+            "model_flag",
+            "fusion_status",
+            "manual_label",
+        }
+        try:
+            cleaned.drop(
+                columns=[col for col in drop_columns if col in cleaned.columns],
+                inplace=True,
+                errors="ignore",
+            )
+        except TypeError:
+            for col in list(drop_columns):
+                if col in cleaned.columns:
+                    cleaned.drop(columns=[col], inplace=True)
+
+        cleaned.reset_index(drop=True, inplace=True)
+        return cleaned
+
+    def _match_rows_from_latest(
+        self, selected_df: "pd.DataFrame"
+    ) -> Optional["pd.DataFrame"]:
+        """Match table selections against the last full prediction result."""
+
+        if pd is None or not isinstance(selected_df, pd.DataFrame) or selected_df.empty:
+            return None
+
+        snapshot = (
+            self._latest_prediction_summary
+            if isinstance(self._latest_prediction_summary, dict)
+            else None
+        )
+        if not snapshot:
+            return None
+
+        reference = snapshot.get("dataframe")
+        if not isinstance(reference, pd.DataFrame) or reference.empty:
+            return None
+
+        key_candidates: List[List[str]] = [
+            ["__source_path__", "flow_id"],
+            ["__source_file__", "flow_id"],
+            ["pcap_file", "flow_id"],
+            ["pcap_name", "flow_id"],
+            ["flow_id"],
+            ["frame_time_epoch", "src_ip", "dst_ip", "src_port", "dst_port"],
+        ]
+
+        usable_keys = [
+            keys
+            for keys in key_candidates
+            if all(key in selected_df.columns and key in reference.columns for key in keys)
+        ]
+
+        if not usable_keys:
+            return None
+
+        matched_rows: List[pd.Series] = []
+        used_indices: Set[int] = set()
+
+        for _, row in selected_df.iterrows():
+            match_index: Optional[int] = None
+            for keys in usable_keys:
+                mask = pd.Series(True, index=reference.index)
+                skip = False
+                for key in keys:
+                    value = row.get(key)
+                    try:
+                        is_missing = pd.isna(value)
+                    except Exception:
+                        is_missing = value in (None, "")
+                    if is_missing:
+                        skip = True
+                        break
+                    try:
+                        mask &= reference[key] == value
+                    except Exception:
+                        skip = True
+                        break
+                    if not mask.any():
+                        skip = True
+                        break
+                if skip or not mask.any():
+                    continue
+                candidate_indices = [
+                    int(idx)
+                    for idx in reference.index[mask]
+                    if int(idx) not in used_indices
+                ]
+                if candidate_indices:
+                    match_index = candidate_indices[0]
+                    break
+            if match_index is None:
+                return None
+            matched_rows.append(reference.loc[match_index])
+            used_indices.add(match_index)
+
+        if not matched_rows:
+            return None
+
+        rebuilt = pd.DataFrame(matched_rows).reset_index(drop=True)
+        return rebuilt
+
+    def _collect_anomaly_details(
+        self,
+        prediction: Optional[dict],
+        *,
+        source_name: str,
+        limit: int = 3,
+    ) -> Tuple[List[str], int]:
+        """Gather anomaly rows for batch summary dialogs."""
+
+        if not isinstance(prediction, dict):
+            return ([], 0)
+
+        metadata = (
+            prediction.get("metadata")
+            if isinstance(prediction.get("metadata"), dict)
+            else {}
+        )
+
+        declared_total: Optional[int] = None
+        for key in ("malicious", "anomaly_count"):
+            value = prediction.get(key)
+            if isinstance(value, (int, np.integer)):
+                declared_total = max(0, int(value))
+                break
+            if value is not None:
+                try:
+                    declared_total = max(0, int(str(value).strip()))
+                    break
+                except (TypeError, ValueError):
+                    continue
+        frame = prediction.get("dataframe")
+        if not isinstance(frame, pd.DataFrame):
+            frame = None
+
+        row_messages = prediction.get("row_messages")
+        if not isinstance(row_messages, (list, tuple)):
+            row_messages = []
+        labels = prediction.get("labels")
+        if not isinstance(labels, (list, tuple)):
+            labels = []
+        predictions = prediction.get("predictions")
+        if not isinstance(predictions, (list, tuple)):
+            predictions = []
+
+        base_tokens: Set[str] = {token.lower() for token in self._ANOMALY_HINTS}
+        raw_tokens = prediction.get("positive_tokens")
+        if isinstance(raw_tokens, (list, tuple, set)):
+            for token in raw_tokens:
+                text = str(token).strip().lower()
+                if text:
+                    base_tokens.add(text)
+        meta_label = str(metadata.get("positive_label", "")).strip().lower()
+        if meta_label:
+            base_tokens.add(meta_label)
+
+        positive_classes: Set[int] = set()
+        raw_classes = prediction.get("positive_classes")
+        if isinstance(raw_classes, (list, tuple, set)):
+            for value in raw_classes:
+                try:
+                    positive_classes.add(int(value))
+                except (TypeError, ValueError):
+                    try:
+                        positive_classes.add(int(str(value).strip()))
+                    except (TypeError, ValueError):
+                        continue
+        meta_class = metadata.get("positive_class")
+        try:
+            if isinstance(meta_class, (int, np.integer)):
+                positive_classes.add(int(meta_class))
+            elif meta_class is not None and str(meta_class).strip():
+                positive_classes.add(int(str(meta_class).strip()))
+        except (TypeError, ValueError):
+            pass
+
+        normalized_labels = prediction.get("normalized_labels")
+        if not isinstance(normalized_labels, (list, tuple)):
+            normalized_labels = []
+
+        fusion_flags_payload = prediction.get("fusion_flags")
+        anomaly_flags = prediction.get("anomaly_flags") if fusion_flags_payload is None else fusion_flags_payload
+        if not isinstance(anomaly_flags, (list, tuple)):
+            anomaly_flags = []
+
+        rule_flags_payload = prediction.get("rule_flags")
+        if not isinstance(rule_flags_payload, (list, tuple)):
+            rule_flags_payload = []
+
+        anomaly_indices_payload = prediction.get("anomaly_indices")
+        if not isinstance(anomaly_indices_payload, (list, tuple, set)):
+            anomaly_indices_payload = []
+
+        def _status_from_text(value: object) -> Optional[str]:
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text:
+                return None
+            lowered = text.lower()
+            if any(token and token in lowered for token in base_tokens):
+                return "异常"
+            if any(token in lowered for token in self._NORMAL_HINTS):
+                return "正常"
+            return None
+
+        def _status_from_numeric(value: object) -> Optional[str]:
+            if value is None or not positive_classes:
+                return None
+            candidates: List[int] = []
+            if isinstance(value, (int, np.integer)):
+                candidates.append(int(value))
+            else:
+                text = str(value).strip()
+                if text:
+                    try:
+                        maybe_float = float(text)
+                    except (TypeError, ValueError):
+                        maybe_float = None
+                    if maybe_float is not None and not math.isnan(maybe_float):
+                        if abs(maybe_float - round(maybe_float)) < 1e-6:
+                            candidates.append(int(round(maybe_float)))
+            if not candidates:
+                return None
+            for candidate in candidates:
+                if candidate in positive_classes:
+                    return "异常"
+            return "正常"
+
+        indices: List[int] = []
+        if anomaly_flags:
+            for idx, flag in enumerate(anomaly_flags):
+                try:
+                    is_positive = bool(flag)
+                except Exception:
+                    is_positive = False
+                if is_positive:
+                    indices.append(idx)
+
+        if rule_flags_payload:
+            for idx, flag in enumerate(rule_flags_payload):
+                try:
+                    triggered = bool(flag)
+                except Exception:
+                    triggered = False
+                if triggered:
+                    indices.append(idx)
+
+        if not indices and anomaly_indices_payload:
+            for value in anomaly_indices_payload:
+                try:
+                    idx = int(value)
+                except (TypeError, ValueError):
+                    try:
+                        idx = int(str(value).strip())
+                    except (TypeError, ValueError):
+                        continue
+                if idx >= 0:
+                    indices.append(idx)
+
+        if not indices and frame is not None and not frame.empty:
+            try:
+                if "prediction_status" in frame.columns:
+                    status_mask = frame["prediction_status"].astype(str).str.contains("异常", na=False)
+                    indices = [idx for idx, flag in enumerate(status_mask.to_numpy()) if bool(flag)]
+                if not indices and "prediction_label" in frame.columns:
+                    label_series = frame["prediction_label"].astype(str)
+                    label_mask = label_series.apply(lambda text: _status_from_text(text) == "异常")
+                    indices = [idx for idx, flag in enumerate(label_mask.to_numpy()) if bool(flag)]
+                if not indices and "prediction" in frame.columns:
+                    pred_series = frame["prediction"].apply(
+                        lambda value: (
+                            _status_from_text(value)
+                            or _status_from_numeric(value)
+                        ) == "异常"
+                    )
+                    indices = [idx for idx, flag in enumerate(pred_series.to_numpy()) if bool(flag)]
+                if not indices and "rules_triggered" in frame.columns:
+                    try:
+                        rule_mask = frame["rules_triggered"].astype(bool)
+                        indices = [idx for idx, flag in enumerate(rule_mask.to_numpy()) if bool(flag)]
+                    except Exception:
+                        pass
+            except Exception:
+                indices = []
+
+        if not indices and normalized_labels:
+            for idx, label in enumerate(normalized_labels):
+                if _status_from_text(label) == "异常":
+                    indices.append(idx)
+
+        if not indices and labels:
+            for idx, label in enumerate(labels):
+                if _status_from_text(label) == "异常":
+                    indices.append(idx)
+
+        if not indices and predictions:
+            for idx, value in enumerate(predictions):
+                status = _status_from_text(value) or _status_from_numeric(value)
+                if status == "异常":
+                    indices.append(idx)
+
+        indices = sorted({idx for idx in indices if isinstance(idx, int) and idx >= 0})
+
+        if not indices:
+            return ([], 0)
+
+        if declared_total is not None:
+            if declared_total <= 0:
+                return ([], 0)
+            if len(indices) > declared_total:
+                indices = indices[:declared_total]
+
+        identifier_columns = (
+            "flow_id",
+            "__source_file__",
+            "__source_path__",
+            "pcap_file",
+            "pcap_name",
+            "file_name",
+            "src_ip",
+            "dst_ip",
+            "src_port",
+            "dst_port",
+        )
+
+        samples: List[str] = []
+        sample_limit = max(1, limit)
+        for idx in indices[:sample_limit]:
+            detail = ""
+            if row_messages and idx < len(row_messages):
+                detail = str(row_messages[idx])
+            elif frame is not None and idx < len(frame):
+                row = frame.iloc[idx]
+                identifier = None
+                for column in identifier_columns:
+                    if column not in frame.columns:
+                        continue
+                    value = row.get(column)
+                    try:
+                        missing = pd.isna(value)
+                    except Exception:
+                        missing = value in (None, "")
+                    if missing:
+                        continue
+                    text_value = str(value).strip()
+                    if text_value:
+                        identifier = f"{column}={text_value}"
+                        break
+                if identifier is None:
+                    identifier = f"第{idx + 1}行"
+
+                label_value = None
+                if "prediction_label" in frame.columns:
+                    label_value = row.get("prediction_label")
+                if label_value is None and labels and idx < len(labels):
+                    label_value = labels[idx]
+                if label_value is None:
+                    label_value = row.get("prediction")
+                label_text = str(label_value)
+
+                score_value = row.get("malicious_score")
+                if score_value is None:
+                    score_value = row.get("anomaly_score")
+                try:
+                    score_float = float(score_value)
+                except Exception:
+                    score_float = None
+                score_text = (
+                    f" 分数={score_float:.4f}"
+                    if score_float is not None and not math.isnan(score_float)
+                    else ""
+                )
+                rule_note = ""
+                if "rules_triggered" in frame.columns:
+                    try:
+                        triggered = bool(frame.loc[idx, "rules_triggered"])
+                    except Exception:
+                        triggered = False
+                    if triggered:
+                        rule_score_value = frame.loc[idx, "rules_score"] if "rules_score" in frame.columns else None
+                        try:
+                            rule_score_text = f" 规则分={float(rule_score_value):.1f}"
+                        except Exception:
+                            rule_score_text = ""
+                        reason_value = frame.loc[idx, "rules_reasons"] if "rules_reasons" in frame.columns else None
+                        reason_text = str(reason_value).strip() if reason_value is not None else ""
+                        if reason_text:
+                            rule_note = f" [规则]{reason_text}{rule_score_text}"
+                        else:
+                            rule_note = f" [规则命中]{rule_score_text}"
+                detail = f"{identifier} -> 预测={label_text}{score_text}{rule_note}"
+
+            if not detail:
+                detail = f"第{idx + 1}行 -> 预测=异常"
+
+            if detail.startswith(f"{source_name}:"):
+                samples.append(detail)
+            else:
+                samples.append(f"{source_name}: {detail}")
+
+        return samples, len(indices)
 
     def _predict_pcap_batch(
         self,
@@ -4271,9 +5485,16 @@ class Ui_MainWindow(object):
         *,
         metadata_override: Optional[dict],
     ) -> None:
+        parent_widget = self._parent_widget()
         if not paths:
-            QtWidgets.QMessageBox.information(None, "无有效文件", "所选目录中没有可处理的 PCAP 文件。")
+            QtWidgets.QMessageBox.information(parent_widget, "无有效文件", "所选目录中没有可处理的 PCAP 文件。")
             return
+
+        button = getattr(self, "btn_predict", None)
+        if button is not None:
+            button.setEnabled(False)
+            self._start_task_progress(button)
+            QtWidgets.QApplication.processEvents()
 
         output_dir = self._prediction_out_dir()
         os.makedirs(output_dir, exist_ok=True)
@@ -4281,86 +5502,318 @@ class Ui_MainWindow(object):
         total = len(paths)
         successes = 0
         total_rows = 0
-        total_malicious = 0
+        total_anomaly_flows = 0
+        anomaly_file_count = 0
+        anomaly_samples: List[str] = []
         failed: List[Tuple[str, str]] = []
 
-        for index, pcap_path in enumerate(paths, start=1):
-            self.display_result(f"[INFO] 处理 PCAP ({index}/{total}): {pcap_path}")
-            try:
-                payload = self._process_online_pcap(
-                    pcap_path,
-                    output_dir=output_dir,
-                    metadata=metadata_override,
+        try:
+            for index, pcap_path in enumerate(paths, start=1):
+                self.display_result(f"[INFO] 处理 PCAP ({index}/{total}): {pcap_path}")
+
+                def _update_progress(local_pct: int) -> None:
+                    if button is None:
+                        return
+                    try:
+                        local_value = max(0, min(100, int(local_pct)))
+                    except Exception:
+                        local_value = 0
+                    completed = (index - 1) + (local_value / 100.0)
+                    overall = int(max(1, min(100, (completed / float(total)) * 100.0)))
+                    self._update_task_progress(button, overall)
+                    QtWidgets.QApplication.processEvents()
+
+                try:
+                    payload = self._process_online_pcap(
+                        pcap_path,
+                        output_dir=output_dir,
+                        metadata=metadata_override,
+                        progress_cb=_update_progress,
+                    )
+                except Exception as exc:
+                    reason = str(exc)
+                    failed.append((pcap_path, reason))
+                    self.display_result(f"[错误] PCAP 处理失败：{pcap_path} -> {reason}")
+                    continue
+
+                prediction = payload.get("prediction") if isinstance(payload, dict) else None
+                source_name = os.path.basename(pcap_path)
+                self._present_prediction_result(
+                    prediction,
+                    source_name=source_name,
+                    metadata_override=metadata_override,
+                    source_pcap=pcap_path,
+                    show_dialog=False,
                 )
-            except Exception as exc:
-                reason = str(exc)
-                failed.append((pcap_path, reason))
-                self.display_result(f"[错误] PCAP 处理失败：{pcap_path} -> {reason}")
-                continue
 
-            prediction = payload.get("prediction") if isinstance(payload, dict) else None
-            source_name = os.path.basename(pcap_path)
-            self._present_prediction_result(
-                prediction,
-                source_name=source_name,
-                metadata_override=metadata_override,
-                source_pcap=pcap_path,
-                show_dialog=False,
-            )
+                successes += 1
+                try:
+                    total_rows += int(prediction.get("total", 0))  # type: ignore[arg-type]
+                except Exception:
+                    pass
 
-            successes += 1
-            try:
-                total_rows += int(prediction.get("total", 0))  # type: ignore[arg-type]
-            except Exception:
-                pass
-            try:
-                total_malicious += int(prediction.get("malicious", 0))  # type: ignore[arg-type]
-            except Exception:
-                pass
+                sample_lines, sample_count = self._collect_anomaly_details(
+                    prediction,
+                    source_name=source_name,
+                    limit=3,
+                )
+                if sample_count > 0 and sample_lines:
+                    anomaly_samples.extend(sample_lines)
+                anomaly_flow_count = 0
+                flags_payload = prediction.get("anomaly_flags")
+                if isinstance(flags_payload, (list, tuple)):
+                    try:
+                        anomaly_flow_count = sum(1 for flag in flags_payload if bool(flag))
+                    except Exception:
+                        anomaly_flow_count = 0
+                declared_total = None
+                for key in ("malicious", "anomaly_count"):
+                    value = prediction.get(key)
+                    if isinstance(value, (int, np.integer)):
+                        declared_total = max(0, int(value))
+                        break
+                    if value is not None:
+                        try:
+                            declared_total = max(0, int(str(value).strip()))
+                            break
+                        except (TypeError, ValueError):
+                            continue
+                if anomaly_flow_count == 0:
+                    if declared_total is not None:
+                        anomaly_flow_count = declared_total
+                    else:
+                        anomaly_flow_count = sample_count
+                else:
+                    if declared_total is not None:
+                        anomaly_flow_count = max(anomaly_flow_count, declared_total)
+                if sample_count > 0:
+                    anomaly_flow_count = max(anomaly_flow_count, sample_count)
+                if anomaly_flow_count > 0:
+                    anomaly_file_count += 1
+                total_anomaly_flows += max(anomaly_flow_count, 0)
 
-        if successes == 0:
-            error_lines = [f"- {os.path.basename(path)}: {reason}" for path, reason in failed[:5]]
-            if len(failed) > 5:
-                error_lines.append("...")
-            QtWidgets.QMessageBox.critical(
-                None,
-                "预测失败",
-                "所有 PCAP 文件处理均失败。\n" + "\n".join(error_lines),
-            )
-            return
+            if successes == 0:
+                error_lines = [f"- {os.path.basename(path)}: {reason}" for path, reason in failed[:5]]
+                if len(failed) > 5:
+                    error_lines.append("...")
+                QtWidgets.QMessageBox.critical(
+                    parent_widget,
+                    "预测失败",
+                    "所有 PCAP 文件处理均失败。\n" + "\n".join(error_lines),
+                )
+                return
 
-        summary_lines = [
-            f"共处理 PCAP 文件：{total} 个",
-            f"成功：{successes} 个，失败：{total - successes} 个",
-            f"累计检测流量：{total_rows} 条",
-            f"检测到异常：{total_malicious} 条",
-        ]
-        if failed:
-            sample = "; ".join(
-                f"{os.path.basename(path)}: {reason}" for path, reason in failed[:3]
-            )
-            if len(failed) > 3:
-                sample += " ..."
-            summary_lines.append(f"失败样例：{sample}")
+            summary_lines = [
+                f"共处理 PCAP 文件：{total} 个",
+                f"成功：{successes} 个，失败：{total - successes} 个",
+                f"累计检测流量：{total_rows} 条",
+                f"检测到异常包：{anomaly_file_count} 个",
+                f"累计异常流量：{total_anomaly_flows} 条",
+            ]
+            if failed:
+                sample = "; ".join(
+                    f"{os.path.basename(path)}: {reason}" for path, reason in failed[:3]
+                )
+                if len(failed) > 3:
+                    sample += " ..."
+                summary_lines.append(f"失败样例：{sample}")
 
-        QtWidgets.QMessageBox.information(None, "预测完成", "\n".join(summary_lines))
+            if anomaly_samples and total_anomaly_flows > 0:
+                summary_lines.append("异常详情（最多展示前几条）：")
+                preview = anomaly_samples[:5]
+                summary_lines.extend(f"- {line}" for line in preview)
+                if len(anomaly_samples) > 5:
+                    summary_lines.append(
+                        f"... 另有 {len(anomaly_samples) - 5} 条异常未显示"
+                    )
+
+            QtWidgets.QMessageBox.information(parent_widget, "预测完成", "\n".join(summary_lines))
+        finally:
+            if button is not None:
+                button.setEnabled(True)
+                if successes > 0:
+                    self._finish_task_progress(button)
+                else:
+                    self._fail_task_progress(button)
 
     def _on_predict(self):
+        parent_widget = self._parent_widget()
         if pd is None:
-            QtWidgets.QMessageBox.warning(None, "缺少依赖", "当前环境未安装 pandas，无法执行预测。")
+            QtWidgets.QMessageBox.warning(parent_widget, "缺少依赖", "当前环境未安装 pandas，无法执行预测。")
+            return
+
+        selected_df: Optional["pd.DataFrame"] = None
+        selection_model = getattr(self.table_view, "selectionModel", None)
+        if callable(selection_model):
+            selection_model = selection_model()
+        if selection_model is not None:
+            try:
+                selected_indexes = selection_model.selectedRows()
+            except Exception:
+                selected_indexes = []
+            if selected_indexes:
+                model = self.table_view.model()
+                source_model = model
+                if isinstance(model, QtCore.QSortFilterProxyModel):
+                    source_model = model.sourceModel()
+                df_source = getattr(source_model, "_df", None)
+                if isinstance(df_source, pd.DataFrame) and not df_source.empty:
+                    row_numbers: List[int] = []
+                    for index in selected_indexes:
+                        source_index = index
+                        if isinstance(model, QtCore.QSortFilterProxyModel):
+                            source_index = model.mapToSource(index)
+                        if source_index.isValid():
+                            row_numbers.append(source_index.row())
+                    if row_numbers:
+                        valid_rows = sorted({row for row in row_numbers if 0 <= row < len(df_source)})
+                        if valid_rows:
+                            base_index = getattr(df_source, "index", None)
+                            candidate_df: Optional["pd.DataFrame"] = None
+                            if pd is not None and isinstance(base_index, pd.Index):
+                                try:
+                                    index_values = [base_index[row] for row in valid_rows]
+                                except Exception:
+                                    index_values = []
+                                else:
+                                    full_df = getattr(self, "_last_preview_df", None)
+                                    if isinstance(full_df, pd.DataFrame) and index_values:
+                                        try:
+                                            candidate_df = full_df.loc[index_values].copy()
+                                        except Exception:
+                                            candidate_df = None
+                            if candidate_df is None:
+                                candidate_df = df_source.iloc[valid_rows].copy()
+                            selected_df = candidate_df
+
+        if selected_df is not None and not selected_df.empty:
+            selected_df = self._sanitize_prediction_input_frame(selected_df)
+            if not isinstance(selected_df, pd.DataFrame) or selected_df.empty:
+                selected_df = None
+
+        if selected_df is not None and not selected_df.empty:
+            metadata_override = None
+            if isinstance(self._selected_metadata, dict):
+                metadata_override = self._selected_metadata
+            elif isinstance(self._latest_prediction_summary, dict):
+                meta_candidate = self._latest_prediction_summary.get("metadata")
+                if isinstance(meta_candidate, dict):
+                    metadata_override = meta_candidate
+
+            self.display_result(f"[INFO] 使用已选流量 {len(selected_df)} 条执行模型预测。")
+
+            button = getattr(self, "btn_predict", None)
+            if button is not None:
+                button.setEnabled(False)
+                self._start_task_progress(button)
+                QtWidgets.QApplication.processEvents()
+
+            selection_count = len(selected_df)
+            result: Optional[dict] = None
+            error_message: Optional[str] = None
+            try:
+                result = self._predict_dataframe(
+                    selected_df,
+                    source_name=f"选中流量({selection_count})",
+                    metadata_override=metadata_override,
+                    silent=True,
+                )
+            except Exception as exc:
+                fallback_frame = self._match_rows_from_latest(selected_df)
+                if isinstance(fallback_frame, pd.DataFrame) and not fallback_frame.empty:
+                    fallback_cleaned = self._sanitize_prediction_input_frame(fallback_frame)
+                    if isinstance(fallback_cleaned, pd.DataFrame) and not fallback_cleaned.empty:
+                        self.display_result(
+                            "[WARN] 所选流量缺少完整特征，已根据最近预测的原始特征补全后重试。"
+                        )
+                        try:
+                            result = self._predict_dataframe(
+                                fallback_cleaned,
+                                source_name=f"选中流量({selection_count})",
+                                metadata_override=metadata_override,
+                                silent=True,
+                            )
+                        except Exception as exc_inner:
+                            error_message = str(exc_inner)
+                    else:
+                        error_message = str(exc)
+                else:
+                    error_message = str(exc)
+
+            if result is None:
+                if button is not None:
+                    button.setEnabled(True)
+                    self._fail_task_progress(button)
+                QtWidgets.QMessageBox.critical(
+                    parent_widget,
+                    "预测失败",
+                    error_message or "所选流量无法重新预测，请检查特征列是否完整。",
+                )
+                return
+
+            if button is not None:
+                button.setEnabled(True)
+                self._finish_task_progress(button)
+
+            self._present_prediction_result(
+                result,
+                source_name=f"选中流量({selection_count})",
+                metadata_override=metadata_override,
+                show_dialog=True,
+            )
             return
 
         preferred_pcap_dir = r"D:\pythonProject8\data\split"
         start_dir = preferred_pcap_dir if os.path.exists(preferred_pcap_dir) else self._default_split_dir()
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        selected_files, _ = QtWidgets.QFileDialog.getOpenFileNames(
             None,
-            "选择 PCAP 文件",
+            "选择 PCAP 流量（可多选）",
             start_dir,
             "PCAP (*.pcap *.pcapng);;所有文件 (*)",
         )
 
-        if file_path:
-            chosen_path = file_path
+        chosen_path: Optional[str]
+        if selected_files:
+            normalized_files = [os.path.normpath(p.strip()) for p in selected_files if p]
+            valid_files = [
+                p
+                for p in normalized_files
+                if p
+                and os.path.exists(p)
+                and os.path.isfile(p)
+                and p.lower().endswith((".pcap", ".pcapng"))
+            ]
+
+            if not valid_files:
+                QtWidgets.QMessageBox.warning(
+                    parent_widget,
+                    "无有效文件",
+                    "请选择存在的 PCAP/PCAPNG 文件。",
+                )
+                return
+
+            metadata_override = (
+                self._selected_metadata if isinstance(self._selected_metadata, dict) else None
+            )
+
+            deduped_files: List[str] = []
+            seen: Set[str] = set()
+            for path in valid_files:
+                if path not in seen:
+                    deduped_files.append(path)
+                    seen.add(path)
+
+            valid_files = deduped_files
+
+            if len(valid_files) > 1:
+                self._remember_path(os.path.dirname(valid_files[0]))
+                self._predict_pcap_batch(
+                    valid_files,
+                    metadata_override=metadata_override,
+                )
+                return
+
+            chosen_path = valid_files[0]
         else:
             dir_path = QtWidgets.QFileDialog.getExistingDirectory(
                 None, "选择 PCAP 所在目录", start_dir
@@ -4374,17 +5827,19 @@ class Ui_MainWindow(object):
             return
 
         if not os.path.exists(chosen_path):
-            QtWidgets.QMessageBox.warning(None, "路径不存在", chosen_path)
+            QtWidgets.QMessageBox.warning(parent_widget, "路径不存在", chosen_path)
             return
 
-        metadata_override = self._selected_metadata if isinstance(self._selected_metadata, dict) else None
+        metadata_override = (
+            self._selected_metadata if isinstance(self._selected_metadata, dict) else None
+        )
 
         if os.path.isdir(chosen_path):
             pcap_candidates = self._list_sorted(chosen_path)
 
             if not pcap_candidates:
                 QtWidgets.QMessageBox.information(
-                    None,
+                    parent_widget,
                     "未发现数据",
                     "所选目录没有可用的 PCAP 文件。",
                 )
@@ -4401,15 +5856,40 @@ class Ui_MainWindow(object):
             self._remember_path(chosen_path)
 
         if chosen_path.lower().endswith((".pcap", ".pcapng")):
+            button = getattr(self, "btn_predict", None)
+            if button is not None:
+                button.setEnabled(False)
+                self._start_task_progress(button)
+                QtWidgets.QApplication.processEvents()
+
+            def _single_progress(local_pct: int) -> None:
+                if button is None:
+                    return
+                try:
+                    pct_value = max(0, min(100, int(local_pct)))
+                except Exception:
+                    pct_value = 0
+                pct_value = max(1, pct_value)
+                self._update_task_progress(button, pct_value)
+                QtWidgets.QApplication.processEvents()
+
             try:
                 payload = self._process_online_pcap(
                     chosen_path,
                     output_dir=self._prediction_out_dir(),
                     metadata=metadata_override,
+                    progress_cb=_single_progress,
                 )
             except Exception as exc:
-                QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
+                if button is not None:
+                    button.setEnabled(True)
+                    self._fail_task_progress(button)
+                QtWidgets.QMessageBox.critical(parent_widget, "预测失败", str(exc))
                 return
+
+            if button is not None:
+                button.setEnabled(True)
+                self._finish_task_progress(button)
 
             prediction = payload.get("prediction") if isinstance(payload, dict) else None
             source_name = os.path.basename(chosen_path)
@@ -4425,11 +5905,11 @@ class Ui_MainWindow(object):
         try:
             df = read_csv_flexible(chosen_path)
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "读取失败", f"无法读取 CSV：{exc}")
             return
 
         if df.empty:
-            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
+            QtWidgets.QMessageBox.information(parent_widget, "空数据", "该 CSV 没有数据行。")
             return
 
         source_name = os.path.splitext(os.path.basename(chosen_path))[0] or os.path.basename(chosen_path)
@@ -4442,7 +5922,7 @@ class Ui_MainWindow(object):
                 silent=True,
             )
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
+            QtWidgets.QMessageBox.critical(parent_widget, "预测失败", str(exc))
             return
 
         self._present_prediction_result(
@@ -4465,6 +5945,7 @@ class Ui_MainWindow(object):
         self._reveal_in_folder(self._default_results_dir())
 
     def _open_logs_dir(self):
+        parent_widget = self._parent_widget()
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -4476,7 +5957,11 @@ class Ui_MainWindow(object):
             sample_file = None
 
         try:
-            dialog = LogViewerDialog(LOGS_DIR, reveal_callback=self._reveal_in_folder, parent=self)
+            dialog = LogViewerDialog(
+                LOGS_DIR,
+                reveal_callback=self._reveal_in_folder,
+                parent=parent_widget,
+            )
             if dialog.exec_() == 0 and sample_file is None:
                 QtWidgets.QMessageBox.information(
                     None,
