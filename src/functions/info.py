@@ -9,7 +9,6 @@ import os
 import tempfile
 import threading
 import time
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from types import ModuleType
@@ -67,10 +66,24 @@ class FlowStats:
             self.max_time = timestamp
 
 
-def _iter_packets(path: str) -> Iterable:
+def _resolve_reader_handle(reader) -> Optional[Any]:
+    for attr in ("fd", "f", "file", "fh", "fdesc", "reader"):
+        handle = getattr(reader, attr, None)
+        if hasattr(handle, "tell"):
+            return handle
+    return None
+
+
+def _iter_packets(path: str, progress_cb: Optional[Callable[[Any], None]] = None) -> Iterable:
     with PcapReader(path) as reader:
+        handle = _resolve_reader_handle(reader)
         for packet in reader:
             yield packet
+            if progress_cb and handle is not None:
+                try:
+                    progress_cb(handle)
+                except Exception:
+                    pass
 
 
 def _count_packets(path: str) -> int:
@@ -160,8 +173,14 @@ def _write_temp_csv(df: pd.DataFrame) -> Optional[str]:
     return temp_path
 
 
-def _flows_to_records(flows_map: Dict[FlowKey, FlowStats], *, file_name: str) -> List[Dict[str, object]]:
+def _flows_to_records(
+    flows_map: Dict[FlowKey, FlowStats],
+    *,
+    file_name: str,
+    limit: Optional[int] = None,
+) -> Tuple[List[Dict[str, object]], bool]:
     records: List[Dict[str, object]] = []
+    truncated = False
 
     for (src_ip, dst_ip, src_port, dst_port, proto), stats in flows_map.items():
         if stats.min_time is None or stats.max_time is None:
@@ -190,7 +209,11 @@ def _flows_to_records(flows_map: Dict[FlowKey, FlowStats], *, file_name: str) ->
             }
         )
 
-    return records
+        if limit is not None and limit > 0 and len(records) >= limit:
+            truncated = True
+            break
+
+    return records, truncated
 
 
 def _process_file(
@@ -202,14 +225,64 @@ def _process_file(
     cancel_cb: Optional[Callable[[], bool]],
     cancel_event: threading.Event,
     progress_hook: Optional[Callable[[int], None]],
-) -> Tuple[List[Dict[str, object]], int, Optional[str], bool]:
-    flows_map: Dict[FlowKey, FlowStats] = defaultdict(FlowStats)
+) -> Tuple[List[Dict[str, object]], int, Optional[str], bool, bool]:
+    return _process_file_limited(
+        file_path,
+        proto_filter=proto_filter,
+        whitelist=whitelist,
+        blacklist=blacklist,
+        cancel_cb=cancel_cb,
+        cancel_event=cancel_event,
+        progress_hook=progress_hook,
+        progress_ratio=None,
+        record_limit=None,
+        packet_limit=None,
+    )
+
+
+def _process_file_limited(
+    file_path: str,
+    *,
+    proto_filter: str,
+    whitelist: Set[int],
+    blacklist: Set[int],
+    cancel_cb: Optional[Callable[[], bool]],
+    cancel_event: threading.Event,
+    progress_hook: Optional[Callable[[int], None]],
+    progress_ratio: Optional[Callable[[str, int], None]],
+    record_limit: Optional[int],
+    packet_limit: Optional[int],
+) -> Tuple[List[Dict[str, object]], int, Optional[str], bool, bool]:
+    flows_map: Dict[FlowKey, FlowStats] = {}
     processed = 0
     last_reported = 0
     cancelled = False
+    truncated = False
 
     try:
-        for pkt in _iter_packets(file_path):
+        file_size = os.path.getsize(file_path)
+    except OSError:
+        file_size = 0
+    last_ratio = -1
+
+    def _byte_progress(handle) -> None:
+        nonlocal last_ratio
+        if not progress_ratio or file_size <= 0:
+            return
+        try:
+            position = handle.tell()
+        except Exception:
+            return
+        pct = min(99, max(0, int(position * 100 / file_size)))
+        if pct != last_ratio:
+            last_ratio = pct
+            progress_ratio(file_path, pct)
+
+    try:
+        if progress_ratio:
+            progress_ratio(file_path, 0)
+
+        for pkt in _iter_packets(file_path, progress_cb=_byte_progress):
             if cancel_event.is_set() or (cancel_cb and cancel_cb()):
                 cancel_event.set()
                 cancelled = True
@@ -235,26 +308,27 @@ def _process_file(
             timestamp = float(pkt.time)
             length = len(pkt)
 
-            if key_fwd in flows_map:
-                flows_map[key_fwd].add_packet(
-                    length=length,
-                    timestamp=timestamp,
-                    direction="fwd",
-                )
-            elif key_bwd in flows_map:
-                flows_map[key_bwd].add_packet(
-                    length=length,
-                    timestamp=timestamp,
-                    direction="bwd",
-                )
+            stats = flows_map.get(key_fwd)
+            if stats is not None:
+                stats.add_packet(length=length, timestamp=timestamp, direction="fwd")
             else:
-                flows_map[key_fwd].add_packet(
-                    length=length,
-                    timestamp=timestamp,
-                    direction="fwd",
-                )
+                stats_bwd = flows_map.get(key_bwd)
+                if stats_bwd is not None:
+                    stats_bwd.add_packet(length=length, timestamp=timestamp, direction="bwd")
+                else:
+                    if record_limit is not None and record_limit > 0 and len(flows_map) >= record_limit:
+                        truncated = True
+                        continue
+                    stats_new = FlowStats()
+                    stats_new.add_packet(length=length, timestamp=timestamp, direction="fwd")
+                    flows_map[key_fwd] = stats_new
 
             processed += 1
+            if packet_limit is not None and packet_limit > 0 and processed >= packet_limit:
+                truncated = True
+                cancelled = True
+                cancel_event.set()
+                break
             if progress_hook and processed - last_reported >= 200:
                 progress_hook(processed - last_reported)
                 last_reported = processed
@@ -263,11 +337,28 @@ def _process_file(
             progress_hook(processed - last_reported)
 
     except Exception as exc:
-        return [], processed, f"[ERROR] 解析失败 {file_path}: {exc}", cancelled
+        if progress_ratio:
+            try:
+                progress_ratio(file_path, 100)
+            except Exception:
+                pass
+        return [], processed, f"[ERROR] 解析失败 {file_path}: {exc}", cancelled, truncated
+
+    if progress_ratio:
+        try:
+            progress_ratio(file_path, 100)
+        except Exception:
+            pass
 
     file_name = os.path.basename(file_path)
-    records = _flows_to_records(flows_map, file_name=file_name)
-    return records, processed, None, cancelled
+    record_limit = record_limit if record_limit and record_limit > 0 else None
+    records, records_truncated = _flows_to_records(
+        flows_map,
+        file_name=file_name,
+        limit=record_limit,
+    )
+    truncated = truncated or records_truncated
+    return records, processed, None, cancelled, truncated
 
 
 def _flow_key(pkt) -> Optional[Tuple[FlowKey, FlowKey]]:
@@ -310,6 +401,8 @@ def get_pcap_features(
     fast: bool = False,
     progress_cb: Optional[Callable[[int], None]] = None,
     cancel_cb: Optional[Callable[[], bool]] = None,
+    record_limit: Optional[int] = None,
+    packet_limit: Optional[int] = None,
 ) -> pd.DataFrame:
     """提取一个或多个 PCAP 文件的流量统计信息，兼容 GUI 所需的参数。"""
 
@@ -326,6 +419,28 @@ def get_pcap_features(
 
     whitelist = _parse_ports(port_whitelist_text)
     blacklist = _parse_ports(port_blacklist_text)
+
+    record_cap: Optional[int]
+    if record_limit is not None:
+        try:
+            record_cap = int(record_limit)
+        except (TypeError, ValueError):
+            record_cap = None
+        if record_cap is not None and record_cap <= 0:
+            record_cap = None
+    else:
+        record_cap = None
+
+    packet_cap: Optional[int]
+    if packet_limit is not None:
+        try:
+            packet_cap = int(packet_limit)
+        except (TypeError, ValueError):
+            packet_cap = None
+        if packet_cap is not None and packet_cap <= 0:
+            packet_cap = None
+    else:
+        packet_cap = None
 
     if proto_filter not in {"both", "tcp", "udp"}:
         proto_filter = "both"
@@ -347,6 +462,9 @@ def get_pcap_features(
     last_emit_pct = -1
     completed_files = 0
     progress_lock = threading.Lock()
+    file_progress: Dict[str, int] = {file_path: 0 for file_path in target_files}
+    remaining_limit = record_cap
+    limit_notes: List[str] = []
 
     def _packet_progress(delta: int) -> None:
         nonlocal processed_packets, last_emit_pct
@@ -370,6 +488,16 @@ def get_pcap_features(
             pct = min(99, int(completed_files * 100 / max(1, len(target_files))))
             progress_cb(pct)
 
+    def _per_file_progress(file_path: str, pct: int) -> None:
+        if not progress_cb:
+            return
+        with progress_lock:
+            file_progress[file_path] = max(0, min(100, int(pct)))
+            if total_packets > 0:
+                return
+            overall = sum(file_progress.values()) / max(1, len(file_progress))
+            progress_cb(min(99, int(overall)))
+
     start_time = time.time()
     records: List[Dict[str, object]] = []
 
@@ -379,7 +507,7 @@ def get_pcap_features(
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_to_file = {
                 executor.submit(
-                    _process_file,
+                    _process_file_limited,
                     file_path,
                     proto_filter=proto_filter,
                     whitelist=whitelist,
@@ -387,6 +515,9 @@ def get_pcap_features(
                     cancel_cb=cancel_cb,
                     cancel_event=cancel_event,
                     progress_hook=_packet_progress if total_packets and not fast else None,
+                    progress_ratio=_per_file_progress,
+                    record_limit=remaining_limit,
+                    packet_limit=packet_cap,
                 ): file_path
                 for file_path in target_files
             }
@@ -394,14 +525,25 @@ def get_pcap_features(
             for future in as_completed(future_to_file):
                 file_path = future_to_file[future]
                 try:
-                    recs, processed, err, cancelled = future.result()
+                    recs, processed, err, cancelled, truncated = future.result()
                     if recs:
-                        records.extend(recs)
+                        if remaining_limit is not None and remaining_limit >= 0:
+                            if len(recs) > remaining_limit:
+                                records.extend(recs[:remaining_limit])
+                            else:
+                                records.extend(recs)
+                            remaining_limit = max(0, remaining_limit - len(recs))
+                        else:
+                            records.extend(recs)
                     if err:
                         file_errors.append(err)
                     if total_packets <= 0 or fast:
                         _file_progress()
-                    if cancelled:
+                    if truncated:
+                        limit_notes.append(
+                            f"{os.path.basename(file_path)} 仅显示前 {len(recs)} 条流量"
+                        )
+                    if cancelled or (remaining_limit is not None and remaining_limit <= 0):
                         cancel_event.set()
                         break
                 except Exception as exc:
@@ -416,7 +558,7 @@ def get_pcap_features(
                 cancel_event.set()
                 break
 
-            recs, processed, err, cancelled = _process_file(
+            recs, processed, err, cancelled, truncated = _process_file_limited(
                 file_path,
                 proto_filter=proto_filter,
                 whitelist=whitelist,
@@ -424,16 +566,33 @@ def get_pcap_features(
                 cancel_cb=cancel_cb,
                 cancel_event=cancel_event,
                 progress_hook=_packet_progress if total_packets and not fast else None,
+                progress_ratio=_per_file_progress,
+                record_limit=remaining_limit,
+                packet_limit=packet_cap,
             )
             if recs:
-                records.extend(recs)
+                if remaining_limit is not None and remaining_limit >= 0:
+                    if len(recs) > remaining_limit:
+                        records.extend(recs[:remaining_limit])
+                    else:
+                        records.extend(recs)
+                    remaining_limit = max(0, remaining_limit - len(recs))
+                else:
+                    records.extend(recs)
             if err:
                 file_errors.append(err)
             if total_packets <= 0 or fast:
                 _file_progress()
-            if cancelled:
+            if truncated:
+                limit_notes.append(
+                    f"{os.path.basename(file_path)} 仅显示前 {len(recs)} 条流量"
+                )
+            if cancelled or (remaining_limit is not None and remaining_limit <= 0):
                 cancel_event.set()
                 break
+
+    if limit_notes:
+        file_errors.extend(limit_notes)
 
     df = pd.DataFrame.from_records(records)
 
@@ -441,6 +600,13 @@ def get_pcap_features(
     df.attrs["out_csv"] = out_csv
     df.attrs["files_total"] = len(target_files)
     df.attrs["errors"] = "\n".join(file_errors)
+    if record_cap is not None:
+        df.attrs["record_limit"] = int(record_cap)
+    if packet_cap is not None:
+        df.attrs["packet_limit"] = int(packet_cap)
+    df.attrs["limited"] = bool(limit_notes or (record_cap is not None and remaining_limit is not None and remaining_limit <= 0))
+    if limit_notes:
+        df.attrs["limit_notes"] = list(limit_notes)
 
     if progress_cb:
         progress_cb(100)

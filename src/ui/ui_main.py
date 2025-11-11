@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 from typing import Callable, Collection, Dict, List, Optional, Set, Tuple, Union
 from datetime import datetime
+from functools import partial
 
 import yaml
 import matplotlib
@@ -833,6 +834,8 @@ def _resolve_data_base() -> Path:
 
 # 仅表格预览上限（全部数据都会落盘）
 PREVIEW_LIMIT_FOR_TABLE = 50
+MAX_INFO_FLOW_RECORDS = 5000
+MAX_INFO_PACKET_SAMPLES = 200_000
 
 DATA_BASE = _resolve_data_base()
 PATHS = get_paths(
@@ -1162,6 +1165,7 @@ class Ui_MainWindow(object):
         self.preprocess_worker: Optional[FunctionThread] = None
         self.thread_pool = QtCore.QThreadPool.globalInstance()
         self._running_tasks: Set[BackgroundTask] = set()
+        self._progress_states: Dict[QtWidgets.QPushButton, Dict[str, object]] = {}
 
         # 用户偏好
         self._settings = AppSettings(SETTINGS_PATH)
@@ -2482,13 +2486,94 @@ class Ui_MainWindow(object):
         p = max(0, min(100, int(progress))) / 100.0
         button.setStyleSheet(
             f'QPushButton{{border:0;border-radius:10px;padding:8px 12px;'
-            f'background:qlineargradient(x1:0,y1:0,x2:1,y2:0,' 
+            f'background:qlineargradient(x1:0,y1:0,x2:1,y2:0,'
             f'stop:0 #69A1FF, stop:{p:.3f} #69A1FF, stop:{p:.3f} #EEF1F6, stop:1 #EEF1F6);}}'
             'QPushButton:hover{background:#E2E8F0;} QPushButton:pressed{background:#D9E0EA;}'
         )
 
     def reset_button_progress(self, button: QtWidgets.QPushButton):
         button.setStyleSheet("")
+
+    def _ensure_progress_state(self, button: QtWidgets.QPushButton) -> Dict[str, object]:
+        states = getattr(self, "_progress_states", None)
+        if states is None:
+            states = {}
+            self._progress_states = states
+        state = states.get(button)
+        if state is None:
+            state = {"current": 0, "target": 0, "timer": None, "done": False}
+            states[button] = state
+        return state
+
+    def _stop_progress_timer(self, state: Dict[str, object]) -> None:
+        timer = state.get("timer")
+        if isinstance(timer, QtCore.QTimer):
+            timer.stop()
+            timer.deleteLater()
+        state["timer"] = None
+
+    def _tick_task_progress(self, button: QtWidgets.QPushButton) -> None:
+        states = getattr(self, "_progress_states", {})
+        state = states.get(button)
+        if not state or state.get("done"):
+            return
+        current = int(state.get("current", 0))
+        target = int(state.get("target", 0))
+        if current < target:
+            current = target
+        elif current < 95:
+            increment = max(1, int((95 - current) * 0.08))
+            current = min(95, current + increment)
+        else:
+            return
+        state["current"] = current
+        self.set_button_progress(button, current)
+
+    def _start_task_progress(self, button: QtWidgets.QPushButton, initial: int = 1) -> None:
+        state = self._ensure_progress_state(button)
+        self._stop_progress_timer(state)
+        value = max(0, min(99, int(initial)))
+        state.update({"current": value, "target": value, "done": False})
+        self.set_button_progress(button, value)
+        timer = QtCore.QTimer()
+        parent = self._parent_widget()
+        if isinstance(parent, QtCore.QObject):
+            timer.setParent(parent)
+        timer.setInterval(280)
+        timer.timeout.connect(lambda b=button: self._tick_task_progress(b))
+        timer.start()
+        state["timer"] = timer
+
+    def _update_task_progress(self, button: QtWidgets.QPushButton, value: int) -> None:
+        state = self._ensure_progress_state(button)
+        val = max(0, min(100, int(value)))
+        state["target"] = max(int(state.get("target", 0)), val)
+        if val >= 100:
+            self._finish_task_progress(button)
+            return
+        if val > int(state.get("current", 0)):
+            state["current"] = val
+            self.set_button_progress(button, val)
+
+    def _finish_task_progress(self, button: QtWidgets.QPushButton, *, success: bool = True) -> None:
+        state = self._ensure_progress_state(button)
+        if not state.get("done"):
+            self._stop_progress_timer(state)
+        state["done"] = True
+        final_value = 100 if success else max(0, int(state.get("current", 0)))
+        state["current"] = final_value
+        state["target"] = final_value
+        if success:
+            self.set_button_progress(button, 100)
+            QtCore.QTimer.singleShot(300, lambda b=button: self.reset_button_progress(b))
+        else:
+            self.reset_button_progress(button)
+
+    def _fail_task_progress(self, button: QtWidgets.QPushButton) -> None:
+        state = self._ensure_progress_state(button)
+        self._stop_progress_timer(state)
+        state.update({"current": 0, "target": 0, "done": True})
+        self.reset_button_progress(button)
 
     # --------- 分页器 ----------
     def _open_csv_paged(self, csv_path: str):
@@ -2736,7 +2821,8 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 正在解析 {path} ...", True)
 
         self._set_action_buttons_enabled(False)
-        self.btn_view.setEnabled(False); self.set_button_progress(self.btn_view, 0)
+        self.btn_view.setEnabled(False)
+        self._start_task_progress(self.btn_view)
 
         self.worker = FunctionThread(
             info,
@@ -2754,17 +2840,18 @@ class Ui_MainWindow(object):
             port_whitelist_text=wl,
             port_blacklist_text=bl,
             fast=True,
+            record_limit=MAX_INFO_FLOW_RECORDS,
+            packet_limit=MAX_INFO_PACKET_SAMPLES,
             cancel_arg="cancel_cb",
         )
-        self.worker.progress.connect(lambda p: self.set_button_progress(self.btn_view, p))
+        self.worker.progress.connect(partial(self._update_task_progress, self.btn_view))
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.error.connect(self._on_worker_error)
         self.worker.start()
 
     def _on_worker_finished(self, df):
         self.btn_view.setEnabled(True)
-        self.set_button_progress(self.btn_view, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_view))
+        self._finish_task_progress(self.btn_view)
         self.worker = None
         self._set_action_buttons_enabled(True)
 
@@ -2774,6 +2861,10 @@ class Ui_MainWindow(object):
         out_csv = getattr(df, "attrs", {}).get("out_csv", None)
         files_total = getattr(df, "attrs", {}).get("files_total", None)
         errs = getattr(df, "attrs", {}).get("errors", "")
+        limited_flag = bool(getattr(df, "attrs", {}).get("limited"))
+        limit_notes = getattr(df, "attrs", {}).get("limit_notes", [])
+        record_cap = getattr(df, "attrs", {}).get("record_limit")
+        packet_cap = getattr(df, "attrs", {}).get("packet_limit")
 
         dst_dir = self._default_csv_info_dir()
         os.makedirs(dst_dir, exist_ok=True)
@@ -2800,16 +2891,36 @@ class Ui_MainWindow(object):
                 head_txt = df.head(20).to_string()
             except Exception:
                 head_txt = "(预览生成失败)"
-            self.display_result(f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}", append=False)
+            self.display_result(
+                f"[INFO] 解析完成（表格仅显示前 {PREVIEW_LIMIT_FOR_TABLE} 行；全部已写入 CSV）。\n{head_txt}",
+                append=False,
+            )
             rows = len(df) if hasattr(df, "__len__") else 0
             status = f"预览 {min(rows, 20)} 行；共处理文件 {files_total if files_total is not None else '?'} 个"
             self._update_status_message(status)
+        if limited_flag:
+            if record_cap:
+                self.display_result(
+                    f"[提示] 为提升速度，仅展示前 {int(record_cap)} 条流量记录。"
+                )
+            elif packet_cap:
+                self.display_result(
+                    f"[提示] 为提升速度，仅解析了前 {int(packet_cap)} 个数据包。"
+                )
+            for note in limit_notes or []:
+                if note:
+                    self.display_result(f"[提示] {note}")
         if errs:
+            seen_notes = {str(note).strip() for note in (limit_notes or []) if note}
             for e in errs.split("\n"):
-                if e.strip(): self.display_result(e)
+                line = e.strip()
+                if not line or line in seen_notes:
+                    continue
+                self.display_result(line)
 
     def _on_worker_error(self, msg):
-        self.btn_view.setEnabled(True); self.reset_button_progress(self.btn_view)
+        self.btn_view.setEnabled(True)
+        self._fail_task_progress(self.btn_view)
         self._set_action_buttons_enabled(True)
         self.worker = None
         QtWidgets.QMessageBox.critical(None, "解析失败", msg)
@@ -3296,14 +3407,15 @@ class Ui_MainWindow(object):
         self._set_action_buttons_enabled(False)
         if os.path.isdir(path):
             self.display_result(f"[INFO] 目录特征提取：{path} -> {out_dir}")
-            self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
+            self.btn_fe.setEnabled(False)
+            self._start_task_progress(self.btn_fe)
             self.dir_fe_worker = FunctionThread(
                 fe_dir,
                 path,
                 out_dir,
                 workers=self.workers_spin.value(),
             )
-            self.dir_fe_worker.progress.connect(lambda p: self.set_button_progress(self.btn_fe, p))
+            self.dir_fe_worker.progress.connect(partial(self._update_task_progress, self.btn_fe))
             self.dir_fe_worker.finished.connect(self._on_fe_dir_finished)
             self.dir_fe_worker.error.connect(self._on_fe_error)
             self.dir_fe_worker.start()
@@ -3311,17 +3423,17 @@ class Ui_MainWindow(object):
             base = os.path.splitext(os.path.basename(path))[0]
             csv = os.path.join(out_dir, f"{base}_features_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
             self.display_result(f"[INFO] 单文件特征提取：{path} -> {csv}")
-            self.btn_fe.setEnabled(False); self.set_button_progress(self.btn_fe, 1)
+            self.btn_fe.setEnabled(False)
+            self._start_task_progress(self.btn_fe)
             self.fe_worker = FunctionThread(fe_single, path, csv)
-            self.fe_worker.progress.connect(lambda p: self.set_button_progress(self.btn_fe, p))
+            self.fe_worker.progress.connect(partial(self._update_task_progress, self.btn_fe))
             self.fe_worker.finished.connect(self._on_fe_finished)
             self.fe_worker.error.connect(self._on_fe_error)
             self.fe_worker.start()
 
     def _on_fe_finished(self, csv):
         self.btn_fe.setEnabled(True)
-        self.set_button_progress(self.btn_fe, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
+        self._finish_task_progress(self.btn_fe)
         self._set_action_buttons_enabled(True)
         self.display_result(f"[INFO] 特征提取完成，CSV已保存: {csv}")
         self._add_output(csv)
@@ -3335,8 +3447,7 @@ class Ui_MainWindow(object):
 
     def _on_fe_dir_finished(self, csv_list: List[str]):
         self.btn_fe.setEnabled(True)
-        self.set_button_progress(self.btn_fe, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_fe))
+        self._finish_task_progress(self.btn_fe)
         self._set_action_buttons_enabled(True)
         self.display_result(f"[INFO] 目录特征提取完成：共 {len(csv_list)} 个 CSV")
         for p in csv_list:
@@ -3352,7 +3463,8 @@ class Ui_MainWindow(object):
                 pass
 
     def _on_fe_error(self, msg):
-        self.btn_fe.setEnabled(True); self.reset_button_progress(self.btn_fe)
+        self.btn_fe.setEnabled(True)
+        self._fail_task_progress(self.btn_fe)
         self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "特征提取失败", msg)
         self.display_result(f"[错误] 特征提取失败: {msg}")
@@ -3419,21 +3531,21 @@ class Ui_MainWindow(object):
 
         self.display_result(f"[INFO] 数据预处理：{preview} -> {out_dir}")
         self._set_action_buttons_enabled(False)
-        self.btn_vector.setEnabled(False); self.set_button_progress(self.btn_vector, 1)
+        self.btn_vector.setEnabled(False)
+        self._start_task_progress(self.btn_vector)
         self.preprocess_worker = FunctionThread(
             preprocess_dir,
             feature_source,
             out_dir,
         )
-        self.preprocess_worker.progress.connect(lambda p: self.set_button_progress(self.btn_vector, p))
+        self.preprocess_worker.progress.connect(partial(self._update_task_progress, self.btn_vector))
         self.preprocess_worker.finished.connect(self._on_preprocess_finished)
         self.preprocess_worker.error.connect(self._on_preprocess_error)
         self.preprocess_worker.start()
 
     def _on_preprocess_finished(self, result):
         self.btn_vector.setEnabled(True)
-        self.set_button_progress(self.btn_vector, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_vector))
+        self._finish_task_progress(self.btn_vector)
         self.preprocess_worker = None
         self._set_action_buttons_enabled(True)
 
@@ -3465,7 +3577,7 @@ class Ui_MainWindow(object):
 
     def _on_preprocess_error(self, msg):
         self.btn_vector.setEnabled(True)
-        self.reset_button_progress(self.btn_vector)
+        self._fail_task_progress(self.btn_vector)
         self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "数据预处理失败", msg)
         self.display_result(f"[错误] 数据预处理失败: {msg}")
@@ -3489,7 +3601,8 @@ class Ui_MainWindow(object):
 
         self.display_result(f"[INFO] 开始训练，输入: {path}")
         self._set_action_buttons_enabled(False)
-        self.btn_train.setEnabled(False); self.set_button_progress(self.btn_train, 1)
+        self.btn_train.setEnabled(False)
+        self._start_task_progress(self.btn_train)
         train_task = BackgroundTask(
             run_train,
             path,
@@ -3500,13 +3613,12 @@ class Ui_MainWindow(object):
             train_task,
             self._on_train_finished,
             self._on_train_error,
-            lambda p: self.set_button_progress(self.btn_train, p),
+            partial(self._update_task_progress, self.btn_train),
         )
 
     def _on_train_finished(self, res):
         self.btn_train.setEnabled(True)
-        self.set_button_progress(self.btn_train, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_train))
+        self._finish_task_progress(self.btn_train)
         self._set_action_buttons_enabled(True)
         if not isinstance(res, dict):
             res = {} if res is None else {"result": res}
@@ -3644,7 +3756,8 @@ class Ui_MainWindow(object):
             self._add_output(res["active_learning_csv"])
 
     def _on_train_error(self, msg):
-        self.btn_train.setEnabled(True); self.reset_button_progress(self.btn_train)
+        self.btn_train.setEnabled(True)
+        self._fail_task_progress(self.btn_train)
         self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "训练失败", msg)
         self.display_result(f"[错误] 训练失败: {msg}")
@@ -3686,7 +3799,7 @@ class Ui_MainWindow(object):
         self._analysis_summary = None
         self._set_action_buttons_enabled(False)
         btn.setEnabled(False)
-        self.set_button_progress(btn, 1)
+        self._start_task_progress(btn)
 
         def _finished(result):
             payload = result if isinstance(result, dict) else {"out_dir": out_dir}
@@ -3704,7 +3817,7 @@ class Ui_MainWindow(object):
             analysis_task,
             _finished,
             self._on_analysis_error,
-            lambda p: self.set_button_progress(btn, p),
+            partial(self._update_task_progress, btn),
         )
         return True
 
@@ -3725,7 +3838,8 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 正在分析结果 -> {out_dir}")
         self._analysis_summary = None
         self._set_action_buttons_enabled(False)
-        self.btn_analysis.setEnabled(False); self.set_button_progress(self.btn_analysis, 1)
+        self.btn_analysis.setEnabled(False)
+        self._start_task_progress(self.btn_analysis)
         meta_path = self._selected_metadata_path
         if not meta_path or not os.path.exists(meta_path):
             _, meta_path = self._latest_pipeline_bundle()
@@ -3747,13 +3861,12 @@ class Ui_MainWindow(object):
             analysis_task,
             _analysis_finished,
             self._on_analysis_error,
-            lambda p: self.set_button_progress(self.btn_analysis, p),
+            partial(self._update_task_progress, self.btn_analysis),
         )
 
     def _on_analysis_finished(self, result):
         self.btn_analysis.setEnabled(True)
-        self.set_button_progress(self.btn_analysis, 100)
-        QtCore.QTimer.singleShot(300, lambda: self.reset_button_progress(self.btn_analysis))
+        self._finish_task_progress(self.btn_analysis)
         self._set_action_buttons_enabled(True)
         out_dir = None
         plot_paths: List[str] = []
@@ -3854,7 +3967,8 @@ class Ui_MainWindow(object):
         )
 
     def _on_analysis_error(self, msg):
-        self.btn_analysis.setEnabled(True); self.reset_button_progress(self.btn_analysis)
+        self.btn_analysis.setEnabled(True)
+        self._fail_task_progress(self.btn_analysis)
         self._set_action_buttons_enabled(True)
         QtWidgets.QMessageBox.critical(None, "分析失败", msg)
         self.display_result(f"[错误] 分析失败: {msg}")
@@ -5157,10 +5271,7 @@ class Ui_MainWindow(object):
         button = getattr(self, "btn_predict", None)
         if button is not None:
             button.setEnabled(False)
-            try:
-                self.set_button_progress(button, 1)
-            except Exception:
-                pass
+            self._start_task_progress(button)
             QtWidgets.QApplication.processEvents()
 
         output_dir = self._prediction_out_dir()
@@ -5187,10 +5298,7 @@ class Ui_MainWindow(object):
                         local_value = 0
                     completed = (index - 1) + (local_value / 100.0)
                     overall = int(max(1, min(100, (completed / float(total)) * 100.0)))
-                    try:
-                        self.set_button_progress(button, overall)
-                    except Exception:
-                        pass
+                    self._update_task_progress(button, overall)
                     QtWidgets.QApplication.processEvents()
 
                 try:
@@ -5302,13 +5410,9 @@ class Ui_MainWindow(object):
             if button is not None:
                 button.setEnabled(True)
                 if successes > 0:
-                    try:
-                        self.set_button_progress(button, 100)
-                    except Exception:
-                        pass
-                    QtCore.QTimer.singleShot(300, lambda b=button: self.reset_button_progress(b))
+                    self._finish_task_progress(button)
                 else:
-                    self.reset_button_progress(button)
+                    self._fail_task_progress(button)
 
     def _on_predict(self):
         parent_widget = self._parent_widget()
@@ -5379,10 +5483,7 @@ class Ui_MainWindow(object):
             button = getattr(self, "btn_predict", None)
             if button is not None:
                 button.setEnabled(False)
-                try:
-                    self.set_button_progress(button, 1)
-                except Exception:
-                    pass
+                self._start_task_progress(button)
                 QtWidgets.QApplication.processEvents()
 
             selection_count = len(selected_df)
@@ -5420,7 +5521,7 @@ class Ui_MainWindow(object):
             if result is None:
                 if button is not None:
                     button.setEnabled(True)
-                    self.reset_button_progress(button)
+                    self._fail_task_progress(button)
                 QtWidgets.QMessageBox.critical(
                     parent_widget,
                     "预测失败",
@@ -5430,11 +5531,7 @@ class Ui_MainWindow(object):
 
             if button is not None:
                 button.setEnabled(True)
-                try:
-                    self.set_button_progress(button, 100)
-                except Exception:
-                    pass
-                QtCore.QTimer.singleShot(300, lambda b=button: self.reset_button_progress(b))
+                self._finish_task_progress(button)
 
             self._present_prediction_result(
                 result,
@@ -5540,10 +5637,7 @@ class Ui_MainWindow(object):
             button = getattr(self, "btn_predict", None)
             if button is not None:
                 button.setEnabled(False)
-                try:
-                    self.set_button_progress(button, 1)
-                except Exception:
-                    pass
+                self._start_task_progress(button)
                 QtWidgets.QApplication.processEvents()
 
             def _single_progress(local_pct: int) -> None:
@@ -5554,10 +5648,7 @@ class Ui_MainWindow(object):
                 except Exception:
                     pct_value = 0
                 pct_value = max(1, pct_value)
-                try:
-                    self.set_button_progress(button, pct_value)
-                except Exception:
-                    pass
+                self._update_task_progress(button, pct_value)
                 QtWidgets.QApplication.processEvents()
 
             try:
@@ -5570,17 +5661,13 @@ class Ui_MainWindow(object):
             except Exception as exc:
                 if button is not None:
                     button.setEnabled(True)
-                    self.reset_button_progress(button)
+                    self._fail_task_progress(button)
                 QtWidgets.QMessageBox.critical(parent_widget, "预测失败", str(exc))
                 return
 
             if button is not None:
                 button.setEnabled(True)
-                try:
-                    self.set_button_progress(button, 100)
-                except Exception:
-                    pass
-                QtCore.QTimer.singleShot(300, lambda b=button: self.reset_button_progress(b))
+                self._finish_task_progress(button)
 
             prediction = payload.get("prediction") if isinstance(payload, dict) else None
             source_name = os.path.basename(chosen_path)
