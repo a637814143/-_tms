@@ -1,4 +1,3 @@
-
 """Training and inference helpers for tree-based PCAP flow classifiers."""
 
 from __future__ import annotations
@@ -12,14 +11,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Un
 import numpy as np
 from joblib import dump, load
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import (
-    average_precision_score,
-    confusion_matrix,
-    precision_recall_curve,
-    precision_recall_fscore_support,
-    roc_auc_score,
-)
-from sklearn.model_selection import train_test_split
 
 from .feature_extractor import extract_pcap_features
 from .vectorizer import (
@@ -503,218 +494,49 @@ def train_hist_gradient_boosting(
     params = DEFAULT_MODEL_PARAMS.copy()
     params.update(filtered_params)
 
-    stratify: Optional[np.ndarray]
-    try:
-        unique = np.unique(y)
-    except TypeError:
-        unique = np.unique(y.astype(str))  # type: ignore[attr-defined]
-    use_stratify = len(unique) > 1
-    if use_stratify:
-        stratify = y
-    else:
-        stratify = None
-
-    try:
-        X_train, X_val, y_train, y_val = train_test_split(
-            X,
-            y,
-            test_size=0.2,
-            random_state=int(params.get("random_state", 1337) or 1337),
-            stratify=stratify,
-        )
-    except ValueError:
-        X_train, X_val, y_train, y_val = X, np.empty((0, X.shape[1])), y, np.empty(0)
-
-    class_weights: Dict[str, float] = {}
-    class_weight_values: Optional[Dict[Union[int, str], float]] = None
-    try:
-        unique_full, counts_full = np.unique(y, return_counts=True)
-    except TypeError:
-        unique_full = np.unique(y.astype(str))  # type: ignore[attr-defined]
-        counts_full = np.ones_like(unique_full, dtype=float)
-
-    if len(unique_full) > 1:
-        class_weight_values = {
-            cls: 1.0 / float(cnt) for cls, cnt in zip(unique_full, counts_full)
-        }
-        class_weights = {str(cls): float(weight) for cls, weight in class_weight_values.items()}
-
-    sample_weight_train = None
-    if class_weight_values is not None:
-        sample_weight_train = np.asarray([class_weight_values[val] for val in y_train], dtype=float)
-
     clf = HistGradientBoostingClassifier(**params)
-    clf.fit(X_train, y_train, sample_weight=sample_weight_train)
-
-    metrics_payload: Dict[str, float] = {}
-    decision_threshold: Optional[float] = None
-    positive_label: Optional[str] = None
-    positive_class: Optional[Union[int, str]] = None
-
-    if X_val.size and y_val.size:
-        scores_val, pos_info = _predict_positive_scores(clf, X_val, label_mapping)
-        positive_label = pos_info.label
-        positive_class = pos_info.value
-        if pos_info.value is not None:
-            y_val_binary = (y_val == pos_info.value).astype(int)
-        else:
-            y_val_binary = (y_val == clf.classes_[-1]).astype(int)
-
-        precision_curve, recall_curve, pr_thresholds = precision_recall_curve(
-            y_val_binary,
-            scores_val,
-        )
-        beta = 0.5
-        if pr_thresholds.size:
-            precision_vals = precision_curve[:-1]
-            recall_vals = recall_curve[:-1]
-            numerator = (1 + beta**2) * precision_vals * recall_vals
-            denominator = (beta**2 * precision_vals) + recall_vals
-            with np.errstate(divide="ignore", invalid="ignore"):
-                f_beta_scores = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator > 0)
-            best_idx = int(np.argmax(f_beta_scores))
-            decision_threshold = float(pr_thresholds[best_idx])
-            metrics_payload["f0_5"] = float(f_beta_scores[best_idx])
-        else:
-            decision_threshold = 0.5
-            metrics_payload["f0_5"] = 0.0
-
-        pred_binary = (scores_val >= float(decision_threshold)).astype(int)
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            y_val_binary,
-            pred_binary,
-            average="binary",
-            zero_division=0,
-        )
-        metrics_payload.update(
-            {
-                "precision": float(precision),
-                "recall": float(recall),
-                "f1": float(f1),
-            }
-        )
-
-        try:
-            roc_auc = roc_auc_score(y_val_binary, scores_val)
-            metrics_payload["roc_auc"] = float(roc_auc)
-        except ValueError:
-            pass
-
-        try:
-            pr_auc = average_precision_score(y_val_binary, scores_val)
-            metrics_payload["pr_auc"] = float(pr_auc)
-        except ValueError:
-            pass
-
-        try:
-            tn, fp, fn, tp = confusion_matrix(y_val_binary, pred_binary).ravel()
-            metrics_payload.update(
-                {
-                    "tp": float(tp),
-                    "fp": float(fp),
-                    "tn": float(tn),
-                    "fn": float(fn),
-                }
-            )
-        except ValueError:
-            pass
-
-        metrics_payload["validation_samples"] = int(len(y_val_binary))
-        metrics_payload["positive_samples"] = int(y_val_binary.sum())
-    else:
-        decision_threshold = 0.5
-        if label_mapping:
-            positive_label = next(iter(label_mapping.values()), None)
-
-    if positive_class is None or positive_label is None:
-        info = _resolve_positive_class(clf, label_mapping)
-        if positive_class is None:
-            positive_class = info.value
-        if positive_label is None:
-            positive_label = info.label
-
-    if class_weight_values is not None:
-        full_weights = np.asarray([class_weight_values[val] for val in y], dtype=float)
-        clf.fit(X, y, sample_weight=full_weights)
-    else:
-        clf.fit(X, y)
-
-    model_file = Path(model_path)
-    previous_estimators: List[Any] = []
-    ensemble_dropped = 0
-    if model_file.exists():
-        try:
-            previous_artifact = load(model_file)
-            previous_model = previous_artifact.get("model") if isinstance(previous_artifact, dict) else None
-        except Exception:
-            previous_model = None
-        if isinstance(previous_model, EnsembleVotingClassifier):
-            previous_estimators = list(previous_model.estimators_)
-        elif previous_model is not None:
-            previous_estimators = [previous_model]
-
-    original_previous = len(previous_estimators)
-    retained_previous = original_previous
-    estimators_chain = previous_estimators + [clf]
-    try:
-        ensemble_model = EnsembleVotingClassifier(estimators_chain)
-    except Exception:
-        ensemble_dropped = original_previous
-        estimators_chain = [clf]
-        ensemble_model = EnsembleVotingClassifier(estimators_chain)
-        retained_previous = 0
+    clf.fit(X, y)
 
     artifact = {
-        "model": ensemble_model,
+        "model": clf,
         "feature_names": feature_names,
         "label_mapping": label_mapping,
     }
     dump(artifact, model_path)
+
     try:
         model_params = clf.get_params(deep=False)
     except Exception:  # pragma: no cover - defensive
         model_params = params
     write_metadata(model_path, feature_names, label_mapping, model_params)
 
-    metrics_payload["ensemble_members"] = int(len(ensemble_model))
-    metrics_payload["ensemble_added"] = int(max(len(estimators_chain) - retained_previous, 0))
-    metrics_payload["ensemble_retained"] = int(retained_previous)
-    if ensemble_dropped:
-        metrics_payload["ensemble_dropped"] = int(ensemble_dropped)
-
     _write_model_metadata(
         model_path,
         feature_names=feature_names,
         label_mapping=label_mapping,
-        decision_threshold=decision_threshold,
-        positive_label=positive_label,
-        positive_class=positive_class,
-        metrics=metrics_payload,
-        class_weights=class_weights,
-        ensemble_members=len(ensemble_model),
-        ensemble_added=max(len(estimators_chain) - retained_previous, 0),
-        ensemble_retained=retained_previous,
-        ensemble_dropped=ensemble_dropped if ensemble_dropped else None,
+        decision_threshold=None,
+        positive_label=None,
+        positive_class=None,
+        metrics=None,
+        class_weights=None,
+        ensemble_members=None,
+        ensemble_added=None,
+        ensemble_retained=None,
+        ensemble_dropped=None,
     )
 
     if label_mapping:
-        classes_display = [label_mapping.get(int(cls), str(cls)) for cls in ensemble_model.classes_]
+        classes_display = [label_mapping.get(int(cls), str(cls)) for cls in clf.classes_]
     else:
-        classes_display = [str(cls) for cls in ensemble_model.classes_]
+        classes_display = [str(cls) for cls in clf.classes_]
 
     return TrainingSummary(
         model_path=Path(model_path),
         classes=classes_display,
         feature_names=feature_names,
-        flow_count=X.shape[0],
+        flow_count=int(X.shape[0]),
         label_mapping=label_mapping,
         dropped_flows=int(stats.dropped_rows),
-        decision_threshold=decision_threshold,
-        positive_label=positive_label,
-        positive_class=positive_class,
-        metrics=metrics_payload or None,
-        class_weights=class_weights or None,
-        validation_samples=int(len(y_val)) if X_val.size else None,
     )
 
 

@@ -6,9 +6,6 @@
   <component name="ChangeListManager">
     <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/__init__.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/__init__.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/modeling.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/modeling.py" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/vectorizer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/vectorizer.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -218,22 +215,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1754543842572</updated>
-    </task>
-    <task id="LOCAL-00031" summary="8888">
-      <option name="closed" value="true" />
-      <created>1761991707001</created>
-      <option name="number" value="00031" />
-      <option name="presentableId" value="LOCAL-00031" />
-      <option name="project" value="LOCAL" />
-      <updated>1761991707001</updated>
-    </task>
-    <task id="LOCAL-00032" summary="8888">
-      <option name="closed" value="true" />
-      <created>1761997244943</created>
-      <option name="number" value="00032" />
-      <option name="presentableId" value="LOCAL-00032" />
-      <option name="project" value="LOCAL" />
-      <updated>1761997244943</updated>
     </task>
     <task id="LOCAL-00033" summary="8888">
       <option name="closed" value="true" />
@@ -611,7 +592,23 @@
       <option name="project" value="LOCAL" />
       <updated>1762855307370</updated>
     </task>
-    <option name="localTasksCounter" value="80" />
+    <task id="LOCAL-00080" summary="8888">
+      <option name="closed" value="true" />
+      <created>1762856914882</created>
+      <option name="number" value="00080" />
+      <option name="presentableId" value="LOCAL-00080" />
+      <option name="project" value="LOCAL" />
+      <updated>1762856914882</updated>
+    </task>
+    <task id="LOCAL-00081" summary="8888">
+      <option name="closed" value="true" />
+      <created>1762857123996</created>
+      <option name="number" value="00081" />
+      <option name="presentableId" value="LOCAL-00081" />
+      <option name="project" value="LOCAL" />
+      <updated>1762857123996</updated>
+    </task>
+    <option name="localTasksCounter" value="82" />
     <servers />
   </component>
   <component name="UnknownFeatures">
