@@ -6,7 +6,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 from joblib import dump, load
@@ -37,6 +37,7 @@ __all__ = [
     "write_metadata",
     "ModelTrainer",
     "ModelPredictor",
+    "EnsembleVotingClassifier",
     "train_hist_gradient_boosting",
     "train_unsupervised_on_split",
     "detect_pcap_with_model",
@@ -46,6 +47,113 @@ __all__ = [
 
 
 _PARAM_CACHE: Dict[type, Set[str]] = {}
+
+
+class EnsembleVotingClassifier:
+    """A lightweight voting classifier for incrementally trained ensembles."""
+
+    def __init__(
+        self,
+        estimators: Sequence[Any],
+        *,
+        voting: str = "soft",
+    ) -> None:
+        if not estimators:
+            raise ValueError("estimators sequence cannot be empty")
+
+        self.voting = voting
+        self.estimators_: List[Any] = [est for est in estimators if est is not None]
+        if not self.estimators_:
+            raise ValueError("at least one valid estimator is required")
+
+        seen: List[Any] = []
+        for estimator in self.estimators_:
+            classes = getattr(estimator, "classes_", None)
+            if classes is None:
+                continue
+            for cls in classes:
+                if not any(cls == existing for existing in seen):
+                    seen.append(cls)
+
+        if not seen:
+            raise ValueError("estimators must expose non-empty classes_ for ensemble")
+
+        self.classes_ = np.asarray(seen, dtype=object)
+        self._class_index = {cls: idx for idx, cls in enumerate(self.classes_)}
+
+    def __len__(self) -> int:  # pragma: no cover - trivial
+        return len(self.estimators_)
+
+    def _empty_proba(self, rows: int) -> np.ndarray:
+        return np.zeros((rows, self.classes_.size), dtype=np.float64)
+
+    def _align_proba(self, estimator: Any, proba: np.ndarray) -> np.ndarray:
+        aligned = self._empty_proba(len(proba))
+        est_classes = getattr(estimator, "classes_", None)
+        if est_classes is None:
+            return aligned
+
+        for src_idx, cls in enumerate(est_classes):
+            dst_idx = self._class_index.get(cls)
+            if dst_idx is None:
+                continue
+            aligned[:, dst_idx] = proba[:, src_idx]
+        return aligned
+
+    def _predict_to_proba(self, estimator: Any, X: np.ndarray) -> np.ndarray:
+        predictions = estimator.predict(X)
+        aligned = self._empty_proba(len(predictions))
+        for row, label in enumerate(predictions):
+            idx = self._class_index.get(label)
+            if idx is None and isinstance(label, (np.generic, np.ndarray)):
+                try:
+                    idx = self._class_index.get(label.item())
+                except Exception:  # pragma: no cover - defensive
+                    idx = None
+            if idx is not None:
+                aligned[row, idx] = 1.0
+        return aligned
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        accumulator: Optional[np.ndarray] = None
+        used = 0
+
+        for estimator in self.estimators_:
+            if hasattr(estimator, "predict_proba"):
+                proba = estimator.predict_proba(X)
+                proba = np.asarray(proba, dtype=np.float64)
+                if proba.ndim == 1:
+                    proba = np.column_stack([1.0 - proba, proba])
+                aligned = self._align_proba(estimator, proba)
+            else:
+                aligned = self._predict_to_proba(estimator, X)
+
+            if accumulator is None:
+                accumulator = np.zeros_like(aligned)
+            accumulator += aligned
+            used += 1
+
+        if accumulator is None or used == 0:
+            raise RuntimeError("ensemble does not contain usable estimators")
+
+        averaged = accumulator / float(used)
+        row_sums = averaged.sum(axis=1, keepdims=True)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            normalized = np.divide(
+                averaged,
+                row_sums,
+                out=np.zeros_like(averaged),
+                where=row_sums > 0,
+            )
+        if np.any(row_sums <= 0):
+            zero_mask = row_sums[:, 0] <= 0
+            normalized[zero_mask] = 1.0 / float(self.classes_.size)
+        return normalized
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        proba = self.predict_proba(X)
+        indices = np.argmax(proba, axis=1)
+        return self.classes_[indices]
 
 
 def _valid_estimator_param_names(model_class: type) -> Set[str]:
@@ -256,7 +364,7 @@ def _resolve_positive_class(
 
 
 def _predict_positive_scores(
-    model: HistGradientBoostingClassifier,
+    model: Any,
     X: np.ndarray,
     label_mapping: Optional[Dict[int, str]] = None,
 ) -> Tuple[np.ndarray, _PositiveClassInfo]:
@@ -448,8 +556,33 @@ def train_hist_gradient_boosting(
     else:
         clf.fit(X, y)
 
+    model_file = Path(model_path)
+    previous_estimators: List[Any] = []
+    ensemble_dropped = 0
+    if model_file.exists():
+        try:
+            previous_artifact = load(model_file)
+            previous_model = previous_artifact.get("model") if isinstance(previous_artifact, dict) else None
+        except Exception:
+            previous_model = None
+        if isinstance(previous_model, EnsembleVotingClassifier):
+            previous_estimators = list(previous_model.estimators_)
+        elif previous_model is not None:
+            previous_estimators = [previous_model]
+
+    original_previous = len(previous_estimators)
+    retained_previous = original_previous
+    estimators_chain = previous_estimators + [clf]
+    try:
+        ensemble_model = EnsembleVotingClassifier(estimators_chain)
+    except Exception:
+        ensemble_dropped = original_previous
+        estimators_chain = [clf]
+        ensemble_model = EnsembleVotingClassifier(estimators_chain)
+        retained_previous = 0
+
     artifact = {
-        "model": clf,
+        "model": ensemble_model,
         "feature_names": feature_names,
         "label_mapping": label_mapping,
     }
@@ -460,6 +593,12 @@ def train_hist_gradient_boosting(
         model_params = params
     write_metadata(model_path, feature_names, label_mapping, model_params)
 
+    metrics_payload["ensemble_members"] = int(len(ensemble_model))
+    metrics_payload["ensemble_added"] = int(max(len(estimators_chain) - retained_previous, 0))
+    metrics_payload["ensemble_retained"] = int(retained_previous)
+    if ensemble_dropped:
+        metrics_payload["ensemble_dropped"] = int(ensemble_dropped)
+
     _write_model_metadata(
         model_path,
         feature_names=feature_names,
@@ -469,12 +608,16 @@ def train_hist_gradient_boosting(
         positive_class=positive_class,
         metrics=metrics_payload,
         class_weights=class_weights,
+        ensemble_members=len(ensemble_model),
+        ensemble_added=max(len(estimators_chain) - retained_previous, 0),
+        ensemble_retained=retained_previous,
+        ensemble_dropped=ensemble_dropped if ensemble_dropped else None,
     )
 
     if label_mapping:
-        classes_display = [label_mapping.get(int(cls), str(cls)) for cls in clf.classes_]
+        classes_display = [label_mapping.get(int(cls), str(cls)) for cls in ensemble_model.classes_]
     else:
-        classes_display = [str(cls) for cls in clf.classes_]
+        classes_display = [str(cls) for cls in ensemble_model.classes_]
 
     return TrainingSummary(
         model_path=Path(model_path),
@@ -502,6 +645,10 @@ def _write_model_metadata(
     positive_class: Optional[Union[int, str]] = None,
     metrics: Optional[Dict[str, float]] = None,
     class_weights: Optional[Dict[str, float]] = None,
+    ensemble_members: Optional[int] = None,
+    ensemble_added: Optional[int] = None,
+    ensemble_retained: Optional[int] = None,
+    ensemble_dropped: Optional[int] = None,
 ) -> Path:
     """Persist metadata alongside the trained model for UI alignment."""
 
@@ -539,6 +686,14 @@ def _write_model_metadata(
         metadata["model_metrics"] = {key: float(value) for key, value in metrics.items()}
     if class_weights:
         metadata["class_weights"] = class_weights
+    if ensemble_members is not None:
+        metadata["ensemble_members"] = int(ensemble_members)
+    if ensemble_added is not None:
+        metadata["ensemble_added"] = int(ensemble_added)
+    if ensemble_retained is not None:
+        metadata["ensemble_retained"] = int(ensemble_retained)
+    if ensemble_dropped is not None:
+        metadata["ensemble_dropped"] = int(ensemble_dropped)
 
     with metadata_path.open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
@@ -548,7 +703,7 @@ def _write_model_metadata(
 
 def _load_model_artifact(
     model_path: Union[str, Path]
-) -> Tuple[HistGradientBoostingClassifier, List[str], Optional[Dict[int, str]]]:
+) -> Tuple[Any, List[str], Optional[Dict[int, str]]]:
     artifact = load(model_path)
     model = artifact.get("model")
     feature_names = artifact.get("feature_names")
@@ -615,7 +770,7 @@ def _resolve_dataset_path(input_path: Union[str, Path]) -> Path:
 
 
 def _build_detection_result(
-    model: HistGradientBoostingClassifier,
+    model: Any,
     feature_names: List[str],
     label_mapping: Optional[Dict[int, str]],
     flows: List[Dict[str, object]],
@@ -753,6 +908,11 @@ class ModelTrainer:
                 metadata["positive_class"] = int(summary.positive_class)
             else:
                 metadata["positive_class"] = str(summary.positive_class)
+        if summary.metrics:
+            for key in ("ensemble_members", "ensemble_added", "ensemble_retained", "ensemble_dropped"):
+                value = summary.metrics.get(key)
+                if value is not None:
+                    metadata[key] = int(value)
         if summary.metrics:
             metadata["model_metrics"] = summary.metrics
         if summary.class_weights:
