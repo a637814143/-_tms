@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from PyQt5 import QtCore, QtGui, QtWidgets
-import sys, os, platform, subprocess, math, shutil, json, io, time, textwrap
+import sys, os, platform, subprocess, math, shutil, json, textwrap
 from pathlib import Path
 import numpy as np
 from typing import Callable, Collection, Dict, List, Optional, Set, Tuple, Union
@@ -1282,11 +1282,9 @@ class Ui_MainWindow(object):
         row.addWidget(self.file_edit, 1)
         row.addStretch(1)
 
-        self.btn_pick_file = QtWidgets.QPushButton("选文件")
-        self.btn_pick_dir = QtWidgets.QPushButton("选目录")
-        self.btn_browse = QtWidgets.QPushButton("浏览")
-        for btn in (self.btn_pick_file, self.btn_pick_dir, self.btn_browse):
-            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        self.btn_pick_file = self._make_button("选文件")
+        self.btn_pick_dir = self._make_button("选目录")
+        self.btn_browse = self._make_button("浏览")
         row.addWidget(self.btn_pick_file)
         row.addWidget(self.btn_pick_dir)
         row.addWidget(self.btn_browse)
@@ -1343,8 +1341,8 @@ class Ui_MainWindow(object):
         ):
             widget.setMinimumHeight(38)
 
-        self.btn_prev = QtWidgets.QPushButton("上一批")
-        self.btn_next = QtWidgets.QPushButton("下一批")
+        self.btn_prev = self._make_button("上一批", object_name="secondary")
+        self.btn_next = self._make_button("下一批", object_name="secondary")
         for btn in (self.btn_prev, self.btn_next):
             btn.setMinimumWidth(120)
         nav_widget = QtWidgets.QWidget()
@@ -1353,9 +1351,6 @@ class Ui_MainWindow(object):
         nav_layout.setSpacing(12)
         nav_layout.addWidget(self.btn_prev, 1)
         nav_layout.addWidget(self.btn_next, 1)
-
-        for btn in (self.btn_prev, self.btn_next):
-            btn.setObjectName("secondary")
 
         pg.addRow("处理模式：", self.mode_combo)
         pg.addRow("批处理数量", self.batch_spin)
@@ -1421,8 +1416,8 @@ class Ui_MainWindow(object):
         hb.setContentsMargins(12, 0, 12, 0)
         hb.setSpacing(10)
 
-        self.btn_page_prev = QtWidgets.QPushButton("上一页")
-        self.btn_page_next = QtWidgets.QPushButton("下一页")
+        self.btn_page_prev = self._make_button("上一页", object_name="secondary")
+        self.btn_page_next = self._make_button("下一页", object_name="secondary")
         self.page_info = QtWidgets.QLabel("第 0/0 页")
         self.page_size_label = QtWidgets.QLabel("每页行数：")
         self.page_size_label.setAlignment(QtCore.Qt.AlignVCenter | QtCore.Qt.AlignRight)
@@ -1430,11 +1425,9 @@ class Ui_MainWindow(object):
         self.page_size_spin.setRange(20, 200000)
         self.page_size_spin.setSingleStep(10)
         self.page_size_spin.setValue(50)
-        self.btn_show_all = QtWidgets.QPushButton("显示全部（可能较慢）")
+        self.btn_show_all = self._make_button("显示全部（可能较慢）", object_name="secondary")
 
         for btn in (self.btn_page_prev, self.btn_page_next, self.btn_show_all):
-            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-            btn.setObjectName("secondary")
             btn.setMinimumWidth(120)
 
         self.page_size_spin.setMinimumHeight(38)
@@ -1518,6 +1511,25 @@ class Ui_MainWindow(object):
         else:
             label.setText(base)
 
+    def _make_button(
+        self,
+        text: str,
+        *,
+        object_name: Optional[str] = None,
+        tooltip: Optional[str] = None,
+        icon: Optional[QtGui.QIcon] = None,
+        cursor: QtCore.Qt.CursorShape = QtCore.Qt.PointingHandCursor,
+    ) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton(text)
+        if object_name:
+            button.setObjectName(object_name)
+        if tooltip:
+            button.setToolTip(tooltip)
+        if icon is not None:
+            button.setIcon(icon)
+        button.setCursor(QtGui.QCursor(cursor))
+        return button
+
     def _create_collapsible_group(
         self,
         title: str,
@@ -1556,6 +1568,30 @@ class Ui_MainWindow(object):
         _toggle(True)
         return group, inner_layout
 
+    def _add_group_with_controls(
+        self,
+        title: str,
+        controls: Collection[QtWidgets.QWidget],
+        *,
+        spacing: int = 8,
+        add_stretch: bool = True,
+    ) -> Tuple[QtWidgets.QGroupBox, QtWidgets.QLayout]:
+        group, layout = self._create_collapsible_group(title, spacing=spacing)
+        for widget in controls:
+            layout.addWidget(widget)
+        if add_stretch:
+            layout.addStretch(1)
+        self.right_layout.addWidget(group)
+        return group, layout
+
+    def _bind_button_actions(
+        self, bindings: Dict[QtWidgets.QAbstractButton, Callable[[], None]]
+    ) -> None:
+        for button, handler in bindings.items():
+            if button is None or handler is None:
+                continue
+            button.clicked.connect(handler)
+
     def _build_right_panel(self):
         self.right_scroll = QtWidgets.QScrollArea(self.centralwidget)
         self.right_scroll.setWidgetResizable(True)
@@ -1571,61 +1607,44 @@ class Ui_MainWindow(object):
 
         self.right_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
 
-        self.btn_view = QtWidgets.QPushButton("查看流量信息")
-        self.btn_fe = QtWidgets.QPushButton("提取特征")
-        self.btn_vector = QtWidgets.QPushButton("数据预处理")
-        self.btn_train = QtWidgets.QPushButton("训练模型")
-        self.btn_analysis = QtWidgets.QPushButton("运行分析")
-        self.btn_predict = QtWidgets.QPushButton("加载模型预测")
-        self.btn_export = QtWidgets.QPushButton("导出结果（异常）")
-        self.btn_open_results = QtWidgets.QPushButton("打开结果目录")
-        self.btn_view_logs = QtWidgets.QPushButton("查看日志")
-        self.btn_clear = QtWidgets.QPushButton("清空显示")
-        self.btn_export_report = QtWidgets.QPushButton("导出 PDF 报告")
-        self.btn_config_editor = QtWidgets.QPushButton("编辑全局配置")
-        self.btn_online_toggle = QtWidgets.QPushButton("开启在线检测")
-        for btn in (
-            self.btn_view,
-            self.btn_fe,
-            self.btn_vector,
-            self.btn_train,
-            self.btn_analysis,
-            self.btn_predict,
-            self.btn_export,
-            self.btn_open_results,
-            self.btn_view_logs,
-            self.btn_clear,
-            self.btn_export_report,
-            self.btn_config_editor,
-            self.btn_online_toggle,
-        ):
-            btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+        button_specs = (
+            ("btn_view", "查看流量信息"),
+            ("btn_fe", "提取特征"),
+            ("btn_vector", "数据预处理"),
+            ("btn_train", "训练模型"),
+            ("btn_analysis", "运行分析"),
+            ("btn_predict", "加载模型预测"),
+            ("btn_export", "导出结果（异常）"),
+            ("btn_open_results", "打开结果目录"),
+            ("btn_view_logs", "查看日志"),
+            ("btn_clear", "清空显示"),
+            ("btn_export_report", "导出 PDF 报告"),
+            ("btn_config_editor", "编辑全局配置"),
+            ("btn_online_toggle", "开启在线检测"),
+        )
+        for attr, text in button_specs:
+            setattr(self, attr, self._make_button(text))
 
-        data_group, data_layout = self._create_collapsible_group("数据阶段")
-        data_layout.addWidget(self.btn_view)
-        data_layout.addWidget(self.btn_fe)
-        data_layout.addWidget(self.btn_vector)
-        data_layout.addStretch(1)
-        self.right_layout.addWidget(data_group)
+        self._add_group_with_controls(
+            "数据阶段",
+            (self.btn_view, self.btn_fe, self.btn_vector),
+        )
 
-        model_group, model_layout = self._create_collapsible_group("模型阶段")
-        model_layout.addWidget(self.btn_train)
-        model_layout.addWidget(self.btn_predict)
-        model_layout.addWidget(self.btn_analysis)
-        model_layout.addStretch(1)
-        self.right_layout.addWidget(model_group)
+        self._add_group_with_controls(
+            "模型阶段",
+            (self.btn_train, self.btn_predict, self.btn_analysis),
+        )
 
-        output_group, output_layout = self._create_collapsible_group("输出管理")
-        output_layout.addWidget(self.btn_export)
-        output_layout.addWidget(self.btn_open_results)
-        output_layout.addWidget(self.btn_view_logs)
-        output_layout.addStretch(1)
-        self.right_layout.addWidget(output_group)
+        self._add_group_with_controls(
+            "输出管理",
+            (self.btn_export, self.btn_open_results, self.btn_view_logs),
+        )
 
-        utility_group, utility_layout = self._create_collapsible_group("系统与维护")
-        utility_layout.addWidget(self.btn_export_report)
-        utility_layout.addWidget(self.btn_config_editor)
-        utility_layout.addWidget(self.btn_online_toggle)
+        utility_group, utility_layout = self._add_group_with_controls(
+            "系统与维护",
+            (self.btn_export_report, self.btn_config_editor, self.btn_online_toggle),
+            add_stretch=False,
+        )
         self.online_status_label = QtWidgets.QLabel("在线检测未启动")
         self.online_status_label.setAlignment(QtCore.Qt.AlignCenter)
         self.online_status_label.setObjectName("OnlineStatusLabel")
@@ -1635,9 +1654,12 @@ class Ui_MainWindow(object):
         self.right_layout.addWidget(utility_group)
 
         self.dashboard = ResultsDashboard()
-        dashboard_group, dashboard_layout = self._create_collapsible_group("训练监控", spacing=10)
-        dashboard_layout.addWidget(self.dashboard)
-        self.right_layout.addWidget(dashboard_group)
+        self._add_group_with_controls(
+            "训练监控",
+            (self.dashboard,),
+            spacing=10,
+            add_stretch=False,
+        )
 
         self.model_group, mg_layout = self._create_collapsible_group("模型版本管理")
         model_row = QtWidgets.QHBoxLayout()
@@ -1645,9 +1667,7 @@ class Ui_MainWindow(object):
         model_row.setSpacing(8)
         self.model_combo = QtWidgets.QComboBox()
         self.model_combo.setMinimumHeight(38)
-        self.model_refresh_btn = QtWidgets.QPushButton("刷新")
-        self.model_refresh_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
-        self.model_refresh_btn.setObjectName("secondary")
+        self.model_refresh_btn = self._make_button("刷新", object_name="secondary")
         self.model_refresh_btn.setMinimumWidth(120)
         model_row.addWidget(self.model_combo)
         model_row.addWidget(self.model_refresh_btn)
@@ -2029,35 +2049,37 @@ class Ui_MainWindow(object):
             self._action_bindings_verified = True
 
     def _bind_signals(self):
-        self.btn_pick_file.clicked.connect(self._choose_file)
-        self.btn_pick_dir.clicked.connect(self._choose_dir)
-        self.btn_browse.clicked.connect(self._browse_compat)
-        self.path_tool_button.clicked.connect(self._browse_compat)
-
-        self.btn_prev.clicked.connect(self._on_prev_batch)
-        self.btn_next.clicked.connect(self._on_next_batch)
+        self._bind_button_actions(
+            {
+                self.btn_pick_file: self._choose_file,
+                self.btn_pick_dir: self._choose_dir,
+                self.btn_browse: self._browse_compat,
+                self.path_tool_button: self._browse_compat,
+                self.btn_prev: self._on_prev_batch,
+                self.btn_next: self._on_next_batch,
+                self.btn_view: self._on_view_info,
+                self.btn_export: self._on_export_results,
+                self.btn_clear: self._on_clear,
+                self.btn_fe: self._on_extract_features,
+                self.btn_vector: self._on_preprocess_features,
+                self.btn_train: self._on_train_model,
+                self.btn_analysis: self._on_run_analysis,
+                self.btn_predict: self._on_predict,
+                self.btn_open_results: self._open_results_dir,
+                self.btn_view_logs: self._open_logs_dir,
+                self.btn_export_report: self._on_export_report,
+                self.btn_config_editor: self._open_config_editor_dialog,
+                self.btn_online_toggle: self._toggle_online_detection,
+                self.model_refresh_btn: self._refresh_model_versions,
+                self.btn_page_prev: self._on_page_prev,
+                self.btn_page_next: self._on_page_next,
+                self.btn_show_all: self._show_full_preview,
+            }
+        )
 
         # 所有功能均使用顶部路径
-        self.btn_view.clicked.connect(self._on_view_info)
-        self.btn_export.clicked.connect(self._on_export_results)
-        self.btn_clear.clicked.connect(self._on_clear)
-        self.btn_fe.clicked.connect(self._on_extract_features)
-        self.btn_vector.clicked.connect(self._on_preprocess_features)
-        self.btn_train.clicked.connect(self._on_train_model)
-        self.btn_analysis.clicked.connect(self._on_run_analysis)
-        self.btn_predict.clicked.connect(self._on_predict)
-        self.btn_open_results.clicked.connect(self._open_results_dir)
-        self.btn_view_logs.clicked.connect(self._open_logs_dir)
-        self.btn_export_report.clicked.connect(self._on_export_report)
-        self.btn_config_editor.clicked.connect(self._open_config_editor_dialog)
-        self.btn_online_toggle.clicked.connect(self._toggle_online_detection)
         self.model_combo.currentIndexChanged.connect(self._on_model_combo_changed)
-        self.model_refresh_btn.clicked.connect(self._refresh_model_versions)
-
-        self.btn_page_prev.clicked.connect(self._on_page_prev)
-        self.btn_page_next.clicked.connect(self._on_page_next)
         self.page_size_spin.valueChanged.connect(self._on_page_size_changed)
-        self.btn_show_all.clicked.connect(self._show_full_preview)
 
         self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
         self.output_list.itemDoubleClicked.connect(self._on_output_double_click)
