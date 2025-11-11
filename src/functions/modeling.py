@@ -36,11 +36,68 @@ except Exception:  # pragma: no cover - 预测模块可在无 pandas 环境运�
 try:  # 规则引擎不是硬依赖
     from .risk_rules import (  # type: ignore
         DEFAULT_TRIGGER_THRESHOLD,
+        DEFAULT_MODEL_WEIGHT,
+        DEFAULT_RULE_WEIGHT,
+        DEFAULT_FUSION_THRESHOLD,
+        fuse_model_rule_votes,
         score_rules as apply_risk_rules,
     )
 except Exception:  # pragma: no cover - 缺少依赖时退化
     apply_risk_rules = None  # type: ignore
     DEFAULT_TRIGGER_THRESHOLD = 60.0  # type: ignore
+    DEFAULT_MODEL_WEIGHT = 0.6  # type: ignore
+    DEFAULT_RULE_WEIGHT = 0.4  # type: ignore
+    DEFAULT_FUSION_THRESHOLD = 0.5  # type: ignore
+
+    def fuse_model_rule_votes(
+        model_flags: Iterable[object],
+        rule_scores: Optional[Iterable[object]],
+        *,
+        model_weight: float = DEFAULT_MODEL_WEIGHT,
+        rule_weight: float = DEFAULT_RULE_WEIGHT,
+        threshold: float = DEFAULT_FUSION_THRESHOLD,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        model_arr = np.asarray(model_flags, dtype=np.float64).reshape(-1)
+        if model_arr.size == 0:
+            empty = np.zeros(0, dtype=np.float64)
+            return empty, empty.astype(bool)
+
+        model_arr = np.clip(model_arr, 0.0, 1.0)
+
+        if rule_scores is None:
+            normalized_rules = np.zeros_like(model_arr)
+            active_rule_weight = 0.0
+        else:
+            try:
+                rule_arr = np.asarray(rule_scores, dtype=np.float64).reshape(-1)
+            except Exception:
+                rule_arr = None
+            if rule_arr is None or rule_arr.size == 0:
+                normalized_rules = np.zeros_like(model_arr)
+                active_rule_weight = 0.0
+            else:
+                if rule_arr.size != model_arr.size:
+                    if rule_arr.size < model_arr.size:
+                        padded = np.zeros_like(model_arr)
+                        padded[: rule_arr.size] = rule_arr
+                        rule_arr = padded
+                    else:
+                        rule_arr = rule_arr[: model_arr.size]
+                normalized_rules = np.clip(rule_arr / 100.0, 0.0, 1.0)
+                active_rule_weight = float(rule_weight)
+
+        total_weight = float(model_weight + active_rule_weight)
+        if not np.isfinite(total_weight) or total_weight <= 0.0:
+            model_w = 1.0
+            rule_w = 0.0
+        else:
+            model_w = float(model_weight) / total_weight
+            rule_w = float(active_rule_weight) / total_weight
+
+        fused_scores = model_w * model_arr + rule_w * normalized_rules
+        fused_flags = fused_scores >= float(threshold)
+
+        return fused_scores, fused_flags
 
 __all__ = [
     "DEFAULT_MODEL_PARAMS",
@@ -238,6 +295,17 @@ class DetectionResult:
     flows: List[Dict[str, object]]
     error: Optional[str] = None
     prediction_labels: Optional[List[str]] = None
+    normalized_labels: Optional[List[str]] = None
+    model_flags: Optional[List[bool]] = None
+    model_statuses: Optional[List[Optional[str]]] = None
+    rule_scores: Optional[List[float]] = None
+    rule_flags: Optional[List[bool]] = None
+    rule_reasons: Optional[List[str]] = None
+    fusion_scores: Optional[List[float]] = None
+    fusion_flags: Optional[List[bool]] = None
+    fusion_statuses: Optional[List[str]] = None
+    fusion_threshold: Optional[float] = None
+    fusion_weights: Optional[Dict[str, float]] = None
 
 
 DEFAULT_MODEL_PARAMS: Dict[str, Union[int, float, None]] = {
@@ -838,9 +906,27 @@ def _build_detection_result(
     else:
         prediction_labels = [str(value) for value in predicted_values]
 
-    status_labels, _, _, _ = summarize_prediction_labels(
+    normalized_labels, _, _, _ = summarize_prediction_labels(
         predicted_values, label_mapping
     )
+
+    model_statuses: List[Optional[str]] = []
+    model_flags = np.zeros(vectorized.flow_count, dtype=bool)
+    for idx in range(vectorized.flow_count):
+        base_status = normalized_labels[idx] if idx < len(normalized_labels) else None
+        interpreted = base_status if base_status in {"异常", "正常"} else _interpret_label_value(
+            predicted_values[idx]
+        )
+        if interpreted == "异常":
+            model_flags[idx] = True
+            model_statuses.append("异常")
+        elif interpreted == "正常":
+            model_flags[idx] = False
+            model_statuses.append("正常")
+        else:
+            fallback_flag = bool(computed_scores[idx] >= 0.5)
+            model_flags[idx] = fallback_flag
+            model_statuses.append("异常" if fallback_flag else "正常")
 
     rule_scores: Optional[np.ndarray] = None
     rule_reasons: Optional[List[str]] = None
@@ -862,20 +948,51 @@ def _build_detection_result(
                     rule_reasons = [str(value) if value is not None else "" for value in reason_series.tolist()]
                 rule_flags = rule_scores >= float(DEFAULT_TRIGGER_THRESHOLD)
 
+    active_rule_weight = float(DEFAULT_RULE_WEIGHT) if (
+        rule_scores is not None and getattr(rule_scores, "size", 0) > 0
+    ) else 0.0
+
+    fusion_scores, fusion_flags = fuse_model_rule_votes(
+        model_flags.astype(np.float64),
+        rule_scores,
+        model_weight=float(DEFAULT_MODEL_WEIGHT),
+        rule_weight=active_rule_weight,
+        threshold=float(DEFAULT_FUSION_THRESHOLD),
+    )
+    fusion_scores = np.asarray(fusion_scores, dtype=np.float64).reshape(-1)
+    fusion_flags = np.asarray(fusion_flags, dtype=bool).reshape(-1)
+
+    final_statuses: List[str] = []
+    for idx in range(vectorized.flow_count):
+        is_anomaly = bool(fusion_flags[idx]) if idx < fusion_flags.size else bool(model_flags[idx])
+        final_statuses.append("异常" if is_anomaly else "正常")
+
     annotated_flows: List[Dict[str, object]] = []
-    for index, (flow, label, label_name, score, status) in enumerate(
-        zip(flows, predicted_values, prediction_labels, computed_scores, status_labels)
+    for index, (flow, label, label_name, score) in enumerate(
+        zip(flows, predicted_values, prediction_labels, computed_scores)
     ):
         annotated = dict(flow)
-        annotated["prediction"] = int(label)
+        try:
+            annotated["prediction"] = int(label)
+        except Exception:
+            annotated["prediction"] = label
         annotated["prediction_label"] = label_name
         annotated["malicious_score"] = float(score)
-        if status in {"异常", "正常"}:
-            annotated["prediction_status"] = status
+        if index < len(model_statuses) and model_statuses[index] is not None:
+            annotated["model_status"] = model_statuses[index]
+        if index < len(final_statuses):
+            annotated["prediction_status"] = final_statuses[index]
+            annotated["fusion_status"] = final_statuses[index]
+        if fusion_scores.size > index:
+            annotated["fusion_score"] = float(fusion_scores[index])
+            annotated["fusion_decision"] = int(bool(fusion_flags[index]))
+        annotated["model_flag"] = bool(model_flags[index]) if index < model_flags.shape[0] else False
         if rule_scores is not None and index < rule_scores.shape[0]:
             annotated["rules_score"] = float(rule_scores[index])
-            triggered = bool(rule_flags[index]) if rule_flags is not None and index < rule_flags.shape[0] else bool(
-                rule_scores[index] >= float(DEFAULT_TRIGGER_THRESHOLD)
+            triggered = (
+                bool(rule_flags[index])
+                if rule_flags is not None and index < rule_flags.shape[0]
+                else bool(rule_scores[index] >= float(DEFAULT_TRIGGER_THRESHOLD))
             )
             if triggered:
                 annotated["rules_triggered"] = True
@@ -885,15 +1002,60 @@ def _build_detection_result(
                     annotated["rules_reasons"] = reason_value
         annotated_flows.append(annotated)
 
+    predictions_list = [int(value) for value in predicted_values]
+    scores_list = [float(value) for value in computed_scores]
+    fusion_score_list = [float(value) for value in fusion_scores.tolist()]
+    fusion_flag_list = [bool(flag) for flag in fusion_flags.tolist()]
+    model_flag_list = [bool(flag) for flag in model_flags.tolist()]
+
+    if rule_scores is not None:
+        rule_score_list = [float(value) for value in rule_scores.tolist()]
+    else:
+        rule_score_list = None
+
+    if rule_flags is not None:
+        rule_flag_list = [bool(flag) for flag in rule_flags.tolist()]
+    elif rule_score_list is not None:
+        rule_flag_list = [score >= float(DEFAULT_TRIGGER_THRESHOLD) for score in rule_score_list]
+    else:
+        rule_flag_list = None
+
+    if rule_reasons is not None:
+        rule_reason_list = [reason for reason in rule_reasons]
+    else:
+        rule_reason_list = None
+
+    total_weight = float(DEFAULT_MODEL_WEIGHT + active_rule_weight)
+    if not np.isfinite(total_weight) or total_weight <= 0.0:
+        fusion_weight_model = 1.0
+        fusion_weight_rules = 0.0
+    else:
+        fusion_weight_model = float(DEFAULT_MODEL_WEIGHT) / total_weight
+        fusion_weight_rules = active_rule_weight / total_weight
+
     return DetectionResult(
         path=Path(path),
         success=True,
         flow_count=len(flows),
         feature_names=feature_names,
-        predictions=[int(value) for value in predicted_values],
-        scores=[float(value) for value in computed_scores],
+        predictions=predictions_list,
+        scores=scores_list,
         flows=annotated_flows,
         prediction_labels=prediction_labels,
+        normalized_labels=list(normalized_labels),
+        model_flags=model_flag_list,
+        model_statuses=[status for status in model_statuses],
+        rule_scores=rule_score_list,
+        rule_flags=rule_flag_list,
+        rule_reasons=rule_reason_list,
+        fusion_scores=fusion_score_list,
+        fusion_flags=fusion_flag_list,
+        fusion_statuses=final_statuses,
+        fusion_threshold=float(DEFAULT_FUSION_THRESHOLD),
+        fusion_weights={
+            "model": fusion_weight_model,
+            "rules": fusion_weight_rules,
+        },
     )
 
 

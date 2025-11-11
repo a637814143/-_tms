@@ -74,11 +74,68 @@ except Exception:
 try:
     from src.functions.risk_rules import (
         DEFAULT_TRIGGER_THRESHOLD,
+        DEFAULT_MODEL_WEIGHT,
+        DEFAULT_RULE_WEIGHT,
+        DEFAULT_FUSION_THRESHOLD,
+        fuse_model_rule_votes,
         score_rules as apply_risk_rules,
     )
 except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
     apply_risk_rules = None  # type: ignore
     DEFAULT_TRIGGER_THRESHOLD = 60.0  # type: ignore
+    DEFAULT_MODEL_WEIGHT = 0.6  # type: ignore
+    DEFAULT_RULE_WEIGHT = 0.4  # type: ignore
+    DEFAULT_FUSION_THRESHOLD = 0.5  # type: ignore
+
+    def fuse_model_rule_votes(
+        model_flags: "np.ndarray | List[float] | List[int] | List[bool]",
+        rule_scores: "Optional[np.ndarray | List[float]]",
+        *,
+        model_weight: float = DEFAULT_MODEL_WEIGHT,
+        rule_weight: float = DEFAULT_RULE_WEIGHT,
+        threshold: float = DEFAULT_FUSION_THRESHOLD,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        model_arr = np.asarray(model_flags, dtype=float).reshape(-1)
+        if model_arr.size == 0:
+            empty = np.zeros(0, dtype=float)
+            return empty, empty.astype(bool)
+
+        model_arr = np.clip(model_arr, 0.0, 1.0)
+
+        if rule_scores is None:
+            normalized_rules = np.zeros_like(model_arr)
+            active_rule_weight = 0.0
+        else:
+            try:
+                rule_arr = np.asarray(rule_scores, dtype=float).reshape(-1)
+            except Exception:
+                rule_arr = None
+            if rule_arr is None or rule_arr.size == 0:
+                normalized_rules = np.zeros_like(model_arr)
+                active_rule_weight = 0.0
+            else:
+                if rule_arr.size != model_arr.size:
+                    if rule_arr.size < model_arr.size:
+                        padded = np.zeros_like(model_arr)
+                        padded[: rule_arr.size] = rule_arr
+                        rule_arr = padded
+                    else:
+                        rule_arr = rule_arr[: model_arr.size]
+                normalized_rules = np.clip(rule_arr / 100.0, 0.0, 1.0)
+                active_rule_weight = float(rule_weight)
+
+        total_weight = float(model_weight + active_rule_weight)
+        if not math.isfinite(total_weight) or total_weight <= 0.0:
+            model_w = 1.0
+            rule_w = 0.0
+        else:
+            model_w = float(model_weight) / total_weight
+            rule_w = float(active_rule_weight) / total_weight
+
+        fused_scores = model_w * model_arr + rule_w * normalized_rules
+        fused_flags = fused_scores >= float(threshold)
+
+        return fused_scores, fused_flags
 
 
 # ---- 简化的通用工具（保持在单文件中）----
@@ -4412,6 +4469,7 @@ class Ui_MainWindow(object):
             positive_classes = _derive_positive_classes(metadata, mapping)
 
             row_statuses: List[Optional[str]] = []
+            model_statuses: List[str] = []
             anomaly_flags: List[bool] = []
 
             total_predictions = len(preds)
@@ -4444,6 +4502,13 @@ class Ui_MainWindow(object):
                 is_anomaly = status == "异常"
                 anomaly_flags.append(is_anomaly)
                 row_statuses.append(status)
+                if isinstance(status, str) and status in {"异常", "正常"}:
+                    model_statuses.append(status)
+                else:
+                    model_statuses.append("异常" if is_anomaly else "正常")
+
+            model_flag_values = [1 if flag else 0 for flag in anomaly_flags]
+            raw_statuses = list(row_statuses)
 
             computed_anomalies = sum(1 for flag in anomaly_flags if flag)
             computed_normals = sum(1 for status in row_statuses if status == "正常")
@@ -4478,11 +4543,58 @@ class Ui_MainWindow(object):
                     if reason_series is not None:
                         rule_reasons_series = reason_series.astype(str, copy=False)
 
+            rule_scores_array = (
+                rule_scores_series.to_numpy(dtype=float)
+                if rule_scores_series is not None
+                else None
+            )
+
+            model_flag_array = np.asarray(model_flag_values, dtype=np.float64)
+            fusion_scores_array, fusion_flags_array = fuse_model_rule_votes(
+                model_flag_array,
+                rule_scores_array,
+                model_weight=float(DEFAULT_MODEL_WEIGHT),
+                rule_weight=float(DEFAULT_RULE_WEIGHT),
+                threshold=float(DEFAULT_FUSION_THRESHOLD),
+            )
+            fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
+            fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
+
+            if fusion_scores_array.size < total_predictions:
+                fusion_scores_array = np.pad(
+                    fusion_scores_array,
+                    (0, total_predictions - fusion_scores_array.size),
+                    "edge",
+                )
+            if fusion_flags_array.size < total_predictions:
+                fusion_flags_array = np.pad(
+                    fusion_flags_array,
+                    (0, total_predictions - fusion_flags_array.size),
+                    "edge",
+                )
+
+            final_flags = [bool(flag) for flag in fusion_flags_array[:total_predictions]]
+            final_statuses = ["异常" if flag else "正常" for flag in final_flags]
+            fusion_scores = fusion_scores_array[:total_predictions]
+
+            anomaly_flags = final_flags
+            row_statuses = final_statuses
+            anomaly_count = sum(1 for flag in anomaly_flags if flag)
+            normal_count = total_predictions - anomaly_count
+            if anomaly_count:
+                status_text = "异常"
+            elif total_predictions:
+                status_text = "正常"
+
             out_df["prediction"] = [int(value) if isinstance(value, (int, np.integer)) else value for value in preds]
             out_df["prediction_label"] = display_labels
             out_df["malicious_score"] = [float(value) for value in np.asarray(scores, dtype=float)]
+            out_df["model_status"] = pd.Series(model_statuses, dtype=object)
+            out_df["model_flag"] = pd.Series(model_flag_values, dtype=int)
             if row_statuses:
                 out_df["prediction_status"] = pd.Series(row_statuses, dtype=object)
+            out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
+            out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
             if rule_scores_series is not None:
                 out_df["rules_score"] = rule_scores_series
                 out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
@@ -4498,17 +4610,6 @@ class Ui_MainWindow(object):
             out_df.to_csv(out_csv, index=False, encoding="utf-8")
 
             total_rows = int(len(out_df))
-            if rule_flags.any():
-                for idx, triggered in enumerate(rule_flags):
-                    if bool(triggered):
-                        anomaly_flags[idx] = True
-                        if idx < len(row_statuses) and row_statuses[idx] != "异常":
-                            row_statuses[idx] = "异常"
-                anomaly_count = sum(1 for flag in anomaly_flags if flag)
-                normal_count = sum(1 for status in row_statuses if status == "正常")
-                if anomaly_count:
-                    status_text = "异常"
-
             out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
 
             summary_lines = [
@@ -4537,6 +4638,25 @@ class Ui_MainWindow(object):
 
             row_messages = _format_row_messages(out_df)
 
+            active_rule_weight = float(DEFAULT_RULE_WEIGHT) if (
+                rule_scores_array is not None and rule_scores_array.size
+            ) else 0.0
+            total_weight = float(DEFAULT_MODEL_WEIGHT + active_rule_weight)
+            if not math.isfinite(total_weight) or total_weight <= 0.0:
+                fusion_weight_model = 1.0
+                fusion_weight_rules = 0.0
+            else:
+                fusion_weight_model = float(DEFAULT_MODEL_WEIGHT) / total_weight
+                fusion_weight_rules = active_rule_weight / total_weight
+
+            fusion_scores_list = [float(value) for value in fusion_scores]
+            fusion_flags_list = [bool(flag) for flag in anomaly_flags]
+            rule_scores_list = (
+                [float(value) for value in rule_scores_array[:total_predictions]]
+                if rule_scores_array is not None
+                else None
+            )
+
             return {
                 "output_csv": out_csv,
                 "dataframe": out_df,
@@ -4554,12 +4674,23 @@ class Ui_MainWindow(object):
                 "labels": display_labels,
                 "normalized_labels": normalized_labels,
                 "row_messages": row_messages,
-                "anomaly_flags": [bool(flag) for flag in anomaly_flags],
-                "anomaly_indices": [idx for idx, flag in enumerate(anomaly_flags) if flag],
+                "anomaly_flags": fusion_flags_list,
+                "anomaly_indices": [idx for idx, flag in enumerate(fusion_flags_list) if flag],
                 "positive_tokens": sorted(positive_tokens),
                 "positive_classes": sorted(positive_classes),
                 "prediction_statuses": row_statuses,
+                "model_statuses": model_statuses,
+                "raw_statuses": raw_statuses,
+                "fusion_scores": fusion_scores_list,
+                "fusion_flags": fusion_flags_list,
+                "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+                "fusion_weights": {
+                    "model": fusion_weight_model,
+                    "rules": fusion_weight_rules,
+                },
+                "model_flags": [bool(flag) for flag in model_flag_values],
                 "rule_flags": [bool(flag) for flag in rule_flags],
+                "rule_scores": rule_scores_list,
                 "rule_threshold": rule_threshold,
                 "rule_hits": rule_hits,
             }
@@ -4680,6 +4811,8 @@ class Ui_MainWindow(object):
             model_flags = pred_array.astype(int) == -1
         except Exception:
             model_flags = np.array([str(value).strip() in {"-1", "异常"} for value in pred_array], dtype=bool)
+        model_flag_values = model_flags.astype(int)
+        model_statuses = ["异常" if flag else "正常" for flag in model_flags]
 
         rule_threshold_raw = metadata.get("rule_threshold") if isinstance(metadata, dict) else None
         rule_threshold = float(rule_threshold_raw) if rule_threshold_raw not in (None, "") else float(DEFAULT_TRIGGER_THRESHOLD)
@@ -4702,22 +4835,56 @@ class Ui_MainWindow(object):
                 if reason_series is not None:
                     rule_reasons_series = reason_series.astype(str, copy=False)
 
+        rule_scores_array = (
+            rule_scores_series.to_numpy(dtype=float)
+            if rule_scores_series is not None
+            else None
+        )
+
+        fusion_scores_array, fusion_flags_array = fuse_model_rule_votes(
+            model_flag_values.astype(float),
+            rule_scores_array,
+            model_weight=float(DEFAULT_MODEL_WEIGHT),
+            rule_weight=float(DEFAULT_RULE_WEIGHT),
+            threshold=float(DEFAULT_FUSION_THRESHOLD),
+        )
+        fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
+        fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
+        if fusion_scores_array.size < total:
+            fusion_scores_array = np.pad(
+                fusion_scores_array,
+                (0, total - fusion_scores_array.size),
+                "edge",
+            )
+        if fusion_flags_array.size < total:
+            fusion_flags_array = np.pad(
+                fusion_flags_array,
+                (0, total - fusion_flags_array.size),
+                "edge",
+            )
+        fusion_flags = fusion_flags_array[:total]
+        fusion_scores = fusion_scores_array[:total]
+        final_statuses = ["异常" if flag else "正常" for flag in fusion_flags]
+
         out_df["prediction"] = preds
         out_df["anomaly_score"] = scores
         out_df["anomaly_confidence"] = risk_score
         out_df["vote_ratio"] = vote_ratio
         out_df["risk_score"] = risk_score
-        out_df["model_anomaly"] = pd.Series(model_flags.astype(int), dtype=int)
+        out_df["model_anomaly"] = pd.Series(model_flag_values, dtype=int)
+        out_df["model_status"] = pd.Series(model_statuses, dtype=object)
+        out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
+        out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
+        out_df["prediction_status"] = pd.Series(final_statuses, dtype=object)
         if rule_scores_series is not None:
             out_df["rules_score"] = rule_scores_series
             out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
             if rule_reasons_series is not None:
                 out_df["rules_reasons"] = rule_reasons_series
 
-        combined_flags = np.logical_or(model_flags, rule_flags)
-        out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in combined_flags], dtype=int)
+        out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
 
-        malicious = int(np.count_nonzero(combined_flags))
+        malicious = int(np.count_nonzero(fusion_flags))
         ratio = (malicious / total) if total else 0.0
 
         score_min = float(np.min(scores)) if len(scores) else 0.0
@@ -4752,6 +4919,23 @@ class Ui_MainWindow(object):
 
         row_messages = _format_row_messages(out_df)
 
+        active_rule_weight = float(DEFAULT_RULE_WEIGHT) if (
+            rule_scores_array is not None and rule_scores_array.size
+        ) else 0.0
+        total_weight = float(DEFAULT_MODEL_WEIGHT + active_rule_weight)
+        if not math.isfinite(total_weight) or total_weight <= 0.0:
+            fusion_weight_model = 1.0
+            fusion_weight_rules = 0.0
+        else:
+            fusion_weight_model = float(DEFAULT_MODEL_WEIGHT) / total_weight
+            fusion_weight_rules = active_rule_weight / total_weight
+
+        rule_scores_list = (
+            [float(value) for value in rule_scores_array[:total]]
+            if rule_scores_array is not None
+            else None
+        )
+
         return {
             "output_csv": out_csv,
             "dataframe": out_df,
@@ -4762,8 +4946,18 @@ class Ui_MainWindow(object):
             "total": total,
             "ratio": ratio,
             "row_messages": row_messages,
-            "anomaly_flags": [bool(flag) for flag in combined_flags],
+            "anomaly_flags": [bool(flag) for flag in fusion_flags],
+            "fusion_flags": [bool(flag) for flag in fusion_flags],
+            "fusion_scores": [float(value) for value in fusion_scores],
+            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+            "fusion_weights": {
+                "model": fusion_weight_model,
+                "rules": fusion_weight_rules,
+            },
+            "model_flags": [bool(flag) for flag in model_flags],
+            "model_statuses": model_statuses,
             "rule_flags": [bool(flag) for flag in rule_flags],
+            "rule_scores": rule_scores_list,
             "rule_threshold": rule_threshold,
             "rule_hits": rule_hits,
         }
@@ -4856,6 +5050,11 @@ class Ui_MainWindow(object):
             "vote_ratio",
             "risk_score",
             "is_malicious",
+            "fusion_score",
+            "fusion_decision",
+            "model_status",
+            "model_flag",
+            "fusion_status",
             "manual_label",
         }
         try:
@@ -5035,7 +5234,8 @@ class Ui_MainWindow(object):
         if not isinstance(normalized_labels, (list, tuple)):
             normalized_labels = []
 
-        anomaly_flags = prediction.get("anomaly_flags")
+        fusion_flags_payload = prediction.get("fusion_flags")
+        anomaly_flags = prediction.get("anomaly_flags") if fusion_flags_payload is None else fusion_flags_payload
         if not isinstance(anomaly_flags, (list, tuple)):
             anomaly_flags = []
 
