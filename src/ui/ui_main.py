@@ -3795,6 +3795,66 @@ class Ui_MainWindow(object):
         if pd is None:
             raise RuntimeError("pandas 未安装，无法执行预测。")
 
+        def _format_row_messages(frame: "pd.DataFrame") -> List[str]:
+            if pd is None or frame is None or not isinstance(frame, pd.DataFrame):
+                return []
+            max_preview = 200
+            if len(frame) > max_preview:
+                return []
+
+            identifier_columns = [
+                "flow_id",
+                "__source_file__",
+                "__source_path__",
+                "pcap_file",
+                "pcap_name",
+                "file_name",
+                "src_ip",
+                "dst_ip",
+                "src_port",
+                "dst_port",
+            ]
+
+            messages: List[str] = []
+            for idx, row in frame.iterrows():
+                identifier = None
+                for column in identifier_columns:
+                    if column not in frame.columns:
+                        continue
+                    value = row.get(column)
+                    try:
+                        is_valid = pd.notna(value)
+                    except Exception:
+                        is_valid = value not in (None, "")
+                    if is_valid:
+                        text_value = str(value).strip()
+                        if text_value:
+                            identifier = f"{column}={text_value}"
+                            break
+                if identifier is None:
+                    identifier = f"第{idx + 1}行"
+
+                label = row.get("prediction_label")
+                if not label:
+                    label = row.get("prediction")
+
+                score_value = row.get("malicious_score")
+                if score_value is None:
+                    score_value = row.get("anomaly_score")
+                try:
+                    score_float = float(score_value)
+                except Exception:
+                    score_float = None
+
+                if score_float is not None and not math.isnan(score_float):
+                    score_text = f" 分数={score_float:.4f}"
+                else:
+                    score_text = ""
+
+                messages.append(f"{identifier} -> 预测={label}{score_text}")
+
+            return messages
+
         bundle = self._resolve_prediction_bundle(df, metadata_override=metadata_override)
         if not bundle:
             raise RuntimeError(
@@ -4040,6 +4100,8 @@ class Ui_MainWindow(object):
                 for msg in summary_lines:
                     self.display_result(f"[INFO] {msg}")
 
+            row_messages = _format_row_messages(out_df)
+
             return {
                 "output_csv": out_csv,
                 "dataframe": out_df,
@@ -4055,6 +4117,7 @@ class Ui_MainWindow(object):
                 "predictions": [int(value) if isinstance(value, (int, np.integer)) else value for value in preds],
                 "scores": [float(value) for value in np.asarray(scores, dtype=float)],
                 "labels": labels,
+                "row_messages": row_messages,
             }
 
         models_dir = self._default_models_dir()
@@ -4204,6 +4267,8 @@ class Ui_MainWindow(object):
             for msg in messages:
                 self.display_result(f"[INFO] {msg}")
 
+        row_messages = _format_row_messages(out_df)
+
         return {
             "output_csv": out_csv,
             "dataframe": out_df,
@@ -4213,6 +4278,7 @@ class Ui_MainWindow(object):
             "malicious": malicious,
             "total": total,
             "ratio": ratio,
+            "row_messages": row_messages,
         }
 
 
@@ -4229,10 +4295,17 @@ class Ui_MainWindow(object):
         if not isinstance(result, dict):
             return
 
+        parent_widget = self._parent_widget()
+
         messages = result.get("messages") or []
         if messages:
             lines = [f"[INFO] [{source_name}] {line}" for line in messages]
             self.display_result("\n".join(lines))
+
+        row_messages = result.get("row_messages") or []
+        if row_messages:
+            detailed_lines = [f"[INFO] [{source_name}] {line}" for line in row_messages]
+            self.display_result("\n".join(detailed_lines))
 
         output_csv = result.get("output_csv")
         if output_csv and os.path.exists(output_csv):
@@ -4274,7 +4347,7 @@ class Ui_MainWindow(object):
 
         if show_dialog:
             QtWidgets.QMessageBox.information(
-                None,
+                parent_widget,
                 "预测完成",
                 "\n".join(result.get("summary") or ["模型预测已完成并写出结果。"]),
             )
@@ -4285,9 +4358,19 @@ class Ui_MainWindow(object):
         *,
         metadata_override: Optional[dict],
     ) -> None:
+        parent_widget = self._parent_widget()
         if not paths:
-            QtWidgets.QMessageBox.information(None, "无有效文件", "所选目录中没有可处理的 PCAP 文件。")
+            QtWidgets.QMessageBox.information(parent_widget, "无有效文件", "所选目录中没有可处理的 PCAP 文件。")
             return
+
+        button = getattr(self, "btn_predict", None)
+        if button is not None:
+            button.setEnabled(False)
+            try:
+                self.set_button_progress(button, 1)
+            except Exception:
+                pass
+            QtWidgets.QApplication.processEvents()
 
         output_dir = self._prediction_out_dir()
         os.makedirs(output_dir, exist_ok=True)
@@ -4298,70 +4381,198 @@ class Ui_MainWindow(object):
         total_malicious = 0
         failed: List[Tuple[str, str]] = []
 
-        for index, pcap_path in enumerate(paths, start=1):
-            self.display_result(f"[INFO] 处理 PCAP ({index}/{total}): {pcap_path}")
-            try:
-                payload = self._process_online_pcap(
-                    pcap_path,
-                    output_dir=output_dir,
-                    metadata=metadata_override,
+        try:
+            for index, pcap_path in enumerate(paths, start=1):
+                self.display_result(f"[INFO] 处理 PCAP ({index}/{total}): {pcap_path}")
+
+                def _update_progress(local_pct: int) -> None:
+                    if button is None:
+                        return
+                    try:
+                        local_value = max(0, min(100, int(local_pct)))
+                    except Exception:
+                        local_value = 0
+                    completed = (index - 1) + (local_value / 100.0)
+                    overall = int(max(1, min(100, (completed / float(total)) * 100.0)))
+                    try:
+                        self.set_button_progress(button, overall)
+                    except Exception:
+                        pass
+                    QtWidgets.QApplication.processEvents()
+
+                try:
+                    payload = self._process_online_pcap(
+                        pcap_path,
+                        output_dir=output_dir,
+                        metadata=metadata_override,
+                        progress_cb=_update_progress,
+                    )
+                except Exception as exc:
+                    reason = str(exc)
+                    failed.append((pcap_path, reason))
+                    self.display_result(f"[错误] PCAP 处理失败：{pcap_path} -> {reason}")
+                    continue
+
+                prediction = payload.get("prediction") if isinstance(payload, dict) else None
+                source_name = os.path.basename(pcap_path)
+                self._present_prediction_result(
+                    prediction,
+                    source_name=source_name,
+                    metadata_override=metadata_override,
+                    source_pcap=pcap_path,
+                    show_dialog=False,
                 )
-            except Exception as exc:
-                reason = str(exc)
-                failed.append((pcap_path, reason))
-                self.display_result(f"[错误] PCAP 处理失败：{pcap_path} -> {reason}")
-                continue
 
-            prediction = payload.get("prediction") if isinstance(payload, dict) else None
-            source_name = os.path.basename(pcap_path)
-            self._present_prediction_result(
-                prediction,
-                source_name=source_name,
-                metadata_override=metadata_override,
-                source_pcap=pcap_path,
-                show_dialog=False,
-            )
+                successes += 1
+                try:
+                    total_rows += int(prediction.get("total", 0))  # type: ignore[arg-type]
+                except Exception:
+                    pass
+                try:
+                    total_malicious += int(prediction.get("malicious", 0))  # type: ignore[arg-type]
+                except Exception:
+                    pass
 
-            successes += 1
-            try:
-                total_rows += int(prediction.get("total", 0))  # type: ignore[arg-type]
-            except Exception:
-                pass
-            try:
-                total_malicious += int(prediction.get("malicious", 0))  # type: ignore[arg-type]
-            except Exception:
-                pass
+            if successes == 0:
+                error_lines = [f"- {os.path.basename(path)}: {reason}" for path, reason in failed[:5]]
+                if len(failed) > 5:
+                    error_lines.append("...")
+                QtWidgets.QMessageBox.critical(
+                    parent_widget,
+                    "预测失败",
+                    "所有 PCAP 文件处理均失败。\n" + "\n".join(error_lines),
+                )
+                return
 
-        if successes == 0:
-            error_lines = [f"- {os.path.basename(path)}: {reason}" for path, reason in failed[:5]]
-            if len(failed) > 5:
-                error_lines.append("...")
-            QtWidgets.QMessageBox.critical(
-                None,
-                "预测失败",
-                "所有 PCAP 文件处理均失败。\n" + "\n".join(error_lines),
-            )
-            return
+            summary_lines = [
+                f"共处理 PCAP 文件：{total} 个",
+                f"成功：{successes} 个，失败：{total - successes} 个",
+                f"累计检测流量：{total_rows} 条",
+                f"检测到异常：{total_malicious} 条",
+            ]
+            if failed:
+                sample = "; ".join(
+                    f"{os.path.basename(path)}: {reason}" for path, reason in failed[:3]
+                )
+                if len(failed) > 3:
+                    sample += " ..."
+                summary_lines.append(f"失败样例：{sample}")
 
-        summary_lines = [
-            f"共处理 PCAP 文件：{total} 个",
-            f"成功：{successes} 个，失败：{total - successes} 个",
-            f"累计检测流量：{total_rows} 条",
-            f"检测到异常：{total_malicious} 条",
-        ]
-        if failed:
-            sample = "; ".join(
-                f"{os.path.basename(path)}: {reason}" for path, reason in failed[:3]
-            )
-            if len(failed) > 3:
-                sample += " ..."
-            summary_lines.append(f"失败样例：{sample}")
-
-        QtWidgets.QMessageBox.information(None, "预测完成", "\n".join(summary_lines))
+            QtWidgets.QMessageBox.information(parent_widget, "预测完成", "\n".join(summary_lines))
+        finally:
+            if button is not None:
+                button.setEnabled(True)
+                if successes > 0:
+                    try:
+                        self.set_button_progress(button, 100)
+                    except Exception:
+                        pass
+                    QtCore.QTimer.singleShot(300, lambda b=button: self.reset_button_progress(b))
+                else:
+                    self.reset_button_progress(button)
 
     def _on_predict(self):
+        parent_widget = self._parent_widget()
         if pd is None:
-            QtWidgets.QMessageBox.warning(None, "缺少依赖", "当前环境未安装 pandas，无法执行预测。")
+            QtWidgets.QMessageBox.warning(parent_widget, "缺少依赖", "当前环境未安装 pandas，无法执行预测。")
+            return
+
+        selected_df: Optional["pd.DataFrame"] = None
+        selection_model = getattr(self.table_view, "selectionModel", None)
+        if callable(selection_model):
+            selection_model = selection_model()
+        if selection_model is not None:
+            try:
+                selected_indexes = selection_model.selectedRows()
+            except Exception:
+                selected_indexes = []
+            if selected_indexes:
+                model = self.table_view.model()
+                source_model = model
+                if isinstance(model, QtCore.QSortFilterProxyModel):
+                    source_model = model.sourceModel()
+                df_source = getattr(source_model, "_df", None)
+                if isinstance(df_source, pd.DataFrame) and not df_source.empty:
+                    row_numbers: List[int] = []
+                    for index in selected_indexes:
+                        source_index = index
+                        if isinstance(model, QtCore.QSortFilterProxyModel):
+                            source_index = model.mapToSource(index)
+                        if source_index.isValid():
+                            row_numbers.append(source_index.row())
+                    if row_numbers:
+                        valid_rows = sorted({row for row in row_numbers if 0 <= row < len(df_source)})
+                        if valid_rows:
+                            selected_df = df_source.iloc[valid_rows].copy()
+                            drop_columns = {
+                                "prediction",
+                                "prediction_label",
+                                "prediction_status",
+                                "malicious_score",
+                                "anomaly_score",
+                                "anomaly_confidence",
+                                "vote_ratio",
+                                "risk_score",
+                                "is_malicious",
+                                "manual_label",
+                            }
+                            try:
+                                selected_df.drop(columns=[col for col in drop_columns if col in selected_df], inplace=True, errors="ignore")
+                            except TypeError:
+                                # pandas<1.0 无 errors 参数
+                                for col in list(drop_columns):
+                                    if col in selected_df:
+                                        selected_df.drop(columns=[col], inplace=True)
+                            selected_df.reset_index(drop=True, inplace=True)
+
+        if selected_df is not None and not selected_df.empty:
+            metadata_override = None
+            if isinstance(self._selected_metadata, dict):
+                metadata_override = self._selected_metadata
+            elif isinstance(self._latest_prediction_summary, dict):
+                meta_candidate = self._latest_prediction_summary.get("metadata")
+                if isinstance(meta_candidate, dict):
+                    metadata_override = meta_candidate
+
+            self.display_result(f"[INFO] 使用已选流量 {len(selected_df)} 条执行模型预测。")
+
+            button = getattr(self, "btn_predict", None)
+            if button is not None:
+                button.setEnabled(False)
+                try:
+                    self.set_button_progress(button, 1)
+                except Exception:
+                    pass
+                QtWidgets.QApplication.processEvents()
+
+            try:
+                result = self._predict_dataframe(
+                    selected_df,
+                    source_name=f"选中流量({len(selected_df)})",
+                    metadata_override=metadata_override,
+                    silent=True,
+                )
+            except Exception as exc:
+                if button is not None:
+                    button.setEnabled(True)
+                    self.reset_button_progress(button)
+                QtWidgets.QMessageBox.critical(parent_widget, "预测失败", str(exc))
+                return
+
+            if button is not None:
+                button.setEnabled(True)
+                try:
+                    self.set_button_progress(button, 100)
+                except Exception:
+                    pass
+                QtCore.QTimer.singleShot(300, lambda b=button: self.reset_button_progress(b))
+
+            self._present_prediction_result(
+                result,
+                source_name=f"选中流量({len(selected_df)})",
+                metadata_override=metadata_override,
+                show_dialog=True,
+            )
             return
 
         preferred_pcap_dir = r"D:\pythonProject8\data\split"
@@ -4387,7 +4598,7 @@ class Ui_MainWindow(object):
 
             if not valid_files:
                 QtWidgets.QMessageBox.warning(
-                    None,
+                    parent_widget,
                     "无有效文件",
                     "请选择存在的 PCAP/PCAPNG 文件。",
                 )
@@ -4428,7 +4639,7 @@ class Ui_MainWindow(object):
             return
 
         if not os.path.exists(chosen_path):
-            QtWidgets.QMessageBox.warning(None, "路径不存在", chosen_path)
+            QtWidgets.QMessageBox.warning(parent_widget, "路径不存在", chosen_path)
             return
 
         metadata_override = (
@@ -4440,7 +4651,7 @@ class Ui_MainWindow(object):
 
             if not pcap_candidates:
                 QtWidgets.QMessageBox.information(
-                    None,
+                    parent_widget,
                     "未发现数据",
                     "所选目录没有可用的 PCAP 文件。",
                 )
@@ -4457,15 +4668,50 @@ class Ui_MainWindow(object):
             self._remember_path(chosen_path)
 
         if chosen_path.lower().endswith((".pcap", ".pcapng")):
+            button = getattr(self, "btn_predict", None)
+            if button is not None:
+                button.setEnabled(False)
+                try:
+                    self.set_button_progress(button, 1)
+                except Exception:
+                    pass
+                QtWidgets.QApplication.processEvents()
+
+            def _single_progress(local_pct: int) -> None:
+                if button is None:
+                    return
+                try:
+                    pct_value = max(0, min(100, int(local_pct)))
+                except Exception:
+                    pct_value = 0
+                pct_value = max(1, pct_value)
+                try:
+                    self.set_button_progress(button, pct_value)
+                except Exception:
+                    pass
+                QtWidgets.QApplication.processEvents()
+
             try:
                 payload = self._process_online_pcap(
                     chosen_path,
                     output_dir=self._prediction_out_dir(),
                     metadata=metadata_override,
+                    progress_cb=_single_progress,
                 )
             except Exception as exc:
-                QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
+                if button is not None:
+                    button.setEnabled(True)
+                    self.reset_button_progress(button)
+                QtWidgets.QMessageBox.critical(parent_widget, "预测失败", str(exc))
                 return
+
+            if button is not None:
+                button.setEnabled(True)
+                try:
+                    self.set_button_progress(button, 100)
+                except Exception:
+                    pass
+                QtCore.QTimer.singleShot(300, lambda b=button: self.reset_button_progress(b))
 
             prediction = payload.get("prediction") if isinstance(payload, dict) else None
             source_name = os.path.basename(chosen_path)
@@ -4481,11 +4727,11 @@ class Ui_MainWindow(object):
         try:
             df = read_csv_flexible(chosen_path)
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(None, "读取失败", f"无法读取 CSV：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "读取失败", f"无法读取 CSV：{exc}")
             return
 
         if df.empty:
-            QtWidgets.QMessageBox.information(None, "空数据", "该 CSV 没有数据行。")
+            QtWidgets.QMessageBox.information(parent_widget, "空数据", "该 CSV 没有数据行。")
             return
 
         source_name = os.path.splitext(os.path.basename(chosen_path))[0] or os.path.basename(chosen_path)
@@ -4498,7 +4744,7 @@ class Ui_MainWindow(object):
                 silent=True,
             )
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(None, "预测失败", str(exc))
+            QtWidgets.QMessageBox.critical(parent_widget, "预测失败", str(exc))
             return
 
         self._present_prediction_result(
