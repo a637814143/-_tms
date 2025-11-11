@@ -1011,6 +1011,7 @@ def _align_input_features(
 class Ui_MainWindow(object):
     # --------- 基本结构 ----------
     def setupUi(self, MainWindow):
+        self._main_window = MainWindow
         MainWindow.setObjectName("MainWindow")
         MainWindow.resize(1400, 840)
         MainWindow.setStyleSheet(APP_STYLE)
@@ -1132,6 +1133,15 @@ class Ui_MainWindow(object):
 
         self.retranslateUi(MainWindow)
         QtCore.QMetaObject.connectSlotsByName(MainWindow)
+
+    def _parent_widget(self):
+        parent = getattr(self, "_main_window", None)
+        if isinstance(parent, QtWidgets.QWidget):
+            return parent
+        central = getattr(self, "centralwidget", None)
+        if isinstance(central, QtWidgets.QWidget):
+            return central
+        return None
 
     def _build_path_bar(self):
         self.file_group = QtWidgets.QGroupBox("数据源选择")
@@ -1584,10 +1594,11 @@ class Ui_MainWindow(object):
         return default_path
 
     def _open_config_editor_dialog(self) -> None:
+        parent_widget = self._parent_widget()
         try:
             config_path = self._active_config_path()
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "定位失败", f"无法确定配置文件路径：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "定位失败", f"无法确定配置文件路径：{exc}")
             return
 
         config_path_parent = config_path.parent
@@ -1622,14 +1633,14 @@ class Ui_MainWindow(object):
                 title="编辑全局配置",
                 text=text,
                 path=config_path,
-                parent=self,
+                parent=parent_widget,
             )
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "初始化失败", f"无法打开配置编辑器：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "初始化失败", f"无法打开配置编辑器：{exc}")
             return
 
         if warning:
-            QtWidgets.QMessageBox.warning(self, "读取提示", warning)
+            QtWidgets.QMessageBox.warning(parent_widget, "读取提示", warning)
 
         result = dialog.exec_()
         if result != QtWidgets.QDialog.Accepted:
@@ -1637,17 +1648,17 @@ class Ui_MainWindow(object):
 
         new_text = dialog.text().strip()
         if not new_text:
-            QtWidgets.QMessageBox.warning(self, "内容为空", "配置内容不能为空。")
+            QtWidgets.QMessageBox.warning(parent_widget, "内容为空", "配置内容不能为空。")
             return
 
         try:
             parsed = yaml.safe_load(new_text) or {}
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "格式错误", f"配置内容不是有效的 YAML：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "格式错误", f"配置内容不是有效的 YAML：{exc}")
             return
 
         if not isinstance(parsed, dict):
-            QtWidgets.QMessageBox.critical(self, "格式错误", "配置文件的根节点必须是一个字典。")
+            QtWidgets.QMessageBox.critical(parent_widget, "格式错误", "配置文件的根节点必须是一个字典。")
             return
 
         try:
@@ -1657,7 +1668,7 @@ class Ui_MainWindow(object):
                 if not new_text.endswith("\n"):
                     fh.write("\n")
         except Exception as exc:
-            QtWidgets.QMessageBox.critical(self, "保存失败", f"无法写入配置文件：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "保存失败", f"无法写入配置文件：{exc}")
             return
 
         try:
@@ -4465,6 +4476,7 @@ class Ui_MainWindow(object):
         self._reveal_in_folder(self._default_results_dir())
 
     def _open_logs_dir(self):
+        parent_widget = self._parent_widget()
         try:
             LOGS_DIR.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -4476,7 +4488,11 @@ class Ui_MainWindow(object):
             sample_file = None
 
         try:
-            dialog = LogViewerDialog(LOGS_DIR, reveal_callback=self._reveal_in_folder, parent=self)
+            dialog = LogViewerDialog(
+                LOGS_DIR,
+                reveal_callback=self._reveal_in_folder,
+                parent=parent_widget,
+            )
             if dialog.exec_() == 0 and sample_file is None:
                 QtWidgets.QMessageBox.information(
                     None,
