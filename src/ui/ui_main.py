@@ -4366,15 +4366,55 @@ class Ui_MainWindow(object):
 
         preferred_pcap_dir = r"D:\pythonProject8\data\split"
         start_dir = preferred_pcap_dir if os.path.exists(preferred_pcap_dir) else self._default_split_dir()
-        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        selected_files, _ = QtWidgets.QFileDialog.getOpenFileNames(
             None,
-            "选择 PCAP 文件",
+            "选择 PCAP 流量（可多选）",
             start_dir,
             "PCAP (*.pcap *.pcapng);;所有文件 (*)",
         )
 
-        if file_path:
-            chosen_path = file_path
+        chosen_path: Optional[str]
+        if selected_files:
+            normalized_files = [os.path.normpath(p.strip()) for p in selected_files if p]
+            valid_files = [
+                p
+                for p in normalized_files
+                if p
+                and os.path.exists(p)
+                and os.path.isfile(p)
+                and p.lower().endswith((".pcap", ".pcapng"))
+            ]
+
+            if not valid_files:
+                QtWidgets.QMessageBox.warning(
+                    None,
+                    "无有效文件",
+                    "请选择存在的 PCAP/PCAPNG 文件。",
+                )
+                return
+
+            metadata_override = (
+                self._selected_metadata if isinstance(self._selected_metadata, dict) else None
+            )
+
+            deduped_files: List[str] = []
+            seen: Set[str] = set()
+            for path in valid_files:
+                if path not in seen:
+                    deduped_files.append(path)
+                    seen.add(path)
+
+            valid_files = deduped_files
+
+            if len(valid_files) > 1:
+                self._remember_path(os.path.dirname(valid_files[0]))
+                self._predict_pcap_batch(
+                    valid_files,
+                    metadata_override=metadata_override,
+                )
+                return
+
+            chosen_path = valid_files[0]
         else:
             dir_path = QtWidgets.QFileDialog.getExistingDirectory(
                 None, "选择 PCAP 所在目录", start_dir
@@ -4391,7 +4431,9 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.warning(None, "路径不存在", chosen_path)
             return
 
-        metadata_override = self._selected_metadata if isinstance(self._selected_metadata, dict) else None
+        metadata_override = (
+            self._selected_metadata if isinstance(self._selected_metadata, dict) else None
+        )
 
         if os.path.isdir(chosen_path):
             pcap_candidates = self._list_sorted(chosen_path)
