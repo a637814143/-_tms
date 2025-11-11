@@ -1704,8 +1704,9 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 配置已更新并保存至：{config_path}")
 
     def _toggle_online_detection(self) -> None:
+        parent_widget = self._parent_widget()
         if pd is None:
-            QtWidgets.QMessageBox.warning(None, "缺少依赖", "当前环境未安装 pandas，无法执行在线检测。")
+            QtWidgets.QMessageBox.warning(parent_widget, "缺少依赖", "当前环境未安装 pandas，无法执行在线检测。")
             return
 
         worker = getattr(self, "_online_worker", None)
@@ -1748,8 +1749,9 @@ class Ui_MainWindow(object):
             self.online_status_label.setText(message)
 
     def _on_online_error(self, message: str) -> None:
+        parent_widget = self._parent_widget()
         self.display_result(f"[错误] 在线检测：{message}")
-        QtWidgets.QMessageBox.warning(None, "在线检测错误", message)
+        QtWidgets.QMessageBox.warning(parent_widget, "在线检测错误", message)
 
     def _on_online_stopped(self) -> None:
         self._online_worker = None
@@ -1884,8 +1886,9 @@ class Ui_MainWindow(object):
         self.display_result(f"[INFO] 在线检测完成：{payload.get('pcap_path')}")
 
     def _on_online_prediction_error(self, message: str) -> None:
+        parent_widget = self._parent_widget()
         self.display_result(f"[错误] 在线检测任务失败：{message}")
-        QtWidgets.QMessageBox.warning(None, "在线检测任务失败", message)
+        QtWidgets.QMessageBox.warning(parent_widget, "在线检测任务失败", message)
         self.online_status_label.setText(f"检测任务失败：{message}")
 
     def _bind_signals(self):
