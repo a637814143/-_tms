@@ -17,6 +17,9 @@ DEFAULTS = dict(
     SYN_HEAVY = 15,          # SYN 明显多于 ACK 的简易阈
 )
 
+# 规则判定异常时的默认触发阈值
+DEFAULT_TRIGGER_THRESHOLD = 60.0
+
 def _to_float(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").fillna(0.0).astype(np.float32)
 
