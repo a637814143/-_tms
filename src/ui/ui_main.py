@@ -4692,6 +4692,19 @@ class Ui_MainWindow(object):
             if isinstance(prediction.get("metadata"), dict)
             else {}
         )
+
+        declared_total: Optional[int] = None
+        for key in ("malicious", "anomaly_count"):
+            value = prediction.get(key)
+            if isinstance(value, (int, np.integer)):
+                declared_total = max(0, int(value))
+                break
+            if value is not None:
+                try:
+                    declared_total = max(0, int(str(value).strip()))
+                    break
+                except (TypeError, ValueError):
+                    continue
         frame = prediction.get("dataframe")
         if not isinstance(frame, pd.DataFrame):
             frame = None
@@ -4847,6 +4860,12 @@ class Ui_MainWindow(object):
 
         if not indices:
             return ([], 0)
+
+        if declared_total is not None:
+            if declared_total <= 0:
+                return ([], 0)
+            if len(indices) > declared_total:
+                indices = indices[:declared_total]
 
         identifier_columns = (
             "flow_id",
@@ -5004,7 +5023,7 @@ class Ui_MainWindow(object):
                     source_name=source_name,
                     limit=3,
                 )
-                if sample_lines:
+                if sample_count > 0 and sample_lines:
                     anomaly_samples.extend(sample_lines)
                 anomaly_flow_count = 0
                 flags_payload = prediction.get("anomaly_flags")
@@ -5013,11 +5032,28 @@ class Ui_MainWindow(object):
                         anomaly_flow_count = sum(1 for flag in flags_payload if bool(flag))
                     except Exception:
                         anomaly_flow_count = 0
+                declared_total = None
+                for key in ("malicious", "anomaly_count"):
+                    value = prediction.get(key)
+                    if isinstance(value, (int, np.integer)):
+                        declared_total = max(0, int(value))
+                        break
+                    if value is not None:
+                        try:
+                            declared_total = max(0, int(str(value).strip()))
+                            break
+                        except (TypeError, ValueError):
+                            continue
                 if anomaly_flow_count == 0:
-                    try:
-                        anomaly_flow_count = int(prediction.get("malicious", sample_count))
-                    except Exception:
+                    if declared_total is not None:
+                        anomaly_flow_count = declared_total
+                    else:
                         anomaly_flow_count = sample_count
+                else:
+                    if declared_total is not None:
+                        anomaly_flow_count = max(anomaly_flow_count, declared_total)
+                if sample_count > 0:
+                    anomaly_flow_count = max(anomaly_flow_count, sample_count)
                 if anomaly_flow_count > 0:
                     anomaly_file_count += 1
                 total_anomaly_flows += max(anomaly_flow_count, 0)
@@ -5048,7 +5084,7 @@ class Ui_MainWindow(object):
                     sample += " ..."
                 summary_lines.append(f"失败样例：{sample}")
 
-            if anomaly_samples:
+            if anomaly_samples and total_anomaly_flows > 0:
                 summary_lines.append("异常详情（最多展示前几条）：")
                 preview = anomaly_samples[:5]
                 summary_lines.extend(f"- {line}" for line in preview)
