@@ -15,6 +15,7 @@ DEFAULTS = dict(
     BEACON_MIN_PKTS = 20,    # 需要一定包数才算有意义
     EXFIL_BPS_RATIO = 0.8,   # bps 的经验百分位阈值（兼容旧逻辑）
     EXFIL_UP_RATIO = 0.8,    # 上行/总流量占比异常阈值
+    EXFIL_STRICT_UP_RATIO = 0.9,  # 上行占比极高时的强烈外泄提示
     SYN_HEAVY = 15,          # SYN 明显多于 ACK 的简易阈
     RATE_SPIKE_ABS = 1000.0, # 速率突增阈值（bytes/s）
     SMALL_PKT_MEAN = 50.0,   # 小包均值阈值（字节）
@@ -23,6 +24,22 @@ DEFAULTS = dict(
     TLS_DURATION_MAX = 1.0,  # TLS 握手极短持续时间阈值
     PORT_SCAN_UNIQUE_PORTS = 10,  # 同一 src 访问端口数量阈值
     BPS_SIGMA_MULT = 3.0,    # 动态带宽阈值：均值+N*std
+    DDOS_PKT_RATE = 1000.0,  # DDoS：高包速阈值
+    DDOS_BYTE_RATE = 1_000_000.0,  # DDoS：高字节速率阈值
+    SLOWLORIS_DURATION = 60.0,     # Slowloris 持续时间阈值（秒）
+    SLOWLORIS_BPS_MAX = 100.0,     # Slowloris 低速阈值（bytes/s）
+    IP_SPOOF_SRC_VARIETY = 10,     # 同一目标的来源 IP 数量
+    ARP_PPS_HI = 100.0,            # ARP 流量的包速阈值
+    DNS_REQ_BYTES_MAX = 100.0,     # DNS 请求字节阈值
+    DNS_RESP_BYTES_MIN = 1000.0,   # DNS 响应字节阈值
+    FTP_LARGE_TRANSFER = 50000.0,  # FTP 大文件阈值
+    UNIQUE_DST_PORTS = 10,         # 行内 unique_dst_ports 阈值
+    UNIQUE_DST_IPS = 10,           # 行内 unique_dst_ips 阈值
+    TRAFFIC_SPIKE_BPS = 10000.0,   # 突发流量速率阈值
+    TRAFFIC_SPIKE_DURATION = 5.0,  # 突发流量持续时间阈值
+    UNUSUAL_PROTO_PPS = 100.0,     # 非 TCP/UDP 协议高频阈值
+    SHORT_SESSION_DURATION = 1.0,  # 过短会话
+    LONG_SESSION_DURATION = 3600.0,# 过长会话
 )
 
 # 规则判定异常时的默认触发阈值
@@ -48,6 +65,7 @@ def score_rules(df: pd.DataFrame, params: Dict=None) -> Tuple[pd.Series, pd.Seri
     # 统一需要的列
     col = lambda name: _to_float(df[name]) if name in df.columns else pd.Series(np.zeros(n, dtype=np.float32), index=df.index)
     proto = df["protocol"].astype(str) if "protocol" in df.columns else pd.Series([""]*n)
+    proto_upper = proto.str.upper()
 
     pps = col("pps")
     bps = col("bps")
@@ -62,6 +80,11 @@ def score_rules(df: pd.DataFrame, params: Dict=None) -> Tuple[pd.Series, pd.Seri
     packet_len_mean = col("packet_length_mean")
     flow_duration = col("flow_duration")
     unique_ports = col("unique_ports_accessed")
+    unique_dst_ports = col("unique_dst_ports")
+    unique_dst_ips = col("unique_dst_ips")
+    unique_src_ips = col("unique_src_ips")
+    total_len_fwd_pkts = col("total_len_fwd_pkts")
+    total_len_bwd_pkts = col("total_len_bwd_pkts")
 
     # 1) UDP Flood：UDP 且包速高
     udp_mask = proto.isin(["17", "udp", "UDP", "Udp"])
@@ -151,13 +174,13 @@ def score_rules(df: pd.DataFrame, params: Dict=None) -> Tuple[pd.Series, pd.Seri
         reasons[i].append("小包高频(疑似洪泛)")
 
     # 8) 协议分布异常（ICMP 突出）
-    icmp_mask = proto.str.upper().eq("ICMP") & (flow_rate > params["ICMP_BPS_HI"])
+    icmp_mask = proto_upper.eq("ICMP") & (flow_rate > params["ICMP_BPS_HI"])
     for i in np.where(icmp_mask.values)[0]:
         score[i] += 30
         reasons[i].append("异常 ICMP 流量")
 
     # 9) TLS 握手异常
-    tls_mask = proto.str.upper().eq("TLS") & (flow_duration > 0) & (flow_duration < params["TLS_DURATION_MAX"])
+    tls_mask = proto_upper.eq("TLS") & (flow_duration > 0) & (flow_duration < params["TLS_DURATION_MAX"])
     for i in np.where(tls_mask.values)[0]:
         score[i] += 30
         reasons[i].append("TLS 握手持续时间过短")
@@ -168,6 +191,92 @@ def score_rules(df: pd.DataFrame, params: Dict=None) -> Tuple[pd.Series, pd.Seri
         for i in np.where(port_scan_mask)[0]:
             score[i] += 35
             reasons[i].append("端口扫描(统计)")
+
+    # 11) DDoS：包速与字节速率均极高
+    ddos_mask = (flow_pkts_per_s >= params["DDOS_PKT_RATE"]) & (flow_rate >= params["DDOS_BYTE_RATE"])
+    for i in np.where(ddos_mask)[0]:
+        score[i] += 50
+        reasons[i].append("疑似DDoS攻击(高包速/高带宽)")
+
+    # 12) Slowloris：长连接且速率极低
+    slowloris_mask = (flow_duration >= params["SLOWLORIS_DURATION"]) & (flow_rate <= params["SLOWLORIS_BPS_MAX"])
+    for i in np.where(slowloris_mask)[0]:
+        score[i] += 30
+        reasons[i].append("疑似Slowloris攻击")
+
+    # 13) IP 欺骗：同一目标对应来源 IP 非常多
+    if "unique_src_ips" in df.columns:
+        spoof_mask = unique_src_ips >= params["IP_SPOOF_SRC_VARIETY"]
+        for i in np.where(spoof_mask)[0]:
+            score[i] += 40
+            reasons[i].append("疑似IP欺骗(来源IP异常多)")
+
+    # 14) ARP 欺骗：ARP 协议且包速高
+    arp_mask = proto_upper.eq("ARP") & (flow_pkts_per_s >= params["ARP_PPS_HI"])
+    for i in np.where(arp_mask)[0]:
+        score[i] += 50
+        reasons[i].append("疑似ARP欺骗攻击")
+
+    # 15) DNS 放大：请求小但响应巨大
+    dns_mask = proto_upper.eq("DNS")
+    dns_amp_mask = dns_mask & (total_len_fwd_pkts <= params["DNS_REQ_BYTES_MAX"]) & (total_len_bwd_pkts >= params["DNS_RESP_BYTES_MIN"])
+    for i in np.where(dns_amp_mask)[0]:
+        score[i] += 40
+        reasons[i].append("疑似DNS放大攻击")
+
+    # 16) 额外的外泄提示：上行占比极高
+    if _exists(df, ["flow_bytes", "flow_up_bytes"]):
+        total = flow_bytes.to_numpy()
+        up_bytes = flow_up_bytes.to_numpy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            strict_ratio = np.divide(up_bytes, total, out=np.zeros(n, dtype=np.float32), where=total > 0)
+        strict_mask = (total > 0) & (strict_ratio >= params["EXFIL_STRICT_UP_RATIO"])
+        for i in np.where(strict_mask)[0]:
+            score[i] += 30
+            reasons[i].append("上行占比极高(强烈外泄信号)")
+
+    # 17) 大文件 FTP 传输
+    ftp_mask = proto_upper.eq("FTP") & (total_len_fwd_pkts + total_len_bwd_pkts >= params["FTP_LARGE_TRANSFER"])
+    for i in np.where(ftp_mask)[0]:
+        score[i] += 60
+        reasons[i].append("FTP大文件传输(疑似外泄)")
+
+    # 18) 行内端口扫描/IP 扫描字段支持
+    if "unique_dst_ports" in df.columns:
+        dst_port_mask = unique_dst_ports >= params["UNIQUE_DST_PORTS"]
+        for i in np.where(dst_port_mask)[0]:
+            score[i] += 40
+            reasons[i].append("疑似端口扫描(多端口)")
+
+    if "unique_dst_ips" in df.columns:
+        dst_ip_mask = unique_dst_ips >= params["UNIQUE_DST_IPS"]
+        for i in np.where(dst_ip_mask)[0]:
+            score[i] += 40
+            reasons[i].append("疑似IP扫描(多目标)")
+
+    # 19) 突发流量：短时高带宽
+    spike_short_mask = (flow_rate >= params["TRAFFIC_SPIKE_BPS"]) & (flow_duration > 0) & (flow_duration <= params["TRAFFIC_SPIKE_DURATION"])
+    for i in np.where(spike_short_mask)[0]:
+        score[i] += 50
+        reasons[i].append("短时流量突增")
+
+    # 20) 协议异常：非常见协议高速率
+    common_proto = {"TCP", "UDP"}
+    unusual_proto_mask = ~proto_upper.isin(common_proto) & (flow_pkts_per_s >= params["UNUSUAL_PROTO_PPS"])
+    for i in np.where(unusual_proto_mask)[0]:
+        score[i] += 30
+        reasons[i].append("非常见协议高频通信")
+
+    # 21) 会话持续时间异常
+    short_session_mask = (flow_duration > 0) & (flow_duration < params["SHORT_SESSION_DURATION"])
+    for i in np.where(short_session_mask)[0]:
+        score[i] += 20
+        reasons[i].append("会话持续时间过短")
+
+    long_session_mask = flow_duration >= params["LONG_SESSION_DURATION"]
+    for i in np.where(long_session_mask)[0]:
+        score[i] += 20
+        reasons[i].append("会话持续时间过长")
 
     # 归一 & 文本
     score = np.clip(score, 0, 100).astype(np.float32)
