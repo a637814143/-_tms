@@ -775,10 +775,15 @@ def _build_detection_result(
     label_mapping: Optional[Dict[int, str]],
     flows: List[Dict[str, object]],
     path: Union[str, Path],
+    *,
+    vectorized: Optional[VectorizationResult] = None,
+    predictions: Optional[Sequence[object]] = None,
+    scores: Optional[Sequence[float]] = None,
 ) -> DetectionResult:
-    vectorized: VectorizationResult = vectorize_flows(
-        flows, feature_names=feature_names, include_labels=False
-    )
+    if vectorized is None:
+        vectorized = vectorize_flows(
+            flows, feature_names=feature_names, include_labels=False
+        )
 
     if vectorized.flow_count == 0:
         return DetectionResult(
@@ -793,21 +798,39 @@ def _build_detection_result(
         )
 
     X = vectorized.matrix
-    scores, pos_info = _predict_positive_scores(model, X, label_mapping)
 
-    predictions = model.predict(X)
+    computed_scores: np.ndarray
+    if scores is None:
+        computed_scores, _ = _predict_positive_scores(model, X, label_mapping)
+    else:
+        computed_scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+
+    predicted_values: np.ndarray
+    if predictions is None:
+        predicted_values = np.asarray(model.predict(X)).reshape(-1)
+    else:
+        predicted_values = np.asarray(predictions).reshape(-1)
+
+    if predicted_values.shape[0] != vectorized.flow_count:
+        raise ValueError("prediction count does not match flow count")
+
+    if computed_scores.shape[0] != vectorized.flow_count:
+        raise ValueError("score count does not match flow count")
+
     prediction_labels: List[str] = []
     if label_mapping:
-        for value in predictions:
+        for value in predicted_values:
             prediction_labels.append(label_mapping.get(int(value), str(value)))
     else:
-        prediction_labels = [str(value) for value in predictions]
+        prediction_labels = [str(value) for value in predicted_values]
 
-    status_labels, _, _, _ = summarize_prediction_labels(predictions, label_mapping)
+    status_labels, _, _, _ = summarize_prediction_labels(
+        predicted_values, label_mapping
+    )
 
     annotated_flows: List[Dict[str, object]] = []
     for flow, label, label_name, score, status in zip(
-        flows, predictions, prediction_labels, scores, status_labels
+        flows, predicted_values, prediction_labels, computed_scores, status_labels
     ):
         annotated = dict(flow)
         annotated["prediction"] = int(label)
@@ -822,8 +845,8 @@ def _build_detection_result(
         success=True,
         flow_count=len(flows),
         feature_names=feature_names,
-        predictions=[int(value) for value in predictions],
-        scores=[float(value) for value in scores],
+        predictions=[int(value) for value in predicted_values],
+        scores=[float(value) for value in computed_scores],
         flows=annotated_flows,
         prediction_labels=prediction_labels,
     )
@@ -974,8 +997,10 @@ class ModelPredictor:
         )
 
     def predict_matrix(self, matrix: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Predict class labels and anomaly scores for a batch of samples."""
+
         model = self.model
-        predictions = model.predict(matrix)
+        predictions = np.asarray(model.predict(matrix)).reshape(-1)
 
         scores, _ = _predict_positive_scores(model, matrix, self.label_mapping)
 
@@ -983,12 +1008,24 @@ class ModelPredictor:
 
     def predict_flows(self, flows: Iterable[Dict[str, object]], *, path: Union[str, Path] = "memory") -> DetectionResult:
         flow_list = [dict(flow) for flow in flows]
+        vectorized = vectorize_flows(
+            flow_list, feature_names=self.feature_names, include_labels=False
+        )
+
+        if vectorized.flow_count > 0:
+            predictions, scores = self.predict_matrix(vectorized.matrix)
+        else:
+            predictions, scores = None, None
+
         return _build_detection_result(
             self.model,
             self.feature_names,
             self.label_mapping,
             flow_list,
             path,
+            vectorized=vectorized,
+            predictions=predictions,
+            scores=scores,
         )
 
     def detect_pcap(self, pcap_path: Union[str, Path]) -> DetectionResult:
