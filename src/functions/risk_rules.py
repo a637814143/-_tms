@@ -5,7 +5,7 @@
 """
 import numpy as np
 import pandas as pd
-from typing import Tuple, List, Dict
+from typing import Iterable, Optional, Tuple, List, Dict
 
 # 可调阈值（按你数据规模可再微调）
 DEFAULTS = dict(
@@ -44,6 +44,11 @@ DEFAULTS = dict(
 
 # 规则判定异常时的默认触发阈值
 DEFAULT_TRIGGER_THRESHOLD = 60.0
+
+# 模型与规则融合的默认权重与阈值
+DEFAULT_MODEL_WEIGHT = 0.6
+DEFAULT_RULE_WEIGHT = 0.4
+DEFAULT_FUSION_THRESHOLD = 0.5
 
 def _to_float(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").fillna(0.0).astype(np.float32)
@@ -282,3 +287,59 @@ def score_rules(df: pd.DataFrame, params: Dict=None) -> Tuple[pd.Series, pd.Seri
     score = np.clip(score, 0, 100).astype(np.float32)
     reason_str = pd.Series(["; ".join(r) for r in reasons], index=df.index)
     return pd.Series(score, index=df.index, name="rules_score"), reason_str.rename("rules_reasons")
+
+
+def fuse_model_rule_votes(
+    model_flags: Iterable[object],
+    rule_scores: Optional[Iterable[object]],
+    *,
+    model_weight: float = DEFAULT_MODEL_WEIGHT,
+    rule_weight: float = DEFAULT_RULE_WEIGHT,
+    threshold: float = DEFAULT_FUSION_THRESHOLD,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Combine模型预测标记与规则得分，返回融合分数与最终判定。"""
+
+    model_arr = np.asarray(model_flags, dtype=np.float64).reshape(-1)
+    if model_arr.size == 0:
+        empty = np.zeros(0, dtype=np.float64)
+        return empty, empty.astype(bool)
+
+    model_arr = np.clip(model_arr, 0.0, 1.0)
+
+    normalized_rules: np.ndarray
+    active_rule_weight = float(rule_weight)
+
+    if rule_scores is None:
+        normalized_rules = np.zeros_like(model_arr)
+        active_rule_weight = 0.0
+    else:
+        try:
+            rule_arr = np.asarray(rule_scores, dtype=np.float64).reshape(-1)
+        except Exception:
+            rule_arr = None
+
+        if rule_arr is None or rule_arr.size == 0:
+            normalized_rules = np.zeros_like(model_arr)
+            active_rule_weight = 0.0
+        else:
+            if rule_arr.size != model_arr.size:
+                if rule_arr.size < model_arr.size:
+                    padded = np.zeros_like(model_arr)
+                    padded[: rule_arr.size] = rule_arr
+                    rule_arr = padded
+                else:
+                    rule_arr = rule_arr[: model_arr.size]
+            normalized_rules = np.clip(rule_arr / 100.0, 0.0, 1.0)
+
+    total_weight = float(model_weight + active_rule_weight)
+    if not np.isfinite(total_weight) or total_weight <= 0.0:
+        model_w = 1.0
+        rule_w = 0.0
+    else:
+        model_w = float(model_weight) / total_weight
+        rule_w = float(active_rule_weight) / total_weight
+
+    fused_scores = model_w * model_arr + rule_w * normalized_rules
+    fused_flags = fused_scores >= float(threshold)
+
+    return fused_scores, fused_flags
