@@ -1009,6 +1009,30 @@ def _align_input_features(
 
 # =============== 主 UI ===============
 class Ui_MainWindow(object):
+    _ANOMALY_HINTS = {
+        "异常",
+        "恶意",
+        "malicious",
+        "anomaly",
+        "attack",
+        "threat",
+        "abnormal",
+        "可疑",
+        "suspect",
+        "intrusion",
+    }
+
+    _NORMAL_HINTS = {
+        "正常",
+        "normal",
+        "benign",
+        "legit",
+        "legitimate",
+        "safe",
+        "良性",
+        "clean",
+    }
+
     # --------- 基本结构 ----------
     def setupUi(self, MainWindow):
         self._main_window = MainWindow
@@ -3795,6 +3819,125 @@ class Ui_MainWindow(object):
         if pd is None:
             raise RuntimeError("pandas 未安装，无法执行预测。")
 
+        def _status_from_text(value: object) -> Optional[str]:
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text:
+                return None
+            lowered = text.lower()
+            if any(token in lowered for token in self._ANOMALY_HINTS):
+                return "异常"
+            if any(token in lowered for token in self._NORMAL_HINTS):
+                return "正常"
+            return None
+
+        def _status_from_numeric(value: object, positive_classes: Set[int]) -> Optional[str]:
+            if value is None:
+                return None
+            candidates: List[int] = []
+            if isinstance(value, (int, np.integer)):
+                candidates.append(int(value))
+            else:
+                text = str(value).strip()
+                if text:
+                    try:
+                        maybe_float = float(text)
+                    except (TypeError, ValueError):
+                        maybe_float = None
+                    if maybe_float is not None and not math.isnan(maybe_float):
+                        if abs(maybe_float - round(maybe_float)) < 1e-6:
+                            candidates.append(int(round(maybe_float)))
+            if not candidates:
+                return None
+            for candidate in candidates:
+                if candidate in positive_classes:
+                    return "异常"
+            if positive_classes:
+                return "正常"
+            return None
+
+        def _derive_positive_tokens(
+            metadata_obj: Optional[dict],
+            mapping_obj: Optional[Dict[Union[int, str], str]],
+        ) -> Set[str]:
+            tokens = {token for token in self._ANOMALY_HINTS}
+            metadata_obj = metadata_obj or {}
+            raw_label = metadata_obj.get("positive_label")
+            if raw_label:
+                tokens.add(str(raw_label).strip().lower())
+            extra_tokens = metadata_obj.get("positive_keywords")
+            if isinstance(extra_tokens, (list, tuple, set)):
+                for token in extra_tokens:
+                    if token:
+                        tokens.add(str(token).strip().lower())
+            if isinstance(mapping_obj, dict):
+                for label in mapping_obj.values():
+                    status = _status_from_text(label)
+                    if status == "异常":
+                        tokens.add(str(label).strip().lower())
+            return {token for token in tokens if token}
+
+        def _derive_positive_classes(
+            metadata_obj: Optional[dict],
+            mapping_obj: Optional[Dict[Union[int, str], str]],
+        ) -> Set[int]:
+            classes: Set[int] = set()
+            metadata_obj = metadata_obj or {}
+            candidate = metadata_obj.get("positive_class")
+            try:
+                if isinstance(candidate, (int, np.integer)):
+                    classes.add(int(candidate))
+                elif candidate is not None and str(candidate).strip():
+                    classes.add(int(str(candidate).strip()))
+            except (TypeError, ValueError):
+                pass
+            if not classes and isinstance(mapping_obj, dict):
+                for key, label in mapping_obj.items():
+                    status = _status_from_text(label)
+                    if status != "异常":
+                        continue
+                    try:
+                        classes.add(int(key))
+                    except (TypeError, ValueError):
+                        try:
+                            classes.add(int(str(key).strip()))
+                        except (TypeError, ValueError):
+                            continue
+            return classes
+
+        def _derive_row_status(
+            label_value: object,
+            prediction_value: object,
+            *,
+            positive_tokens: Set[str],
+            positive_classes: Set[int],
+        ) -> Optional[str]:
+            status = _status_from_text(label_value)
+            if status is None:
+                status = _status_from_text(prediction_value)
+            if status == "异常":
+                return status
+            if status == "正常":
+                return status
+
+            if label_value is not None:
+                text = str(label_value).strip().lower()
+                if text in positive_tokens:
+                    return "异常"
+            if prediction_value is not None:
+                text = str(prediction_value).strip().lower()
+                if text in positive_tokens:
+                    return "异常"
+
+            numeric_status = _status_from_numeric(prediction_value, positive_classes)
+            if numeric_status is not None:
+                return numeric_status
+            numeric_status = _status_from_numeric(label_value, positive_classes)
+            if numeric_status is not None:
+                return numeric_status
+            return None
+
         def _format_row_messages(frame: "pd.DataFrame") -> List[str]:
             if pd is None or frame is None or not isinstance(frame, pd.DataFrame):
                 return []
@@ -3834,6 +3977,12 @@ class Ui_MainWindow(object):
                 if identifier is None:
                     identifier = f"第{idx + 1}行"
 
+                status_value = row.get("prediction_status")
+                if isinstance(status_value, str) and status_value.strip():
+                    status_prefix = f"[{status_value.strip()}] "
+                else:
+                    status_prefix = ""
+
                 label = row.get("prediction_label")
                 if not label:
                     label = row.get("prediction")
@@ -3851,7 +4000,7 @@ class Ui_MainWindow(object):
                 else:
                     score_text = ""
 
-                messages.append(f"{identifier} -> 预测={label}{score_text}")
+                messages.append(f"{status_prefix}{identifier} -> 预测={label}{score_text}")
 
             return messages
 
@@ -4038,39 +4187,90 @@ class Ui_MainWindow(object):
 
             preds = model.predict(matrix)
 
+            display_labels = [
+                mapping.get(int(value), str(value)) if mapping is not None else str(value)
+                for value in preds
+            ]
+
+            normalized_labels: List[str]
+            anomaly_count: Optional[int]
+            normal_count: Optional[int]
+            status_text: Optional[str]
             if summarize_prediction_labels is not None:
-                labels, anomaly_count, normal_count, status_text = summarize_prediction_labels(
+                normalized_labels, anomaly_count, normal_count, status_text = summarize_prediction_labels(
                     preds,
                     mapping,
                 )
             else:
-                labels = [
-                    mapping.get(int(value), str(value)) if mapping is not None else str(value)
-                    for value in preds
-                ]
-                anomaly_count = None
-                normal_count = None
-                status_text = None
-                if labels:
-                    abnormal = sum(1 for label in labels if str(label) == "异常")
-                    normal = sum(1 for label in labels if str(label) == "正常")
-                    if abnormal:
-                        anomaly_count = abnormal
-                        normal_count = normal
-                        status_text = "异常"
-                    elif normal:
-                        anomaly_count = 0
-                        normal_count = normal
-                        status_text = "正常"
+                normalized_labels = []
+                for label in display_labels:
+                    status = _status_from_text(label)
+                    if status is None:
+                        normalized_labels.append(str(label))
+                    else:
+                        normalized_labels.append(status)
+                anomaly_count = sum(1 for label in normalized_labels if label == "异常") if normalized_labels else 0
+                normal_count = sum(1 for label in normalized_labels if label == "正常") if normalized_labels else 0
+                if anomaly_count:
+                    status_text = "异常"
+                elif normal_count and normal_count == len(normalized_labels):
+                    status_text = "正常"
+                else:
+                    status_text = None
+
+            positive_tokens = _derive_positive_tokens(metadata, mapping)
+            positive_classes = _derive_positive_classes(metadata, mapping)
+
+            row_statuses: List[Optional[str]] = []
+            anomaly_flags: List[bool] = []
+
+            total_predictions = len(preds)
+            for idx in range(total_predictions):
+                label_candidate: Optional[object] = None
+                if normalized_labels and idx < len(normalized_labels):
+                    label_candidate = normalized_labels[idx]
+                status = None
+                if isinstance(label_candidate, str) and label_candidate in {"异常", "正常"}:
+                    status = label_candidate
+                else:
+                    status = _derive_row_status(
+                        label_candidate,
+                        preds[idx],
+                        positive_tokens=positive_tokens,
+                        positive_classes=positive_classes,
+                    )
+                if status is None and display_labels and idx < len(display_labels):
+                    status = _derive_row_status(
+                        display_labels[idx],
+                        preds[idx],
+                        positive_tokens=positive_tokens,
+                        positive_classes=positive_classes,
+                    )
+                if status is None:
+                    status = _status_from_text(preds[idx])
+                if status is None and display_labels and idx < len(display_labels):
+                    status = _status_from_text(display_labels[idx])
+
+                is_anomaly = status == "异常"
+                anomaly_flags.append(is_anomaly)
+                row_statuses.append(status)
+
+            computed_anomalies = sum(1 for flag in anomaly_flags if flag)
+            computed_normals = sum(1 for status in row_statuses if status == "正常")
+            anomaly_count = computed_anomalies
+            normal_count = computed_normals
+            if status_text is None:
+                if computed_anomalies > 0:
+                    status_text = "异常"
+                elif total_predictions and computed_normals == total_predictions:
+                    status_text = "正常"
 
             out_df = df.copy()
             out_df["prediction"] = [int(value) if isinstance(value, (int, np.integer)) else value for value in preds]
-            out_df["prediction_label"] = labels
+            out_df["prediction_label"] = display_labels
             out_df["malicious_score"] = [float(value) for value in np.asarray(scores, dtype=float)]
-            if status_text is not None:
-                out_df["prediction_status"] = [
-                    label if label in {"异常", "正常"} else status_text for label in labels
-                ]
+            if row_statuses:
+                out_df["prediction_status"] = pd.Series(row_statuses, dtype=object)
 
             if output_dir is None:
                 output_dir = self._prediction_out_dir()
@@ -4094,7 +4294,7 @@ class Ui_MainWindow(object):
                     summary_line += f"，正常数量：{int(normal_count)}"
                 summary_lines.append(summary_line)
                 if total_rows:
-                    ratio = float(anomaly_count) / float(total_rows)
+                    ratio = float(anomaly_count) / float(max(total_rows, 1))
             messages.extend(summary_lines)
             if not silent:
                 for msg in summary_lines:
@@ -4116,8 +4316,14 @@ class Ui_MainWindow(object):
                 "normal_count": int(normal_count) if normal_count is not None else None,
                 "predictions": [int(value) if isinstance(value, (int, np.integer)) else value for value in preds],
                 "scores": [float(value) for value in np.asarray(scores, dtype=float)],
-                "labels": labels,
+                "labels": display_labels,
+                "normalized_labels": normalized_labels,
                 "row_messages": row_messages,
+                "anomaly_flags": [bool(flag) for flag in anomaly_flags],
+                "anomaly_indices": [idx for idx, flag in enumerate(anomaly_flags) if flag],
+                "positive_tokens": sorted(positive_tokens),
+                "positive_classes": sorted(positive_classes),
+                "prediction_statuses": row_statuses,
             }
 
         models_dir = self._default_models_dir()
@@ -4500,90 +4706,144 @@ class Ui_MainWindow(object):
         if not isinstance(predictions, (list, tuple)):
             predictions = []
 
-        positive_tokens = {
-            "异常",
-            "恶意",
-            "malicious",
-            "anomaly",
-            "attack",
-            "threat",
-            "abnormal",
-            "positive",
-        }
+        base_tokens: Set[str] = {token.lower() for token in self._ANOMALY_HINTS}
+        raw_tokens = prediction.get("positive_tokens")
+        if isinstance(raw_tokens, (list, tuple, set)):
+            for token in raw_tokens:
+                text = str(token).strip().lower()
+                if text:
+                    base_tokens.add(text)
         meta_label = str(metadata.get("positive_label", "")).strip().lower()
         if meta_label:
-            positive_tokens.add(meta_label)
+            base_tokens.add(meta_label)
 
-        positive_numeric_values: Set[int] = set()
+        positive_classes: Set[int] = set()
+        raw_classes = prediction.get("positive_classes")
+        if isinstance(raw_classes, (list, tuple, set)):
+            for value in raw_classes:
+                try:
+                    positive_classes.add(int(value))
+                except (TypeError, ValueError):
+                    try:
+                        positive_classes.add(int(str(value).strip()))
+                    except (TypeError, ValueError):
+                        continue
         meta_class = metadata.get("positive_class")
-        if isinstance(meta_class, (int, np.integer)):
-            positive_numeric_values.add(int(meta_class))
-        else:
-            try:
-                if meta_class is not None:
-                    positive_numeric_values.add(int(str(meta_class).strip()))
-            except (TypeError, ValueError):
-                pass
-        positive_numeric_values.update({1, -1})
+        try:
+            if isinstance(meta_class, (int, np.integer)):
+                positive_classes.add(int(meta_class))
+            elif meta_class is not None and str(meta_class).strip():
+                positive_classes.add(int(str(meta_class).strip()))
+        except (TypeError, ValueError):
+            pass
 
-        def _value_is_positive(value: object) -> bool:
+        normalized_labels = prediction.get("normalized_labels")
+        if not isinstance(normalized_labels, (list, tuple)):
+            normalized_labels = []
+
+        anomaly_flags = prediction.get("anomaly_flags")
+        if not isinstance(anomaly_flags, (list, tuple)):
+            anomaly_flags = []
+
+        anomaly_indices_payload = prediction.get("anomaly_indices")
+        if not isinstance(anomaly_indices_payload, (list, tuple, set)):
+            anomaly_indices_payload = []
+
+        def _status_from_text(value: object) -> Optional[str]:
             if value is None:
-                return False
+                return None
             text = str(value).strip()
             if not text:
-                return False
-            lower = text.lower()
-            if any(token in lower for token in positive_tokens):
-                return True
-            numeric_value: Optional[int] = None
+                return None
+            lowered = text.lower()
+            if any(token and token in lowered for token in base_tokens):
+                return "异常"
+            if any(token in lowered for token in self._NORMAL_HINTS):
+                return "正常"
+            return None
+
+        def _status_from_numeric(value: object) -> Optional[str]:
+            if value is None or not positive_classes:
+                return None
+            candidates: List[int] = []
             if isinstance(value, (int, np.integer)):
-                numeric_value = int(value)
+                candidates.append(int(value))
             else:
-                try:
-                    maybe_float = float(text)
-                except (TypeError, ValueError):
-                    maybe_float = None
-                if maybe_float is not None and not math.isnan(maybe_float):
-                    if abs(maybe_float - round(maybe_float)) < 1e-6:
-                        numeric_value = int(round(maybe_float))
-            if numeric_value is not None and numeric_value in positive_numeric_values:
-                return True
-            return False
+                text = str(value).strip()
+                if text:
+                    try:
+                        maybe_float = float(text)
+                    except (TypeError, ValueError):
+                        maybe_float = None
+                    if maybe_float is not None and not math.isnan(maybe_float):
+                        if abs(maybe_float - round(maybe_float)) < 1e-6:
+                            candidates.append(int(round(maybe_float)))
+            if not candidates:
+                return None
+            for candidate in candidates:
+                if candidate in positive_classes:
+                    return "异常"
+            return "正常"
 
         indices: List[int] = []
-        if frame is not None and not frame.empty:
+        if anomaly_flags:
+            for idx, flag in enumerate(anomaly_flags):
+                try:
+                    is_positive = bool(flag)
+                except Exception:
+                    is_positive = False
+                if is_positive:
+                    indices.append(idx)
+
+        if not indices and anomaly_indices_payload:
+            for value in anomaly_indices_payload:
+                try:
+                    idx = int(value)
+                except (TypeError, ValueError):
+                    try:
+                        idx = int(str(value).strip())
+                    except (TypeError, ValueError):
+                        continue
+                if idx >= 0:
+                    indices.append(idx)
+
+        if not indices and frame is not None and not frame.empty:
             try:
                 if "prediction_status" in frame.columns:
-                    status_mask = (
-                        frame["prediction_status"].astype(str).str.contains("异常", na=False)
-                    )
-                    indices = [
-                        idx for idx, flag in enumerate(status_mask.to_numpy()) if bool(flag)
-                    ]
+                    status_mask = frame["prediction_status"].astype(str).str.contains("异常", na=False)
+                    indices = [idx for idx, flag in enumerate(status_mask.to_numpy()) if bool(flag)]
                 if not indices and "prediction_label" in frame.columns:
-                    label_mask = frame["prediction_label"].astype(str).str.lower().apply(
-                        lambda text: any(token in text for token in positive_tokens)
-                    )
-                    indices = [
-                        idx for idx, flag in enumerate(label_mask.to_numpy()) if bool(flag)
-                    ]
+                    label_series = frame["prediction_label"].astype(str)
+                    label_mask = label_series.apply(lambda text: _status_from_text(text) == "异常")
+                    indices = [idx for idx, flag in enumerate(label_mask.to_numpy()) if bool(flag)]
                 if not indices and "prediction" in frame.columns:
-                    pred_mask = frame["prediction"].apply(_value_is_positive)
-                    indices = [
-                        idx for idx, flag in enumerate(pred_mask.to_numpy()) if bool(flag)
-                    ]
+                    pred_series = frame["prediction"].apply(
+                        lambda value: (
+                            _status_from_text(value)
+                            or _status_from_numeric(value)
+                        ) == "异常"
+                    )
+                    indices = [idx for idx, flag in enumerate(pred_series.to_numpy()) if bool(flag)]
             except Exception:
                 indices = []
 
+        if not indices and normalized_labels:
+            for idx, label in enumerate(normalized_labels):
+                if _status_from_text(label) == "异常":
+                    indices.append(idx)
+
         if not indices and labels:
             for idx, label in enumerate(labels):
-                if _value_is_positive(label):
+                if _status_from_text(label) == "异常":
                     indices.append(idx)
 
         if not indices and predictions:
             for idx, value in enumerate(predictions):
-                if _value_is_positive(value):
+                status = _status_from_text(value) or _status_from_numeric(value)
+                if status == "异常":
                     indices.append(idx)
+
+        indices = sorted({idx for idx in indices if isinstance(idx, int) and idx >= 0})
 
         if not indices:
             return ([], 0)
@@ -4686,7 +4946,8 @@ class Ui_MainWindow(object):
         total = len(paths)
         successes = 0
         total_rows = 0
-        total_malicious = 0
+        total_anomaly_flows = 0
+        anomaly_file_count = 0
         anomaly_samples: List[str] = []
         failed: List[Tuple[str, str]] = []
 
@@ -4737,6 +4998,7 @@ class Ui_MainWindow(object):
                     total_rows += int(prediction.get("total", 0))  # type: ignore[arg-type]
                 except Exception:
                     pass
+
                 sample_lines, sample_count = self._collect_anomaly_details(
                     prediction,
                     source_name=source_name,
@@ -4744,10 +5006,21 @@ class Ui_MainWindow(object):
                 )
                 if sample_lines:
                     anomaly_samples.extend(sample_lines)
-                try:
-                    total_malicious += int(prediction.get("malicious", sample_count))
-                except Exception:
-                    total_malicious += sample_count
+                anomaly_flow_count = 0
+                flags_payload = prediction.get("anomaly_flags")
+                if isinstance(flags_payload, (list, tuple)):
+                    try:
+                        anomaly_flow_count = sum(1 for flag in flags_payload if bool(flag))
+                    except Exception:
+                        anomaly_flow_count = 0
+                if anomaly_flow_count == 0:
+                    try:
+                        anomaly_flow_count = int(prediction.get("malicious", sample_count))
+                    except Exception:
+                        anomaly_flow_count = sample_count
+                if anomaly_flow_count > 0:
+                    anomaly_file_count += 1
+                total_anomaly_flows += max(anomaly_flow_count, 0)
 
             if successes == 0:
                 error_lines = [f"- {os.path.basename(path)}: {reason}" for path, reason in failed[:5]]
@@ -4764,7 +5037,8 @@ class Ui_MainWindow(object):
                 f"共处理 PCAP 文件：{total} 个",
                 f"成功：{successes} 个，失败：{total - successes} 个",
                 f"累计检测流量：{total_rows} 条",
-                f"检测到异常：{total_malicious} 条",
+                f"检测到异常包：{anomaly_file_count} 个",
+                f"累计异常流量：{total_anomaly_flows} 条",
             ]
             if failed:
                 sample = "; ".join(

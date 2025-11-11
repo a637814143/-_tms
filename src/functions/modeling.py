@@ -1131,7 +1131,7 @@ def summarize_prediction_labels(
             inferred = _interpret_label_value(value)
             if inferred == "异常":
                 anomaly_count += 1
-            elif inferred == "正":
+            elif inferred == "正常":
                 normal_count += 1
 
     status_text: Optional[str]
