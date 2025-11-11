@@ -28,6 +28,20 @@ from .vectorizer import (
     vectorize_flows,
 )
 
+try:  # pandas 在预测阶段可选
+    import pandas as pd  # type: ignore
+except Exception:  # pragma: no cover - 预测模块可在无 pandas 环境运行
+    pd = None  # type: ignore
+
+try:  # 规则引擎不是硬依赖
+    from .risk_rules import (  # type: ignore
+        DEFAULT_TRIGGER_THRESHOLD,
+        score_rules as apply_risk_rules,
+    )
+except Exception:  # pragma: no cover - 缺少依赖时退化
+    apply_risk_rules = None  # type: ignore
+    DEFAULT_TRIGGER_THRESHOLD = 60.0  # type: ignore
+
 __all__ = [
     "DEFAULT_MODEL_PARAMS",
     "MODEL_SCHEMA_VERSION",
@@ -828,9 +842,29 @@ def _build_detection_result(
         predicted_values, label_mapping
     )
 
+    rule_scores: Optional[np.ndarray] = None
+    rule_reasons: Optional[List[str]] = None
+    rule_flags: Optional[np.ndarray] = None
+    if pd is not None and apply_risk_rules is not None and flows:
+        try:
+            frame = pd.DataFrame(flows)
+        except Exception:
+            frame = None
+        if frame is not None and not frame.empty:
+            try:
+                score_series, reason_series = apply_risk_rules(frame)
+            except Exception:
+                score_series = None
+                reason_series = None
+            if score_series is not None:
+                rule_scores = np.asarray(score_series, dtype=np.float64).reshape(-1)
+                if reason_series is not None:
+                    rule_reasons = [str(value) if value is not None else "" for value in reason_series.tolist()]
+                rule_flags = rule_scores >= float(DEFAULT_TRIGGER_THRESHOLD)
+
     annotated_flows: List[Dict[str, object]] = []
-    for flow, label, label_name, score, status in zip(
-        flows, predicted_values, prediction_labels, computed_scores, status_labels
+    for index, (flow, label, label_name, score, status) in enumerate(
+        zip(flows, predicted_values, prediction_labels, computed_scores, status_labels)
     ):
         annotated = dict(flow)
         annotated["prediction"] = int(label)
@@ -838,6 +872,17 @@ def _build_detection_result(
         annotated["malicious_score"] = float(score)
         if status in {"异常", "正常"}:
             annotated["prediction_status"] = status
+        if rule_scores is not None and index < rule_scores.shape[0]:
+            annotated["rules_score"] = float(rule_scores[index])
+            triggered = bool(rule_flags[index]) if rule_flags is not None and index < rule_flags.shape[0] else bool(
+                rule_scores[index] >= float(DEFAULT_TRIGGER_THRESHOLD)
+            )
+            if triggered:
+                annotated["rules_triggered"] = True
+            if rule_reasons is not None and index < len(rule_reasons):
+                reason_value = rule_reasons[index]
+                if reason_value:
+                    annotated["rules_reasons"] = reason_value
         annotated_flows.append(annotated)
 
     return DetectionResult(

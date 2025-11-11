@@ -70,6 +70,15 @@ try:
 except Exception:
     pd = None
 
+try:
+    from src.functions.risk_rules import (
+        DEFAULT_TRIGGER_THRESHOLD,
+        score_rules as apply_risk_rules,
+    )
+except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
+    apply_risk_rules = None  # type: ignore
+    DEFAULT_TRIGGER_THRESHOLD = 60.0  # type: ignore
+
 
 # ---- 简化的通用工具（保持在单文件中）----
 
@@ -1033,12 +1042,29 @@ class Ui_MainWindow(object):
         "clean",
     }
 
+    _ACTION_HANDLER_MAP = {
+        "btn_view": "_on_view_info",
+        "btn_fe": "_on_extract_features",
+        "btn_vector": "_on_preprocess_features",
+        "btn_train": "_on_train_model",
+        "btn_analysis": "_on_run_analysis",
+        "btn_predict": "_on_predict",
+        "btn_export": "_on_export_results",
+        "btn_open_results": "_open_results_dir",
+        "btn_view_logs": "_open_logs_dir",
+        "btn_clear": "_on_clear",
+        "btn_export_report": "_on_export_report",
+        "btn_config_editor": "_open_config_editor_dialog",
+        "btn_online_toggle": "_toggle_online_detection",
+    }
+
     # --------- 基本结构 ----------
     def setupUi(self, MainWindow):
         self._main_window = MainWindow
         MainWindow.setObjectName("MainWindow")
         MainWindow.resize(1400, 840)
         MainWindow.setStyleSheet(APP_STYLE)
+        self._action_bindings_verified = False
 
         self.centralwidget = QtWidgets.QWidget(MainWindow)
         self.main_layout = QtWidgets.QVBoxLayout(self.centralwidget)
@@ -1915,6 +1941,32 @@ class Ui_MainWindow(object):
         QtWidgets.QMessageBox.warning(parent_widget, "在线检测任务失败", message)
         self.online_status_label.setText(f"检测任务失败：{message}")
 
+    def _verify_action_bindings(self) -> None:
+        mapping = getattr(self, "_ACTION_HANDLER_MAP", {})
+        if not mapping:
+            return
+        issues: List[str] = []
+        for button_attr, handler_name in mapping.items():
+            button = getattr(self, button_attr, None)
+            handler = getattr(self, handler_name, None)
+            if button is None:
+                issues.append(f"缺少按钮 {button_attr}")
+                continue
+            if not callable(handler):
+                issues.append(f"{button_attr} 未实现处理函数 {handler_name}")
+                continue
+            try:
+                button.setProperty("action_handler", handler_name)
+                if not button.toolTip():
+                    button.setToolTip(f"点击执行：{button.text()}")
+            except Exception:
+                pass
+        if issues:
+            message = "；".join(issues)
+            self.display_result(f"[WARN] 功能绑定检查未通过：{message}")
+        else:
+            self._action_bindings_verified = True
+
     def _bind_signals(self):
         self.btn_pick_file.clicked.connect(self._choose_file)
         self.btn_pick_dir.clicked.connect(self._choose_dir)
@@ -1949,6 +2001,8 @@ class Ui_MainWindow(object):
         self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
         self.output_list.itemDoubleClicked.connect(self._on_output_double_click)
         self.table_view.doubleClicked.connect(self._on_table_double_click)
+
+        self._verify_action_bindings()
 
     # --------- 路径小工具 ----------
     _PATH_RESOLVERS = {
@@ -4000,7 +4054,29 @@ class Ui_MainWindow(object):
                 else:
                     score_text = ""
 
-                messages.append(f"{status_prefix}{identifier} -> 预测={label}{score_text}")
+                rule_note = ""
+                if "rules_triggered" in frame.columns or "rule_triggered" in frame.columns:
+                    triggered_value = row.get("rules_triggered")
+                    if triggered_value is None:
+                        triggered_value = row.get("rule_triggered")
+                    try:
+                        triggered_bool = bool(int(triggered_value))
+                    except Exception:
+                        triggered_bool = bool(triggered_value)
+                    if triggered_bool:
+                        score_value = row.get("rules_score")
+                        try:
+                            rule_score_text = f" 规则分={float(score_value):.1f}"
+                        except Exception:
+                            rule_score_text = ""
+                        reason_value = row.get("rules_reasons")
+                        reason_text = str(reason_value).strip() if reason_value is not None else ""
+                        if reason_text:
+                            rule_note = f" [规则]{reason_text}{rule_score_text}"
+                        else:
+                            rule_note = f" [规则命中]{rule_score_text}"
+
+                messages.append(f"{status_prefix}{identifier} -> 预测={label}{score_text}{rule_note}")
 
             return messages
 
@@ -4266,11 +4342,38 @@ class Ui_MainWindow(object):
                     status_text = "正常"
 
             out_df = df.copy()
+            rule_threshold_raw = None
+            if isinstance(metadata, dict):
+                rule_threshold_raw = metadata.get("rule_threshold")
+            rule_threshold = float(rule_threshold_raw) if rule_threshold_raw not in (None, "") else float(DEFAULT_TRIGGER_THRESHOLD)
+            rule_scores_series = None
+            rule_reasons_series = None
+            rule_flags = np.zeros(total_predictions, dtype=bool)
+            if apply_risk_rules is not None and pd is not None and total_predictions:
+                try:
+                    score_series, reason_series = apply_risk_rules(out_df)
+                except Exception:
+                    score_series = None
+                    reason_series = None
+                if score_series is not None:
+                    try:
+                        rule_scores_series = score_series.astype(float, copy=False)
+                    except Exception:
+                        rule_scores_series = pd.Series(score_series, dtype=float)
+                    rule_flags = rule_scores_series.to_numpy(dtype=float) >= rule_threshold
+                    if reason_series is not None:
+                        rule_reasons_series = reason_series.astype(str, copy=False)
+
             out_df["prediction"] = [int(value) if isinstance(value, (int, np.integer)) else value for value in preds]
             out_df["prediction_label"] = display_labels
             out_df["malicious_score"] = [float(value) for value in np.asarray(scores, dtype=float)]
             if row_statuses:
                 out_df["prediction_status"] = pd.Series(row_statuses, dtype=object)
+            if rule_scores_series is not None:
+                out_df["rules_score"] = rule_scores_series
+                out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
+                if rule_reasons_series is not None:
+                    out_df["rules_reasons"] = rule_reasons_series
 
             if output_dir is None:
                 output_dir = self._prediction_out_dir()
@@ -4281,6 +4384,19 @@ class Ui_MainWindow(object):
             out_df.to_csv(out_csv, index=False, encoding="utf-8")
 
             total_rows = int(len(out_df))
+            if rule_flags.any():
+                for idx, triggered in enumerate(rule_flags):
+                    if bool(triggered):
+                        anomaly_flags[idx] = True
+                        if idx < len(row_statuses) and row_statuses[idx] != "异常":
+                            row_statuses[idx] = "异常"
+                anomaly_count = sum(1 for flag in anomaly_flags if flag)
+                normal_count = sum(1 for status in row_statuses if status == "正常")
+                if anomaly_count:
+                    status_text = "异常"
+
+            out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
+
             summary_lines = [
                 f"模型预测完成：{source_name}",
                 f"输出行数：{total_rows}",
@@ -4295,6 +4411,11 @@ class Ui_MainWindow(object):
                 summary_lines.append(summary_line)
                 if total_rows:
                     ratio = float(anomaly_count) / float(max(total_rows, 1))
+            rule_hits = int(rule_flags.sum()) if rule_flags.size else 0
+            if rule_hits:
+                summary_lines.append(
+                    f"规则命中：{rule_hits} 条 (阈值 {rule_threshold:.1f})"
+                )
             messages.extend(summary_lines)
             if not silent:
                 for msg in summary_lines:
@@ -4324,6 +4445,9 @@ class Ui_MainWindow(object):
                 "positive_tokens": sorted(positive_tokens),
                 "positive_classes": sorted(positive_classes),
                 "prediction_statuses": row_statuses,
+                "rule_flags": [bool(flag) for flag in rule_flags],
+                "rule_threshold": rule_threshold,
+                "rule_hits": rule_hits,
             }
 
         models_dir = self._default_models_dir()
@@ -4436,15 +4560,50 @@ class Ui_MainWindow(object):
             )
 
         out_df = df.copy()
+        pred_array = np.asarray(preds)
+        model_flags = np.zeros(pred_array.shape[0], dtype=bool)
+        try:
+            model_flags = pred_array.astype(int) == -1
+        except Exception:
+            model_flags = np.array([str(value).strip() in {"-1", "异常"} for value in pred_array], dtype=bool)
+
+        rule_threshold_raw = metadata.get("rule_threshold") if isinstance(metadata, dict) else None
+        rule_threshold = float(rule_threshold_raw) if rule_threshold_raw not in (None, "") else float(DEFAULT_TRIGGER_THRESHOLD)
+        rule_scores_series = None
+        rule_reasons_series = None
+        total = int(len(out_df))
+        rule_flags = np.zeros(total, dtype=bool)
+        if apply_risk_rules is not None and pd is not None and total:
+            try:
+                score_series, reason_series = apply_risk_rules(out_df)
+            except Exception:
+                score_series = None
+                reason_series = None
+            if score_series is not None:
+                try:
+                    rule_scores_series = score_series.astype(float, copy=False)
+                except Exception:
+                    rule_scores_series = pd.Series(score_series, dtype=float)
+                rule_flags = rule_scores_series.to_numpy(dtype=float) >= rule_threshold
+                if reason_series is not None:
+                    rule_reasons_series = reason_series.astype(str, copy=False)
+
         out_df["prediction"] = preds
-        out_df["is_malicious"] = (preds == -1).astype(int)
         out_df["anomaly_score"] = scores
         out_df["anomaly_confidence"] = risk_score
         out_df["vote_ratio"] = vote_ratio
         out_df["risk_score"] = risk_score
+        out_df["model_anomaly"] = pd.Series(model_flags.astype(int), dtype=int)
+        if rule_scores_series is not None:
+            out_df["rules_score"] = rule_scores_series
+            out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
+            if rule_reasons_series is not None:
+                out_df["rules_reasons"] = rule_reasons_series
 
-        malicious = int(out_df["is_malicious"].sum())
-        total = int(len(out_df))
+        combined_flags = np.logical_or(model_flags, rule_flags)
+        out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in combined_flags], dtype=int)
+
+        malicious = int(np.count_nonzero(combined_flags))
         ratio = (malicious / total) if total else 0.0
 
         score_min = float(np.min(scores)) if len(scores) else 0.0
@@ -4459,6 +4618,10 @@ class Ui_MainWindow(object):
             f"分数范围：{score_min:.4f} ~ {score_max:.4f}",
             f"平均风险分：{float(risk_score.mean()):.2%}",
         ]
+
+        rule_hits = int(rule_flags.sum()) if total else 0
+        if rule_hits:
+            summary_lines.append(f"规则命中：{rule_hits} 条 (阈值 {rule_threshold:.1f})")
 
         if output_dir is None:
             output_dir = self._prediction_out_dir()
@@ -4485,6 +4648,10 @@ class Ui_MainWindow(object):
             "total": total,
             "ratio": ratio,
             "row_messages": row_messages,
+            "anomaly_flags": [bool(flag) for flag in combined_flags],
+            "rule_flags": [bool(flag) for flag in rule_flags],
+            "rule_threshold": rule_threshold,
+            "rule_hits": rule_hits,
         }
 
 
@@ -4758,6 +4925,10 @@ class Ui_MainWindow(object):
         if not isinstance(anomaly_flags, (list, tuple)):
             anomaly_flags = []
 
+        rule_flags_payload = prediction.get("rule_flags")
+        if not isinstance(rule_flags_payload, (list, tuple)):
+            rule_flags_payload = []
+
         anomaly_indices_payload = prediction.get("anomaly_indices")
         if not isinstance(anomaly_indices_payload, (list, tuple, set)):
             anomaly_indices_payload = []
@@ -4808,6 +4979,15 @@ class Ui_MainWindow(object):
                 if is_positive:
                     indices.append(idx)
 
+        if rule_flags_payload:
+            for idx, flag in enumerate(rule_flags_payload):
+                try:
+                    triggered = bool(flag)
+                except Exception:
+                    triggered = False
+                if triggered:
+                    indices.append(idx)
+
         if not indices and anomaly_indices_payload:
             for value in anomaly_indices_payload:
                 try:
@@ -4837,6 +5017,12 @@ class Ui_MainWindow(object):
                         ) == "异常"
                     )
                     indices = [idx for idx, flag in enumerate(pred_series.to_numpy()) if bool(flag)]
+                if not indices and "rules_triggered" in frame.columns:
+                    try:
+                        rule_mask = frame["rules_triggered"].astype(bool)
+                        indices = [idx for idx, flag in enumerate(rule_mask.to_numpy()) if bool(flag)]
+                    except Exception:
+                        pass
             except Exception:
                 indices = []
 
@@ -4927,7 +5113,25 @@ class Ui_MainWindow(object):
                     if score_float is not None and not math.isnan(score_float)
                     else ""
                 )
-                detail = f"{identifier} -> 预测={label_text}{score_text}"
+                rule_note = ""
+                if "rules_triggered" in frame.columns:
+                    try:
+                        triggered = bool(frame.loc[idx, "rules_triggered"])
+                    except Exception:
+                        triggered = False
+                    if triggered:
+                        rule_score_value = frame.loc[idx, "rules_score"] if "rules_score" in frame.columns else None
+                        try:
+                            rule_score_text = f" 规则分={float(rule_score_value):.1f}"
+                        except Exception:
+                            rule_score_text = ""
+                        reason_value = frame.loc[idx, "rules_reasons"] if "rules_reasons" in frame.columns else None
+                        reason_text = str(reason_value).strip() if reason_value is not None else ""
+                        if reason_text:
+                            rule_note = f" [规则]{reason_text}{rule_score_text}"
+                        else:
+                            rule_note = f" [规则命中]{rule_score_text}"
+                detail = f"{identifier} -> 预测={label_text}{score_text}{rule_note}"
 
             if not detail:
                 detail = f"第{idx + 1}行 -> 预测=异常"
