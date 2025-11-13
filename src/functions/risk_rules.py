@@ -693,83 +693,58 @@ def score_rules(
 
 
 def fuse_model_rule_votes(
-    model_flags: Iterable[object],
+    model_scores: Iterable[object],
     rule_scores: Optional[Iterable[object]],
     *,
-    model_weight: float = DEFAULT_MODEL_WEIGHT,
-    rule_weight: float = DEFAULT_RULE_WEIGHT,
-    threshold: float = DEFAULT_FUSION_THRESHOLD,
     profile: Optional[str] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Combine模型预测标记与规则得分，返回融合分数与最终判定。"""
+    model_weight: Optional[float] = None,
+    rule_weight: Optional[float] = None,
+    threshold: Optional[float] = None,
+    trigger_threshold: Optional[float] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """按档位融合模型分数与规则得分，返回融合分、最终标记与规则触发标记。"""
 
-    if profile is not None:
-        try:
-            settings = get_rule_settings(profile)
-        except Exception:
-            settings = {}
-        else:
-            if isinstance(settings, dict):
-                preset_model = settings.get("model_weight")
-                preset_rule = settings.get("rule_weight")
-                preset_threshold = settings.get("fusion_threshold")
-                if preset_model is not None and model_weight == DEFAULT_MODEL_WEIGHT:
-                    try:
-                        model_weight = float(preset_model)
-                    except (TypeError, ValueError):
-                        pass
-                if preset_rule is not None and rule_weight == DEFAULT_RULE_WEIGHT:
-                    try:
-                        rule_weight = float(preset_rule)
-                    except (TypeError, ValueError):
-                        pass
-                if preset_threshold is not None and threshold == DEFAULT_FUSION_THRESHOLD:
-                    try:
-                        threshold = float(preset_threshold)
-                    except (TypeError, ValueError):
-                        pass
+    selected_profile = (profile or DEFAULT_RULE_PROFILE).strip().lower()
+    if not selected_profile:
+        selected_profile = DEFAULT_RULE_PROFILE
+    preset = PROFILE_PRESETS.get(selected_profile, PROFILE_PRESETS[DEFAULT_RULE_PROFILE])
 
-    model_arr = np.asarray(model_flags, dtype=np.float64).reshape(-1)
+    if trigger_threshold is None:
+        trigger_threshold = float(preset.get("trigger_threshold", DEFAULT_TRIGGER_THRESHOLD))
+    if model_weight is None:
+        model_weight = float(preset.get("model_weight", DEFAULT_MODEL_WEIGHT))
+    if rule_weight is None:
+        rule_weight = float(preset.get("rule_weight", DEFAULT_RULE_WEIGHT))
+    if threshold is None:
+        threshold = float(preset.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
+
+    model_arr = np.asarray(model_scores, dtype=np.float64).reshape(-1)
     if model_arr.size == 0:
         empty = np.zeros(0, dtype=np.float64)
-        return empty, empty.astype(bool)
+        empty_bool = empty.astype(bool)
+        return empty, empty_bool, empty_bool
 
     model_arr = np.clip(model_arr, 0.0, 1.0)
-
-    normalized_rules: np.ndarray
-    active_rule_weight = float(rule_weight)
 
     if rule_scores is None:
         normalized_rules = np.zeros_like(model_arr)
         active_rule_weight = 0.0
+        rule_arr = normalized_rules
     else:
-        try:
-            rule_arr = np.asarray(rule_scores, dtype=np.float64).reshape(-1)
-        except Exception:
-            rule_arr = None
+        rule_arr = np.asarray(rule_scores, dtype=np.float64).reshape(-1)
+        if rule_arr.size != model_arr.size:
+            if rule_arr.size < model_arr.size:
+                padded = np.zeros_like(model_arr)
+                padded[: rule_arr.size] = rule_arr
+                rule_arr = padded
+            else:
+                rule_arr = rule_arr[: model_arr.size]
+        normalized_rules = np.clip(rule_arr / 100.0, 0.0, 1.0)
+        active_rule_weight = float(rule_weight)
 
-        if rule_arr is None or rule_arr.size == 0:
-            normalized_rules = np.zeros_like(model_arr)
-            active_rule_weight = 0.0
-        else:
-            if rule_arr.size != model_arr.size:
-                if rule_arr.size < model_arr.size:
-                    padded = np.zeros_like(model_arr)
-                    padded[: rule_arr.size] = rule_arr
-                    rule_arr = padded
-                else:
-                    rule_arr = rule_arr[: model_arr.size]
-            normalized_rules = np.clip(rule_arr / 100.0, 0.0, 1.0)
+    rules_triggered = (rule_arr >= float(trigger_threshold)).astype(bool)
 
-    total_weight = float(model_weight + active_rule_weight)
-    if not np.isfinite(total_weight) or total_weight <= 0.0:
-        model_w = 1.0
-        rule_w = 0.0
-    else:
-        model_w = float(model_weight) / total_weight
-        rule_w = float(active_rule_weight) / total_weight
+    fused_scores = float(model_weight) * model_arr + float(active_rule_weight) * normalized_rules
+    fused_flags = (fused_scores >= float(threshold)).astype(bool)
 
-    fused_scores = model_w * model_arr + rule_w * normalized_rules
-    fused_flags = fused_scores >= float(threshold)
-
-    return fused_scores, fused_flags
+    return fused_scores, fused_flags, rules_triggered
