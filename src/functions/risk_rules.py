@@ -73,21 +73,21 @@ PROFILE_PRESETS: Dict[str, Dict[str, Any]] = {
         # 触发规则的分数线（规则总分低于它，基本不参与决策）
         "trigger_threshold": 60.0,
         # 模型权重更大，规则只做轻微修正
-        "model_weight": 0.80,
-        "rule_weight": 0.20,
+        "model_weight": 0.85,
+        "rule_weight": 0.15,
         # 融合得分必须比较高才算异常
-        "fusion_threshold": 0.65,
+        "fusion_threshold": 0.70,
         # baseline 模式：只看融合得分
         "mode": "conservative",
     },
     "aggressive": {
-        # 只要规则分数达到 35 就当“很可疑”
-        "trigger_threshold": 35.0,
+        # 只要规则分数达到 30 就当“很可疑”
+        "trigger_threshold": 30.0,
         # 规则权重更高，宁可多报一点
-        "model_weight": 0.50,
-        "rule_weight": 0.50,
+        "model_weight": 0.30,
+        "rule_weight": 0.70,
         # 融合阈值放宽
-        "fusion_threshold": 0.40,
+        "fusion_threshold": 0.35,
         # aggressive 模式：融合得分 OR 强规则命中
         "mode": "aggressive",
     },

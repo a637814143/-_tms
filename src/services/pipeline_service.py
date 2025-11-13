@@ -410,10 +410,7 @@ def _run_prediction(
             )
             normalized_weights = rule_settings.get("normalized_weights")
 
-            effective_rule_threshold = min(
-                float(rule_threshold_value),
-                float(RULE_TRIGGER_THRESHOLD),
-            )
+            effective_rule_threshold = float(rule_threshold_value)
 
             rule_scores_array: Optional[np.ndarray] = None
             rule_reasons_list: Optional[List[str]] = None
@@ -589,10 +586,7 @@ def _run_prediction(
             )
             normalized_weights = rule_settings.get("normalized_weights")
 
-            effective_rule_threshold = min(
-                float(rule_threshold_value),
-                float(RULE_TRIGGER_THRESHOLD),
-            )
+            effective_rule_threshold = float(rule_threshold_value)
 
             rule_scores_array: Optional[np.ndarray] = None
             rule_reasons_list: Optional[List[str]] = None
