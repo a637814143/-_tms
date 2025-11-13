@@ -3224,7 +3224,24 @@ class Ui_MainWindow(object):
             return None
 
         if "prediction_status" in df.columns:
-            export_df = df[df["prediction_status"].astype(str) == "异常"].copy()
+            status_series = df["prediction_status"]
+            if pd is not None:
+                numeric_mask = pd.to_numeric(status_series, errors="coerce") == 1
+                text_mask = (
+                    status_series.astype(str)
+                    .str.strip()
+                    .str.lower()
+                    .isin({"1", "true", "异常", "malicious", "anomaly", "attack"})
+                )
+                mask = (numeric_mask.fillna(False)) | text_mask
+                export_df = df[mask].copy()
+            else:
+                mask = [
+                    str(value).strip().lower()
+                    in {"1", "true", "异常", "malicious", "anomaly", "attack"}
+                    for value in status_series
+                ]
+                export_df = df[mask].copy()
         elif "prediction_label" in df.columns:
             export_df = df[
                 df["prediction_label"].astype(str).str.strip().str.lower().isin(
@@ -4421,10 +4438,17 @@ class Ui_MainWindow(object):
                     identifier = f"第{idx + 1}行"
 
                 status_value = row.get("prediction_status")
+                status_text = ""
                 if isinstance(status_value, str) and status_value.strip():
-                    status_prefix = f"[{status_value.strip()}] "
+                    status_text = status_value.strip()
                 else:
-                    status_prefix = ""
+                    try:
+                        status_int = int(status_value)
+                        status_text = "异常" if status_int else "正常"
+                    except Exception:
+                        if status_value is not None and str(status_value).strip():
+                            status_text = str(status_value).strip()
+                status_prefix = f"[{status_text}] " if status_text else ""
 
                 label = row.get("prediction_label")
                 if not label:
@@ -4820,14 +4844,6 @@ class Ui_MainWindow(object):
                 rules_triggered_array = rules_triggered_array[:total_predictions]
 
             rule_flags = rules_triggered_array
-            fusion_flags_array = np.logical_or(fusion_flags_array, rules_triggered_array)
-            threshold_floor = float(fusion_threshold_value)
-            if math.isfinite(threshold_floor) and rules_triggered_array.any():
-                fusion_scores_array = np.where(
-                    rules_triggered_array,
-                    np.maximum(fusion_scores_array, threshold_floor),
-                    fusion_scores_array,
-                )
 
             final_flags = [bool(flag) for flag in fusion_flags_array[:total_predictions]]
             final_statuses = ["异常" if flag else "正常" for flag in final_flags]
@@ -4835,7 +4851,7 @@ class Ui_MainWindow(object):
 
             anomaly_flags = final_flags
             row_statuses = final_statuses
-            anomaly_count = sum(1 for flag in anomaly_flags if flag)
+            anomaly_count = int(np.count_nonzero(anomaly_flags))
             normal_count = total_predictions - anomaly_count
             if anomaly_count:
                 status_text = "异常"
@@ -4848,7 +4864,7 @@ class Ui_MainWindow(object):
             out_df["model_status"] = pd.Series(model_statuses, dtype=object)
             out_df["model_flag"] = pd.Series(model_flag_values, dtype=int)
             if row_statuses:
-                out_df["prediction_status"] = pd.Series(row_statuses, dtype=object)
+                out_df["fusion_status"] = pd.Series(row_statuses, dtype=object)
             out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
             out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
             if rule_scores_series is not None:
@@ -4856,6 +4872,9 @@ class Ui_MainWindow(object):
                 out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
                 if rule_reasons_series is not None:
                     out_df["rules_reasons"] = rule_reasons_series
+
+            out_df["prediction_status"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
+            out_df["fusion_status"] = pd.Series(row_statuses, dtype=object)
 
             if output_dir is None:
                 output_dir = self._prediction_out_dir()
@@ -4882,7 +4901,7 @@ class Ui_MainWindow(object):
                 summary_lines.append(summary_line)
                 if total_rows:
                     ratio = float(anomaly_count) / float(max(total_rows, 1))
-            rule_hits = int(rule_flags.sum()) if rule_flags.size else 0
+            rule_hits = int(np.count_nonzero(rule_flags)) if rule_flags.size else 0
             if rule_hits:
                 summary_lines.append(
                     f"规则命中：{rule_hits} 条 (阈值 {rule_threshold:.1f})"
@@ -5168,14 +5187,6 @@ class Ui_MainWindow(object):
         elif rules_triggered_array.size > total:
             rules_triggered_array = rules_triggered_array[:total]
         rule_flags = rules_triggered_array
-        fusion_flags_array = np.logical_or(fusion_flags_array, rules_triggered_array)
-        threshold_floor = float(fusion_threshold_value)
-        if math.isfinite(threshold_floor) and rules_triggered_array.any():
-            fusion_scores_array = np.where(
-                rules_triggered_array,
-                np.maximum(fusion_scores_array, threshold_floor),
-                fusion_scores_array,
-            )
         fusion_flags = fusion_flags_array[:total]
         fusion_scores = fusion_scores_array[:total]
         final_statuses = ["异常" if flag else "正常" for flag in fusion_flags]
@@ -5189,7 +5200,8 @@ class Ui_MainWindow(object):
         out_df["model_status"] = pd.Series(model_statuses, dtype=object)
         out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
         out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
-        out_df["prediction_status"] = pd.Series(final_statuses, dtype=object)
+        out_df["prediction_status"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
+        out_df["fusion_status"] = pd.Series(final_statuses, dtype=object)
         if rule_scores_series is not None:
             out_df["rules_score"] = rule_scores_series
             out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
@@ -5214,7 +5226,7 @@ class Ui_MainWindow(object):
             f"平均风险分：{float(risk_score.mean()):.2%}",
         ]
 
-        rule_hits = int(rule_flags.sum()) if total else 0
+        rule_hits = int(np.count_nonzero(rule_flags)) if total else 0
         if rule_hits:
             summary_lines.append(f"规则命中：{rule_hits} 条 (阈值 {rule_threshold:.1f})")
         if rule_profile:
@@ -5650,8 +5662,22 @@ class Ui_MainWindow(object):
         if not indices and frame is not None and not frame.empty:
             try:
                 if "prediction_status" in frame.columns:
-                    status_mask = frame["prediction_status"].astype(str).str.contains("异常", na=False)
-                    indices = [idx for idx, flag in enumerate(status_mask.to_numpy()) if bool(flag)]
+                    status_series = frame["prediction_status"]
+                    if pd is not None:
+                        numeric_mask = pd.to_numeric(status_series, errors="coerce") == 1
+                        text_mask = status_series.astype(str).str.contains("异常", na=False)
+                        fallback_mask = (
+                            status_series.astype(str)
+                            .str.strip()
+                            .str.lower()
+                            .isin({"1", "true", "malicious", "anomaly", "attack"})
+                        )
+                        status_mask = (numeric_mask.fillna(False)) | text_mask | fallback_mask
+                    else:
+                        status_mask = status_series.astype(str).str.lower().isin(
+                            ["1", "true", "异常", "malicious", "anomaly", "attack"]
+                        )
+                    indices = [idx for idx, flag in enumerate(np.asarray(status_mask, dtype=bool)) if bool(flag)]
                 if not indices and "prediction_label" in frame.columns:
                     label_series = frame["prediction_label"].astype(str)
                     label_mask = label_series.apply(lambda text: _status_from_text(text) == "异常")

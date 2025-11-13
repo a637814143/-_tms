@@ -165,11 +165,12 @@ def simple_predict(
         if normalized == "异常":
             anomaly_count += 1
             row["is_malicious"] = "1"
+            row["prediction_status"] = "1"
         else:
             normal_count += 1
             row["is_malicious"] = "0"
+            row["prediction_status"] = "0"
         row["prediction"] = normalized
-        row["prediction_status"] = normalized
         row[score_column] = f"{score:.6f}"
 
     with out_path.open("w", encoding="utf-8", newline="") as handle:
