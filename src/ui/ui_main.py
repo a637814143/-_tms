@@ -1457,6 +1457,7 @@ class Ui_MainWindow(object):
         og.setContentsMargins(12, 10, 12, 10)
         self.output_list = QtWidgets.QListWidget()
         self.output_list.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self._output_paths: Set[str] = set()
         og.addWidget(self.output_list)
         self.left_layout.addWidget(self.out_group, stretch=1)
 
@@ -6146,10 +6147,20 @@ class Ui_MainWindow(object):
     # --------- 输出列表 ----------
 
     def _add_output(self, path):
-        if not path: return
+        if not path:
+            return
+        try:
+            normalized = os.path.abspath(path)
+        except Exception:
+            normalized = path
+        if normalized in getattr(self, "_output_paths", set()):
+            return
+        self._output_paths.add(normalized)
         it = QtWidgets.QListWidgetItem(os.path.basename(path))
-        it.setToolTip(path); it.setData(QtCore.Qt.UserRole, path)
-        self.output_list.addItem(it); self.output_list.scrollToBottom()
+        it.setToolTip(path)
+        it.setData(QtCore.Qt.UserRole, path)
+        self.output_list.addItem(it)
+        self.output_list.scrollToBottom()
 
     def _open_results_dir(self):
         self._reveal_in_folder(self._default_results_dir())
@@ -6293,6 +6304,7 @@ class Ui_MainWindow(object):
                 self._table_model = None
             self.display_tabs.setCurrentWidget(self.results_widget)
             self.output_list.clear()
+            self._output_paths = set()
             self._update_status_message("@2025 恶意流量检测系统")
             self._csv_paged_path = None
             self._csv_total_rows = None

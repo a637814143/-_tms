@@ -271,6 +271,8 @@ def _run_prediction(
         except Exception as exc:  # pragma: no cover - metadata best effort
             logger.warning("Failed to load metadata %s: %s", metadata_path, exc)
 
+    metadata_obj: Dict[str, object] = dict(metadata_payload)
+
     if pipeline_path.lower().endswith(".json"):
         if load_simple_model is None or simple_predict is None:
             raise RuntimeError(
@@ -363,7 +365,6 @@ def _run_prediction(
                     model_flags_bool[idx] = fallback_flag
                     model_statuses.append("异常" if fallback_flag else "正常")
 
-            metadata_obj: Dict[str, object] = {}
             pipeline_meta = pipeline.get("metadata") if isinstance(pipeline, dict) else None
             if isinstance(pipeline_meta, dict):
                 metadata_obj.update(pipeline_meta)
@@ -626,6 +627,9 @@ def _run_prediction(
                 }
             if metadata_obj:
                 result_info["metadata"] = metadata_obj
+
+    if metadata_obj and "metadata" not in result_info:
+        result_info["metadata"] = metadata_obj
 
     log_model_event(
         "cli.predict",
