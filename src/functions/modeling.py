@@ -32,16 +32,18 @@ try:  # 规则引擎不是硬依赖
         DEFAULT_MODEL_WEIGHT,
         DEFAULT_RULE_WEIGHT,
         DEFAULT_FUSION_THRESHOLD,
+        RULE_TRIGGER_THRESHOLD,
         fuse_model_rule_votes,
         get_rule_settings,
         score_rules as apply_risk_rules,
     )
 except Exception:  # pragma: no cover - 缺少依赖时退化
     apply_risk_rules = None  # type: ignore
-    DEFAULT_TRIGGER_THRESHOLD = 60.0  # type: ignore
-    DEFAULT_MODEL_WEIGHT = 0.6  # type: ignore
-    DEFAULT_RULE_WEIGHT = 0.4  # type: ignore
-    DEFAULT_FUSION_THRESHOLD = 0.5  # type: ignore
+    DEFAULT_TRIGGER_THRESHOLD = 40.0  # type: ignore
+    DEFAULT_MODEL_WEIGHT = 0.3  # type: ignore
+    DEFAULT_RULE_WEIGHT = 0.7  # type: ignore
+    DEFAULT_FUSION_THRESHOLD = 0.2  # type: ignore
+    RULE_TRIGGER_THRESHOLD = 25.0  # type: ignore
 
     def get_rule_settings(profile: Optional[str] = None) -> Dict[str, object]:  # type: ignore
         return {
@@ -1212,6 +1214,10 @@ def _build_detection_result(
         rule_config.get("trigger_threshold") if isinstance(rule_config, dict) else None,
         DEFAULT_TRIGGER_THRESHOLD,
     )
+    effective_rule_threshold = min(
+        float(default_rule_threshold),
+        _safe_float(RULE_TRIGGER_THRESHOLD, default_rule_threshold),
+    )
     fusion_model_weight_base = _safe_float(
         rule_config.get("model_weight") if isinstance(rule_config, dict) else None,
         DEFAULT_MODEL_WEIGHT,
@@ -1243,7 +1249,7 @@ def _build_detection_result(
                 rule_scores = np.asarray(score_series, dtype=np.float64).reshape(-1)
                 if reason_series is not None:
                     rule_reasons = [str(value) if value is not None else "" for value in reason_series.tolist()]
-                rule_flags = rule_scores >= float(default_rule_threshold)
+                rule_flags = rule_scores >= float(effective_rule_threshold)
 
     active_rule_weight = (
         float(fusion_rule_weight_base)
@@ -1260,6 +1266,25 @@ def _build_detection_result(
     )
     fusion_scores = np.asarray(fusion_scores, dtype=np.float64).reshape(-1)
     fusion_flags = np.asarray(fusion_flags, dtype=bool).reshape(-1)
+
+    if rule_flags is not None and getattr(rule_flags, "size", 0):
+        rule_bool = np.asarray(rule_flags, dtype=bool).reshape(-1)
+        if rule_bool.size < fusion_flags.size:
+            rule_bool = np.pad(
+                rule_bool,
+                (0, fusion_flags.size - rule_bool.size),
+                constant_values=False,
+            )
+        elif rule_bool.size > fusion_flags.size:
+            rule_bool = rule_bool[: fusion_flags.size]
+        fusion_flags = np.logical_or(fusion_flags, rule_bool)
+        threshold_floor = float(fusion_threshold_value)
+        if np.isfinite(threshold_floor):
+            fusion_scores = np.where(
+                rule_bool,
+                np.maximum(fusion_scores, threshold_floor),
+                fusion_scores,
+            )
 
     final_statuses: List[str] = []
     for idx in range(vectorized.flow_count):
@@ -1291,7 +1316,7 @@ def _build_detection_result(
             triggered = (
                 bool(rule_flags[index])
                 if rule_flags is not None and index < rule_flags.shape[0]
-                else bool(rule_scores[index] >= float(DEFAULT_TRIGGER_THRESHOLD))
+                else bool(rule_scores[index] >= float(effective_rule_threshold))
             )
             if triggered:
                 annotated["rules_triggered"] = True
@@ -1315,7 +1340,7 @@ def _build_detection_result(
     if rule_flags is not None:
         rule_flag_list = [bool(flag) for flag in rule_flags.tolist()]
     elif rule_score_list is not None:
-        rule_flag_list = [score >= float(default_rule_threshold) for score in rule_score_list]
+        rule_flag_list = [score >= float(effective_rule_threshold) for score in rule_score_list]
     else:
         rule_flag_list = None
 

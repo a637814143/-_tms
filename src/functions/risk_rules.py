@@ -58,12 +58,15 @@ DEFAULTS = dict(
 )
 
 # 规则判定异常时的默认触发阈值
-DEFAULT_TRIGGER_THRESHOLD = 60.0
+DEFAULT_TRIGGER_THRESHOLD = 40.0
+
+# 规则触发的兜底高敏感阈值（UI/导出使用）
+RULE_TRIGGER_THRESHOLD = 25.0
 
 # 模型与规则融合的默认权重与阈值
-DEFAULT_MODEL_WEIGHT = 0.6
-DEFAULT_RULE_WEIGHT = 0.4
-DEFAULT_FUSION_THRESHOLD = 0.5
+DEFAULT_MODEL_WEIGHT = 0.3
+DEFAULT_RULE_WEIGHT = 0.7
+DEFAULT_FUSION_THRESHOLD = 0.2
 
 
 def _load_rules_config() -> Dict[str, Any]:
@@ -144,19 +147,19 @@ def _refresh_module_defaults() -> None:
     try:
         DEFAULT_TRIGGER_THRESHOLD = float(settings.get("trigger_threshold", DEFAULT_TRIGGER_THRESHOLD))
     except (TypeError, ValueError):  # pragma: no cover - 兜底
-        DEFAULT_TRIGGER_THRESHOLD = 60.0
+        DEFAULT_TRIGGER_THRESHOLD = 40.0
     try:
         DEFAULT_MODEL_WEIGHT = float(settings.get("model_weight", DEFAULT_MODEL_WEIGHT))
     except (TypeError, ValueError):  # pragma: no cover - 兜底
-        DEFAULT_MODEL_WEIGHT = 0.6
+        DEFAULT_MODEL_WEIGHT = 0.3
     try:
         DEFAULT_RULE_WEIGHT = float(settings.get("rule_weight", DEFAULT_RULE_WEIGHT))
     except (TypeError, ValueError):  # pragma: no cover
-        DEFAULT_RULE_WEIGHT = 0.4
+        DEFAULT_RULE_WEIGHT = 0.7
     try:
         DEFAULT_FUSION_THRESHOLD = float(settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
     except (TypeError, ValueError):  # pragma: no cover
-        DEFAULT_FUSION_THRESHOLD = 0.5
+        DEFAULT_FUSION_THRESHOLD = 0.2
 
 
 try:  # 模块导入时同步一次配置（如果配置可用）
@@ -186,23 +189,66 @@ def score_rules(
     score = np.zeros(n, dtype=np.float32)
     reasons: List[List[str]] = [[] for _ in range(n)]
 
-    # 统一需要的列
-    col = lambda name: _to_float(df[name]) if name in df.columns else pd.Series(np.zeros(n, dtype=np.float32), index=df.index)
-    proto = df["protocol"].astype(str) if "protocol" in df.columns else pd.Series([""]*n)
+    # 统一需要的列（兼容多种命名）
+    col = (
+        lambda name: _to_float(df[name])
+        if name in df.columns
+        else pd.Series(np.zeros(n, dtype=np.float32), index=df.index)
+    )
+    proto = (
+        df["protocol"].astype(str)
+        if "protocol" in df.columns
+        else pd.Series([""] * n, index=df.index)
+    )
     proto_upper = proto.str.upper()
 
-    pps = col("pps")
-    bps = col("bps")
-    pkt_count = col("pkt_count")
-    inter_mean = col("inter_arrival_mean")
-    inter_std  = col("inter_arrival_std")
-    tcp_flags_count = col("tcp_flag_count")
+    # 会话时长
+    flow_duration = col("flow_duration") + col("Flow Duration")
+
+    # 包速：优先用 Flow Packets/s 或 flow_pkts_per_s
+    pps = (
+        col("pps")
+        + col("flow_pkts_per_s")
+        + col("Flow Packets/s")
+        + col("Fwd Packets/s")
+        + col("Bwd Packets/s")
+    )
+
+    # 字节速率：优先用 Flow Bytes/s 或 flow_byts_per_s
+    bps = col("bps") + col("flow_byts_per_s") + col("Flow Bytes/s")
+
+    # 总包数：前向 + 后向
+    pkt_count = (
+        col("pkt_count")
+        + col("Total Fwd Packets")
+        + col("Tot Fwd Pkts")
+        + col("Total Backward Packets")
+        + col("Tot Bwd Pkts")
+    )
+
+    # IAT 统计：flow 级别
+    inter_mean = col("inter_arrival_mean") + col("Flow IAT Mean")
+    inter_std = col("inter_arrival_std") + col("Flow IAT Std")
+
+    # TCP 标志计数：如果没有聚合列，就把各 flag 加起来
+    tcp_flags_count = (
+        col("tcp_flag_count")
+        + col("FIN Flag Count")
+        + col("SYN Flag Count")
+        + col("RST Flag Count")
+        + col("PSH Flag Count")
+        + col("ACK Flag Count")
+        + col("URG Flag Count")
+    )
+
+    # 总字节/上行字节（如果 CSV 没有 flow_bytes/flow_up_bytes，这里仍可能为 0）
     flow_bytes = col("flow_bytes")
     flow_up_bytes = col("flow_up_bytes")
+
+    # 统一速率、平均包长
     flow_rate = col("flow_byts_per_s") if "flow_byts_per_s" in df.columns else bps
-    flow_pkts_per_s = col("flow_pkts_per_s")
-    packet_len_mean = col("packet_length_mean")
-    flow_duration = col("flow_duration")
+    flow_pkts_per_s = col("flow_pkts_per_s") if "flow_pkts_per_s" in df.columns else pps
+    packet_len_mean = col("packet_length_mean") + col("Packet Length Mean")
     unique_ports = col("unique_ports_accessed")
     unique_dst_ports = col("unique_dst_ports")
     unique_dst_ips = col("unique_dst_ips")
@@ -322,7 +368,7 @@ def score_rules(
                 reasons[i].append("HTTP短小高频访问(疑似爆破/批量注入/扫描)")
 
     # === 7) 慢速 DoS / Slowloris 近似：长连接 + 包速极低 ===
-    if "flow_duration" in df.columns:
+    if ("flow_duration" in df.columns) or ("Flow Duration" in df.columns):
         slow_mask = (
             (flow_duration >= params["SLOWLORIS_MIN_DURATION"])
             & (pps > 0)
@@ -351,7 +397,7 @@ def score_rules(
         major_ratio_series >= params["ONEWAY_RATIO"]
     )
     oneway_idx = np.where(oneway_mask.to_numpy())[0]
-    score[oneway_idx] += 15
+    score[oneway_idx] += 50
     for i in oneway_idx:
         reasons[i].append("单向流量占比异常(可能为扫描/单向攻击/隧道)")
 
