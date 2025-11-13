@@ -65,6 +65,10 @@ from src.functions.annotations import (
     annotation_summary,
     apply_annotations_to_frame,
 )
+try:
+    from src.functions.logging_utils import get_log_dir as _get_app_log_dir
+except Exception:  # pragma: no cover - logging helper may be absent in minimal envs
+    _get_app_log_dir = None  # type: ignore
 
 try:
     import pandas as pd
@@ -775,7 +779,7 @@ class LogViewerDialog(QtWidgets.QDialog):
             return
 
         candidates: Set[Path] = set()
-        for pattern in ("*.log", "*.txt", "*.json", "*.yaml", "*.yml"):
+        for pattern in ("*.log", "*.txt", "*.json", "*.jsonl", "*.yaml", "*.yml"):
             candidates.update(self._log_dir.rglob(pattern))
         if not candidates:
             candidates.update(p for p in self._log_dir.rglob("*") if p.is_file())
@@ -959,7 +963,13 @@ for key in (
 
 default_logs = PATHS.get("logs", DATA_BASE / "logs")
 logs_env = os.getenv("MALDET_LOG_DIR")
-LOGS_DIR = Path(logs_env).expanduser().resolve() if logs_env else Path(default_logs).expanduser().resolve()
+if callable(_get_app_log_dir):
+    try:
+        LOGS_DIR = _get_app_log_dir()
+    except Exception:
+        LOGS_DIR = Path(default_logs).expanduser().resolve()
+else:
+    LOGS_DIR = Path(logs_env).expanduser().resolve() if logs_env else Path(default_logs).expanduser().resolve()
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_DIR = PATHS.get("settings", DATA_BASE / "settings")
 SETTINGS_DIR.mkdir(parents=True, exist_ok=True)

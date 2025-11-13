@@ -32,6 +32,12 @@ def _resolve_log_dir() -> Path:
     return log_dir
 
 
+def get_log_dir() -> Path:
+    """Return the directory where application logs are stored."""
+
+    return _resolve_log_dir()
+
+
 def get_logger(name: str) -> logging.Logger:
     if name in _LOGGERS:
         return _LOGGERS[name]
