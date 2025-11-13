@@ -429,23 +429,6 @@ def _run_prediction(
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
             rules_triggered_array = np.asarray(rules_triggered_array, dtype=bool).reshape(-1)
 
-            if rules_triggered_array.size < fusion_flags_array.size:
-                rules_triggered_array = np.pad(
-                    rules_triggered_array,
-                    (0, fusion_flags_array.size - rules_triggered_array.size),
-                    constant_values=False,
-                )
-            elif rules_triggered_array.size > fusion_flags_array.size:
-                rules_triggered_array = rules_triggered_array[: fusion_flags_array.size]
-
-            fusion_flags_array = np.logical_or(fusion_flags_array, rules_triggered_array)
-            threshold_floor = float(fusion_threshold_value)
-            if np.isfinite(threshold_floor) and rules_triggered_array.any():
-                fusion_scores_array = np.where(
-                    rules_triggered_array,
-                    np.maximum(fusion_scores_array, threshold_floor),
-                    fusion_scores_array,
-                )
             rule_flags_array = rules_triggered_array
 
             total_weight = float(fusion_model_weight_base + active_rule_weight)
@@ -457,7 +440,7 @@ def _run_prediction(
                 fusion_weight_rules = float(active_rule_weight) / total_weight
 
             final_statuses = ["异常" if flag else "正常" for flag in fusion_flags_array]
-            anomaly_count = int(fusion_flags_array.sum())
+            anomaly_count = int(np.count_nonzero(fusion_flags_array))
             normal_count = int(len(fusion_flags_array) - anomaly_count)
             status_text = "异常" if anomaly_count > 0 else ("正常" if len(fusion_flags_array) else None)
 
@@ -469,7 +452,8 @@ def _run_prediction(
             output_df["model_status"] = model_statuses
             output_df["fusion_score"] = fusion_scores_array
             output_df["fusion_decision"] = fusion_flags_array.astype(int)
-            output_df["prediction_status"] = final_statuses
+            output_df["prediction_status"] = fusion_flags_array.astype(int)
+            output_df["fusion_status"] = final_statuses
             if rule_scores_array is not None:
                 output_df["rules_score"] = rule_scores_array
                 if rule_flags_array is not None:
@@ -616,23 +600,6 @@ def _run_prediction(
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
             rules_triggered_array = np.asarray(rules_triggered_array, dtype=bool).reshape(-1)
 
-            if rules_triggered_array.size < fusion_flags_array.size:
-                rules_triggered_array = np.pad(
-                    rules_triggered_array,
-                    (0, fusion_flags_array.size - rules_triggered_array.size),
-                    constant_values=False,
-                )
-            elif rules_triggered_array.size > fusion_flags_array.size:
-                rules_triggered_array = rules_triggered_array[: fusion_flags_array.size]
-
-            fusion_flags_array = np.logical_or(fusion_flags_array, rules_triggered_array)
-            threshold_floor = float(fusion_threshold_value)
-            if np.isfinite(threshold_floor) and rules_triggered_array.any():
-                fusion_scores_array = np.where(
-                    rules_triggered_array,
-                    np.maximum(fusion_scores_array, threshold_floor),
-                    fusion_scores_array,
-                )
             rule_flags_array = rules_triggered_array
 
             total_weight = float(fusion_model_weight_base + active_rule_weight)
@@ -644,7 +611,7 @@ def _run_prediction(
                 fusion_weight_rules = float(active_rule_weight) / total_weight
 
             final_statuses = ["异常" if flag else "正常" for flag in fusion_flags_array]
-            anomaly_count = int(fusion_flags_array.sum())
+            anomaly_count = int(np.count_nonzero(fusion_flags_array))
             normal_count = int(len(fusion_flags_array) - anomaly_count)
             status_text = "异常" if anomaly_count > 0 else ("正常" if len(fusion_flags_array) else None)
 
@@ -652,7 +619,8 @@ def _run_prediction(
             output_df["model_status"] = model_statuses
             output_df["fusion_score"] = fusion_scores_array
             output_df["fusion_decision"] = fusion_flags_array.astype(int)
-            output_df["prediction_status"] = final_statuses
+            output_df["prediction_status"] = fusion_flags_array.astype(int)
+            output_df["fusion_status"] = final_statuses
             output_df["is_malicious"] = fusion_flags_array.astype(int)
 
             if rule_scores_array is not None:

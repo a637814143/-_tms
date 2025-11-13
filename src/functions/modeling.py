@@ -1271,23 +1271,6 @@ def _build_detection_result(
     fusion_flags = np.asarray(fusion_flags, dtype=bool).reshape(-1)
     rules_triggered = np.asarray(rules_triggered, dtype=bool).reshape(-1)
 
-    if rules_triggered.size < fusion_flags.size:
-        rules_triggered = np.pad(
-            rules_triggered,
-            (0, fusion_flags.size - rules_triggered.size),
-            constant_values=False,
-        )
-    elif rules_triggered.size > fusion_flags.size:
-        rules_triggered = rules_triggered[: fusion_flags.size]
-
-    fusion_flags = np.logical_or(fusion_flags, rules_triggered)
-    threshold_floor = float(fusion_threshold_value)
-    if np.isfinite(threshold_floor) and rules_triggered.any():
-        fusion_scores = np.where(
-            rules_triggered,
-            np.maximum(fusion_scores, threshold_floor),
-            fusion_scores,
-        )
     rule_flags = rules_triggered
 
     final_statuses: List[str] = []
@@ -1309,7 +1292,7 @@ def _build_detection_result(
         if index < len(model_statuses) and model_statuses[index] is not None:
             annotated["model_status"] = model_statuses[index]
         if index < len(final_statuses):
-            annotated["prediction_status"] = final_statuses[index]
+            annotated["prediction_status"] = int(bool(fusion_flags[index]))
             annotated["fusion_status"] = final_statuses[index]
         if fusion_scores.size > index:
             annotated["fusion_score"] = float(fusion_scores[index])
