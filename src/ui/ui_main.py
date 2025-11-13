@@ -280,6 +280,28 @@ QScrollArea { border: none; }
 """
 
 
+def _clamp_progress(value: object) -> int:
+    try:
+        return max(0, min(100, int(float(value))))
+    except Exception:
+        return 0
+
+
+def _prepare_kwargs(
+    kwargs: Dict[str, object],
+    *,
+    progress_arg: Optional[str] = None,
+    progress_cb: Optional[Callable[[object], None]] = None,
+    cancel_arg: Optional[str] = None,
+    cancel_cb: Optional[Callable[[], bool]] = None,
+) -> Dict[str, object]:
+    if progress_arg and progress_cb:
+        kwargs.setdefault(progress_arg, progress_cb)
+    if cancel_arg and cancel_cb:
+        kwargs.setdefault(cancel_arg, cancel_cb)
+    return kwargs
+
+
 class AppSettings:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -389,25 +411,23 @@ class FunctionThread(QtCore.QThread):
         self._result_adapter = result_adapter
 
     def _emit_progress(self, value) -> None:
-        try:
-            pct = int(float(value))
-        except Exception:
-            pct = 0
-        self.progress.emit(max(0, min(100, pct)))
+        self.progress.emit(_clamp_progress(value))
 
     def run(self) -> None:  # pragma: no cover - PyQt thread lifecycle
-        kwargs = dict(self._kwargs)
-        if self._progress_arg:
-            kwargs[self._progress_arg] = self._emit_progress
-        if self._cancel_arg:
-            kwargs[self._cancel_arg] = self.isInterruptionRequested
+        kwargs = _prepare_kwargs(
+            dict(self._kwargs),
+            progress_arg=self._progress_arg,
+            progress_cb=self._emit_progress,
+            cancel_arg=self._cancel_arg,
+            cancel_cb=self.isInterruptionRequested,
+        )
         try:
             result = self._fn(*self._args, **kwargs)
-            if self._result_adapter:
-                result = self._result_adapter(result)
         except Exception as exc:  # pragma: no cover - surface to UI
             self.error.emit(str(exc))
             return
+        if self._result_adapter:
+            result = self._result_adapter(result)
         self.finished.emit(result)
 
 
@@ -425,28 +445,19 @@ class BackgroundTask(QtCore.QRunnable):
         self._kwargs = kwargs
         self.signals = _WorkerSignals()
 
-    @property
-    def finished(self):
-        return self.signals.finished
-
-    @property
-    def error(self):
-        return self.signals.error
-
-    @property
-    def progress(self):
-        return self.signals.progress
+    finished = property(lambda self: self.signals.finished)
+    error = property(lambda self: self.signals.error)
+    progress = property(lambda self: self.signals.progress)
 
     def _emit_progress(self, value) -> None:
-        try:
-            pct = int(float(value))
-        except Exception:
-            pct = 0
-        self.signals.progress.emit(max(0, min(100, pct)))
+        self.signals.progress.emit(_clamp_progress(value))
 
     def run(self) -> None:  # pragma: no cover - QRunnable lifecycle
-        kwargs = dict(self._kwargs)
-        kwargs.setdefault("progress_cb", self._emit_progress)
+        kwargs = _prepare_kwargs(
+            dict(self._kwargs),
+            progress_arg="progress_cb",
+            progress_cb=self._emit_progress,
+        )
         try:
             result = self._fn(*self._args, **kwargs)
         except Exception as exc:  # pragma: no cover - surface to UI
