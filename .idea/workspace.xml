@@ -6,7 +6,7 @@
   <component name="ChangeListManager">
     <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/ui/ui_main.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/ui_main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/modeling.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/modeling.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -216,14 +216,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1754543842572</updated>
-    </task>
-    <task id="LOCAL-00046" summary="8888">
-      <option name="closed" value="true" />
-      <created>1762244882699</created>
-      <option name="number" value="00046" />
-      <option name="presentableId" value="LOCAL-00046" />
-      <option name="project" value="LOCAL" />
-      <updated>1762244882699</updated>
     </task>
     <task id="LOCAL-00047" summary="8888">
       <option name="closed" value="true" />
@@ -609,7 +601,15 @@
       <option name="project" value="LOCAL" />
       <updated>1763024797986</updated>
     </task>
-    <option name="localTasksCounter" value="95" />
+    <task id="LOCAL-00095" summary="8888">
+      <option name="closed" value="true" />
+      <created>1763029842364</created>
+      <option name="number" value="00095" />
+      <option name="presentableId" value="LOCAL-00095" />
+      <option name="project" value="LOCAL" />
+      <updated>1763029842364</updated>
+    </task>
+    <option name="localTasksCounter" value="96" />
     <servers />
   </component>
   <component name="UnknownFeatures">

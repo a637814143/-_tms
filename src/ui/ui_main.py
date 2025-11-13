@@ -79,6 +79,7 @@ try:
         DEFAULT_FUSION_THRESHOLD,
         RULE_TRIGGER_THRESHOLD,
         fuse_model_rule_votes,
+        get_fusion_settings,
         get_rule_settings,
         score_rules as apply_risk_rules,
     )
@@ -98,6 +99,14 @@ except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型�
             "rule_weight": float(DEFAULT_RULE_WEIGHT),
             "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
             "profile": profile,
+        }
+
+    def get_fusion_settings(profile: Optional[str] = None) -> Dict[str, float]:  # type: ignore
+        return {
+            "model_weight": float(DEFAULT_MODEL_WEIGHT),
+            "rule_weight": float(DEFAULT_RULE_WEIGHT),
+            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+            "profile": profile or "baseline",
         }
 
     def fuse_model_rule_votes(
@@ -1547,20 +1556,35 @@ class Ui_MainWindow(object):
             if profile_override
             else (settings.get("profile") if isinstance(settings, dict) else None)
         )
+
+        try:
+            fusion_defaults = get_fusion_settings(profile=profile)
+        except Exception:
+            fusion_defaults = {
+                "model_weight": DEFAULT_MODEL_WEIGHT,
+                "rule_weight": DEFAULT_RULE_WEIGHT,
+                "fusion_threshold": DEFAULT_FUSION_THRESHOLD,
+                "profile": profile or "baseline",
+            }
+
         profile_name = profile.strip() if isinstance(profile, str) and profile.strip() else None
+        if profile_name is None:
+            candidate_profile = fusion_defaults.get("profile")
+            if isinstance(candidate_profile, str) and candidate_profile.strip():
+                profile_name = candidate_profile.strip()
 
         default_threshold = float(
             settings.get("trigger_threshold", DEFAULT_TRIGGER_THRESHOLD)
         ) if isinstance(settings, dict) else float(DEFAULT_TRIGGER_THRESHOLD)
         default_model_weight = float(
-            settings.get("model_weight", DEFAULT_MODEL_WEIGHT)
-        ) if isinstance(settings, dict) else float(DEFAULT_MODEL_WEIGHT)
+            fusion_defaults.get("model_weight", DEFAULT_MODEL_WEIGHT)
+        )
         default_rule_weight = float(
-            settings.get("rule_weight", DEFAULT_RULE_WEIGHT)
-        ) if isinstance(settings, dict) else float(DEFAULT_RULE_WEIGHT)
+            fusion_defaults.get("rule_weight", DEFAULT_RULE_WEIGHT)
+        )
         default_fusion_threshold = float(
-            settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD)
-        ) if isinstance(settings, dict) else float(DEFAULT_FUSION_THRESHOLD)
+            fusion_defaults.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD)
+        )
 
         rule_threshold = metadata_obj.get("rule_threshold") if metadata_obj else None
         fusion_threshold = metadata_obj.get("fusion_threshold") if metadata_obj else None
@@ -4764,14 +4788,26 @@ class Ui_MainWindow(object):
 
             out_df = df.copy()
             rule_settings = self._resolve_rule_settings(metadata)
-            rule_params = rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
+            rule_params = (
+                rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
+            )
             rule_threshold_value = float(
                 rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD)
             )
-            fusion_model_weight_base = float(rule_settings.get("model_weight", DEFAULT_MODEL_WEIGHT))
-            fusion_rule_weight_base = float(rule_settings.get("rule_weight", DEFAULT_RULE_WEIGHT))
-            fusion_threshold_value = float(rule_settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
-            rule_profile = rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
+            rule_profile = (
+                rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
+            )
+            fusion_defaults = get_fusion_settings(profile=rule_profile)
+            fusion_model_weight_base = float(
+                rule_settings.get("model_weight", fusion_defaults["model_weight"])
+            )
+            fusion_rule_weight_base = float(
+                rule_settings.get("rule_weight", fusion_defaults["rule_weight"])
+            )
+            fusion_threshold_value = float(
+                rule_settings.get("fusion_threshold", fusion_defaults["fusion_threshold"])
+            )
+            rule_profile = fusion_defaults.get("profile") if rule_profile is None else rule_profile
             normalized_weights = rule_settings.get("normalized_weights")
 
             effective_rule_threshold = min(
@@ -4869,9 +4905,15 @@ class Ui_MainWindow(object):
             out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
             if rule_scores_series is not None:
                 out_df["rules_score"] = rule_scores_series
-                out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
-                if rule_reasons_series is not None:
-                    out_df["rules_reasons"] = rule_reasons_series
+            else:
+                out_df["rules_score"] = pd.Series(np.zeros(total_predictions, dtype=float))
+
+            out_df["rules_flag"] = pd.Series(rule_flags.astype(int), dtype=int)
+            out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
+            if rule_reasons_series is not None:
+                out_df["rules_reasons"] = rule_reasons_series
+            elif "rules_reasons" not in out_df.columns:
+                out_df["rules_reasons"] = ["" for _ in range(total_predictions)]
 
             out_df["prediction_status"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
             out_df["fusion_status"] = pd.Series(row_statuses, dtype=object)
@@ -4915,16 +4957,13 @@ class Ui_MainWindow(object):
 
             row_messages = _format_row_messages(out_df)
 
-            active_rule_weight = float(fusion_rule_weight_base) if (
-                rule_scores_array is not None and rule_scores_array.size
-            ) else 0.0
-            total_weight = float(fusion_model_weight_base + active_rule_weight)
+            total_weight = float(fusion_model_weight_base + fusion_rule_weight_base)
             if not math.isfinite(total_weight) or total_weight <= 0.0:
                 fusion_weight_model = 1.0
                 fusion_weight_rules = 0.0
             else:
                 fusion_weight_model = float(fusion_model_weight_base) / total_weight
-                fusion_weight_rules = active_rule_weight / total_weight
+                fusion_weight_rules = float(fusion_rule_weight_base) / total_weight
 
             fusion_scores_list = [float(value) for value in fusion_scores]
             fusion_flags_list = [bool(flag) for flag in anomaly_flags]
@@ -5109,14 +5148,26 @@ class Ui_MainWindow(object):
         model_statuses = ["异常" if flag else "正常" for flag in model_flags]
 
         rule_settings = self._resolve_rule_settings(metadata)
-        rule_params = rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
+        rule_params = (
+            rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
+        )
         rule_threshold_value = float(
             rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD)
         )
-        fusion_model_weight_base = float(rule_settings.get("model_weight", DEFAULT_MODEL_WEIGHT))
-        fusion_rule_weight_base = float(rule_settings.get("rule_weight", DEFAULT_RULE_WEIGHT))
-        fusion_threshold_value = float(rule_settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
-        rule_profile = rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
+        rule_profile = (
+            rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
+        )
+        fusion_defaults = get_fusion_settings(profile=rule_profile)
+        fusion_model_weight_base = float(
+            rule_settings.get("model_weight", fusion_defaults["model_weight"])
+        )
+        fusion_rule_weight_base = float(
+            rule_settings.get("rule_weight", fusion_defaults["rule_weight"])
+        )
+        fusion_threshold_value = float(
+            rule_settings.get("fusion_threshold", fusion_defaults["fusion_threshold"])
+        )
+        rule_profile = fusion_defaults.get("profile") if rule_profile is None else rule_profile
         normalized_weights = rule_settings.get("normalized_weights")
 
         effective_rule_threshold = min(
@@ -5204,9 +5255,15 @@ class Ui_MainWindow(object):
         out_df["fusion_status"] = pd.Series(final_statuses, dtype=object)
         if rule_scores_series is not None:
             out_df["rules_score"] = rule_scores_series
-            out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
-            if rule_reasons_series is not None:
-                out_df["rules_reasons"] = rule_reasons_series
+        else:
+            out_df["rules_score"] = pd.Series(np.zeros(total, dtype=float))
+
+        out_df["rules_flag"] = pd.Series(rule_flags.astype(int), dtype=int)
+        out_df["rules_triggered"] = pd.Series(rule_flags, dtype=bool)
+        if rule_reasons_series is not None:
+            out_df["rules_reasons"] = rule_reasons_series
+        elif "rules_reasons" not in out_df.columns:
+            out_df["rules_reasons"] = ["" for _ in range(total)]
 
         out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
 
@@ -5247,16 +5304,13 @@ class Ui_MainWindow(object):
 
         row_messages = _format_row_messages(out_df)
 
-        active_rule_weight = float(fusion_rule_weight_base) if (
-            rule_scores_array is not None and rule_scores_array.size
-        ) else 0.0
-        total_weight = float(fusion_model_weight_base + active_rule_weight)
+        total_weight = float(fusion_model_weight_base + fusion_rule_weight_base)
         if not math.isfinite(total_weight) or total_weight <= 0.0:
             fusion_weight_model = 1.0
             fusion_weight_rules = 0.0
         else:
             fusion_weight_model = float(fusion_model_weight_base) / total_weight
-            fusion_weight_rules = active_rule_weight / total_weight
+            fusion_weight_rules = float(fusion_rule_weight_base) / total_weight
 
         rule_scores_list = (
             [float(value) for value in rule_scores_array[:total]]
