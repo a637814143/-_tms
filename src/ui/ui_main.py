@@ -77,16 +77,18 @@ try:
         DEFAULT_MODEL_WEIGHT,
         DEFAULT_RULE_WEIGHT,
         DEFAULT_FUSION_THRESHOLD,
+        RULE_TRIGGER_THRESHOLD,
         fuse_model_rule_votes,
         get_rule_settings,
         score_rules as apply_risk_rules,
     )
 except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
     apply_risk_rules = None  # type: ignore
-    DEFAULT_TRIGGER_THRESHOLD = 60.0  # type: ignore
-    DEFAULT_MODEL_WEIGHT = 0.6  # type: ignore
-    DEFAULT_RULE_WEIGHT = 0.4  # type: ignore
-    DEFAULT_FUSION_THRESHOLD = 0.5  # type: ignore
+    DEFAULT_TRIGGER_THRESHOLD = 40.0  # type: ignore
+    DEFAULT_MODEL_WEIGHT = 0.3  # type: ignore
+    DEFAULT_RULE_WEIGHT = 0.7  # type: ignore
+    DEFAULT_FUSION_THRESHOLD = 0.2  # type: ignore
+    RULE_TRIGGER_THRESHOLD = 25.0  # type: ignore
 
     def get_rule_settings(profile: Optional[str] = None) -> Dict[str, object]:  # type: ignore
         return {
@@ -4704,14 +4706,20 @@ class Ui_MainWindow(object):
             out_df = df.copy()
             rule_settings = self._resolve_rule_settings(metadata)
             rule_params = rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
-            rule_threshold_value = float(rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD))
+            rule_threshold_value = float(
+                rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD)
+            )
             fusion_model_weight_base = float(rule_settings.get("model_weight", DEFAULT_MODEL_WEIGHT))
             fusion_rule_weight_base = float(rule_settings.get("rule_weight", DEFAULT_RULE_WEIGHT))
             fusion_threshold_value = float(rule_settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
             rule_profile = rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
             normalized_weights = rule_settings.get("normalized_weights")
 
-            rule_threshold = float(rule_threshold_value)
+            effective_rule_threshold = min(
+                float(rule_threshold_value),
+                float(RULE_TRIGGER_THRESHOLD),
+            )
+            rule_threshold = float(effective_rule_threshold)
             rule_scores_series = None
             rule_reasons_series = None
             rule_flags = np.zeros(total_predictions, dtype=bool)
@@ -4759,6 +4767,25 @@ class Ui_MainWindow(object):
                     (0, total_predictions - fusion_flags_array.size),
                     "edge",
                 )
+
+            if rule_flags.size:
+                rule_bool = np.asarray(rule_flags, dtype=bool)
+                if rule_bool.size < fusion_flags_array.size:
+                    rule_bool = np.pad(
+                        rule_bool,
+                        (0, fusion_flags_array.size - rule_bool.size),
+                        constant_values=False,
+                    )
+                elif rule_bool.size > fusion_flags_array.size:
+                    rule_bool = rule_bool[: fusion_flags_array.size]
+                fusion_flags_array = np.logical_or(fusion_flags_array, rule_bool)
+                threshold_floor = float(fusion_threshold_value)
+                if math.isfinite(threshold_floor):
+                    fusion_scores_array = np.where(
+                        rule_bool,
+                        np.maximum(fusion_scores_array, threshold_floor),
+                        fusion_scores_array,
+                    )
 
             final_flags = [bool(flag) for flag in fusion_flags_array[:total_predictions]]
             final_statuses = ["异常" if flag else "正常" for flag in final_flags]
@@ -5022,14 +5049,20 @@ class Ui_MainWindow(object):
 
         rule_settings = self._resolve_rule_settings(metadata)
         rule_params = rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
-        rule_threshold_value = float(rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD))
+        rule_threshold_value = float(
+            rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD)
+        )
         fusion_model_weight_base = float(rule_settings.get("model_weight", DEFAULT_MODEL_WEIGHT))
         fusion_rule_weight_base = float(rule_settings.get("rule_weight", DEFAULT_RULE_WEIGHT))
         fusion_threshold_value = float(rule_settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
         rule_profile = rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
         normalized_weights = rule_settings.get("normalized_weights")
 
-        rule_threshold = float(rule_threshold_value)
+        effective_rule_threshold = min(
+            float(rule_threshold_value),
+            float(RULE_TRIGGER_THRESHOLD),
+        )
+        rule_threshold = float(effective_rule_threshold)
         rule_scores_series = None
         rule_reasons_series = None
         total = int(len(out_df))
@@ -5075,6 +5108,24 @@ class Ui_MainWindow(object):
                 fusion_flags_array,
                 (0, total - fusion_flags_array.size),
                 "edge",
+            )
+        if total:
+            rule_bool = np.asarray(rule_flags, dtype=bool)
+            if rule_bool.size < fusion_flags_array.size:
+                rule_bool = np.pad(
+                    rule_bool,
+                    (0, fusion_flags_array.size - rule_bool.size),
+                    constant_values=False,
+                )
+            elif rule_bool.size > fusion_flags_array.size:
+                rule_bool = rule_bool[: fusion_flags_array.size]
+            fusion_flags_array = np.logical_or(fusion_flags_array, rule_bool)
+        threshold_floor = float(fusion_threshold_value)
+        if math.isfinite(threshold_floor) and total:
+            fusion_scores_array = np.where(
+                rule_bool,
+                np.maximum(fusion_scores_array, threshold_floor),
+                fusion_scores_array,
             )
         fusion_flags = fusion_flags_array[:total]
         fusion_scores = fusion_scores_array[:total]

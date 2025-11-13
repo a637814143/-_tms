@@ -88,13 +88,15 @@ try:
         DEFAULT_MODEL_WEIGHT,
         DEFAULT_RULE_WEIGHT,
         DEFAULT_FUSION_THRESHOLD,
+        RULE_TRIGGER_THRESHOLD,
     )
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     apply_risk_rules = None  # type: ignore
-    DEFAULT_TRIGGER_THRESHOLD = 60.0  # type: ignore
-    DEFAULT_MODEL_WEIGHT = 0.6  # type: ignore
-    DEFAULT_RULE_WEIGHT = 0.4  # type: ignore
-    DEFAULT_FUSION_THRESHOLD = 0.5  # type: ignore
+    DEFAULT_TRIGGER_THRESHOLD = 40.0  # type: ignore
+    DEFAULT_MODEL_WEIGHT = 0.3  # type: ignore
+    DEFAULT_RULE_WEIGHT = 0.7  # type: ignore
+    DEFAULT_FUSION_THRESHOLD = 0.2  # type: ignore
+    RULE_TRIGGER_THRESHOLD = 25.0  # type: ignore
 
     def get_rule_settings(profile: Optional[str] = None) -> Dict[str, object]:  # type: ignore
         return {
@@ -373,12 +375,19 @@ def _run_prediction(
 
             rule_settings = _resolve_rule_config(metadata_obj)
             rule_params = rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
-            rule_threshold_value = float(rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD))
+            rule_threshold_value = float(
+                rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD)
+            )
             fusion_model_weight_base = float(rule_settings.get("model_weight", DEFAULT_MODEL_WEIGHT))
             fusion_rule_weight_base = float(rule_settings.get("rule_weight", DEFAULT_RULE_WEIGHT))
             fusion_threshold_value = float(rule_settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
             rule_profile = rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
             normalized_weights = rule_settings.get("normalized_weights")
+
+            effective_rule_threshold = min(
+                float(rule_threshold_value),
+                float(RULE_TRIGGER_THRESHOLD),
+            )
 
             rule_scores_array: Optional[np.ndarray] = None
             rule_reasons_list: Optional[List[str]] = None
@@ -396,7 +405,7 @@ def _run_prediction(
                         rule_scores_array = np.asarray(score_series, dtype=np.float64).reshape(-1)
                     if reason_series is not None:
                         rule_reasons_list = reason_series.astype(str, copy=False).tolist()
-                    rule_flags_array = rule_scores_array >= float(rule_threshold_value)
+                    rule_flags_array = rule_scores_array >= float(effective_rule_threshold)
 
             active_rule_weight = (
                 float(fusion_rule_weight_base)
@@ -413,6 +422,25 @@ def _run_prediction(
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=np.float64).reshape(-1)
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
+
+            if rule_flags_array is not None and rule_flags_array.size:
+                rule_bool = np.asarray(rule_flags_array, dtype=bool).reshape(-1)
+                if rule_bool.size < fusion_flags_array.size:
+                    rule_bool = np.pad(
+                        rule_bool,
+                        (0, fusion_flags_array.size - rule_bool.size),
+                        constant_values=False,
+                    )
+                elif rule_bool.size > fusion_flags_array.size:
+                    rule_bool = rule_bool[: fusion_flags_array.size]
+                fusion_flags_array = np.logical_or(fusion_flags_array, rule_bool)
+                threshold_floor = float(fusion_threshold_value)
+                if np.isfinite(threshold_floor):
+                    fusion_scores_array = np.where(
+                        rule_bool,
+                        np.maximum(fusion_scores_array, threshold_floor),
+                        fusion_scores_array,
+                    )
 
             total_weight = float(fusion_model_weight_base + active_rule_weight)
             if not np.isfinite(total_weight) or total_weight <= 0.0:
@@ -440,8 +468,11 @@ def _run_prediction(
                 output_df["rules_score"] = rule_scores_array
                 if rule_flags_array is not None:
                     output_df["rules_flag"] = rule_flags_array.astype(int)
+                    output_df["rules_triggered"] = rule_flags_array.astype(bool)
                 else:
-                    output_df["rules_flag"] = (rule_scores_array >= float(rule_threshold_value)).astype(int)
+                    fallback_flags = rule_scores_array >= float(effective_rule_threshold)
+                    output_df["rules_flag"] = fallback_flags.astype(int)
+                    output_df["rules_triggered"] = fallback_flags.astype(bool)
                 if rule_reasons_list is not None:
                     output_df["rules_reasons"] = rule_reasons_list
 
@@ -519,12 +550,19 @@ def _run_prediction(
 
             rule_settings = _resolve_rule_config(metadata)
             rule_params = rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
-            rule_threshold_value = float(rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD))
+            rule_threshold_value = float(
+                rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD)
+            )
             fusion_model_weight_base = float(rule_settings.get("model_weight", DEFAULT_MODEL_WEIGHT))
             fusion_rule_weight_base = float(rule_settings.get("rule_weight", DEFAULT_RULE_WEIGHT))
             fusion_threshold_value = float(rule_settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
             rule_profile = rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
             normalized_weights = rule_settings.get("normalized_weights")
+
+            effective_rule_threshold = min(
+                float(rule_threshold_value),
+                float(RULE_TRIGGER_THRESHOLD),
+            )
 
             rule_scores_array: Optional[np.ndarray] = None
             rule_reasons_list: Optional[List[str]] = None
@@ -542,7 +580,7 @@ def _run_prediction(
                         rule_scores_array = np.asarray(score_series, dtype=np.float64).reshape(-1)
                     if reason_series is not None:
                         rule_reasons_list = reason_series.astype(str, copy=False).tolist()
-                    rule_flags_array = rule_scores_array >= float(rule_threshold_value)
+                    rule_flags_array = rule_scores_array >= float(effective_rule_threshold)
 
             active_rule_weight = (
                 float(fusion_rule_weight_base)
@@ -559,6 +597,25 @@ def _run_prediction(
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=np.float64).reshape(-1)
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
+
+            if rule_flags_array is not None and rule_flags_array.size:
+                rule_bool = np.asarray(rule_flags_array, dtype=bool).reshape(-1)
+                if rule_bool.size < fusion_flags_array.size:
+                    rule_bool = np.pad(
+                        rule_bool,
+                        (0, fusion_flags_array.size - rule_bool.size),
+                        constant_values=False,
+                    )
+                elif rule_bool.size > fusion_flags_array.size:
+                    rule_bool = rule_bool[: fusion_flags_array.size]
+                fusion_flags_array = np.logical_or(fusion_flags_array, rule_bool)
+                threshold_floor = float(fusion_threshold_value)
+                if np.isfinite(threshold_floor):
+                    fusion_scores_array = np.where(
+                        rule_bool,
+                        np.maximum(fusion_scores_array, threshold_floor),
+                        fusion_scores_array,
+                    )
 
             total_weight = float(fusion_model_weight_base + active_rule_weight)
             if not np.isfinite(total_weight) or total_weight <= 0.0:
@@ -584,8 +641,11 @@ def _run_prediction(
                 output_df["rules_score"] = rule_scores_array
                 if rule_flags_array is not None:
                     output_df["rules_flag"] = rule_flags_array.astype(int)
+                    output_df["rules_triggered"] = rule_flags_array.astype(bool)
                 else:
-                    output_df["rules_flag"] = (rule_scores_array >= float(rule_threshold_value)).astype(int)
+                    fallback_flags = rule_scores_array >= float(effective_rule_threshold)
+                    output_df["rules_flag"] = fallback_flags.astype(int)
+                    output_df["rules_triggered"] = fallback_flags.astype(bool)
                 if rule_reasons_list is not None:
                     output_df["rules_reasons"] = rule_reasons_list
 
