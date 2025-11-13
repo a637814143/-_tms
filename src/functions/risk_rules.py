@@ -5,7 +5,7 @@
 """
 import numpy as np
 import pandas as pd
-from typing import Iterable, Optional, Tuple, List, Dict, Any
+from typing import Iterable, Optional, Tuple, List, Dict, Any, Sequence, Union
 
 try:  # 配置是可选依赖，缺失时保持默认行为
     from src.configuration import load_config
@@ -68,24 +68,28 @@ DEFAULTS = dict(
 # 规则档位预设：baseline / aggressive
 DEFAULT_RULE_PROFILE = "baseline"
 
-PROFILE_PRESETS: Dict[str, Dict[str, float]] = {
+PROFILE_PRESETS: Dict[str, Dict[str, Any]] = {
     "baseline": {
-        # 规则总分 >= trigger_threshold 才认为“规则强烈命中”
+        # 触发规则的分数线（规则总分低于它，基本不参与决策）
         "trigger_threshold": 60.0,
-        # 模型权重更高，规则只做辅助
-        "model_weight": 0.7,
-        "rule_weight": 0.3,
-        # 融合分 >= fusion_threshold 才判异常
-        "fusion_threshold": 0.5,
+        # 模型权重更大，规则只做轻微修正
+        "model_weight": 0.80,
+        "rule_weight": 0.20,
+        # 融合得分必须比较高才算异常
+        "fusion_threshold": 0.65,
+        # baseline 模式：只看融合得分
+        "mode": "conservative",
     },
     "aggressive": {
-        # 规则总分 >= 25 就认为“规则强烈命中”
-        "trigger_threshold": 25.0,
-        # 规则权重更高，对恶意流量更敏感
-        "model_weight": 0.3,
-        "rule_weight": 0.7,
-        # 判异常的阈值更低
-        "fusion_threshold": 0.2,
+        # 只要规则分数达到 35 就当“很可疑”
+        "trigger_threshold": 35.0,
+        # 规则权重更高，宁可多报一点
+        "model_weight": 0.50,
+        "rule_weight": 0.50,
+        # 融合阈值放宽
+        "fusion_threshold": 0.40,
+        # aggressive 模式：融合得分 OR 强规则命中
+        "mode": "aggressive",
     },
 }
 
@@ -201,6 +205,9 @@ def get_rule_settings(profile: Optional[str] = None) -> Dict[str, Any]:
         except (TypeError, ValueError):
             return float(default)
 
+    base_preset = PROFILE_PRESETS.get(selected_profile, PROFILE_PRESETS[DEFAULT_RULE_PROFILE])
+    mode_value = profile_params.get("mode", base_preset.get("mode", "conservative"))
+
     settings = {
         "params": params,
         "trigger_threshold": trigger_threshold,
@@ -208,6 +215,7 @@ def get_rule_settings(profile: Optional[str] = None) -> Dict[str, Any]:
         "rule_weight": _as_float(rule_weight, DEFAULT_RULE_WEIGHT),
         "fusion_threshold": _as_float(fusion_threshold, DEFAULT_FUSION_THRESHOLD),
         "profile": selected_profile,
+        "mode": str(mode_value),
     }
     return settings
 
@@ -693,8 +701,8 @@ def score_rules(
 
 
 def fuse_model_rule_votes(
-    model_scores: Iterable[object],
-    rule_scores: Optional[Iterable[object]],
+    model_scores: Union[np.ndarray, Sequence[float], Sequence[int], Sequence[bool]],
+    rule_scores: Optional[Union[np.ndarray, Sequence[float]]],
     *,
     profile: Optional[str] = None,
     model_weight: Optional[float] = None,
@@ -702,21 +710,7 @@ def fuse_model_rule_votes(
     threshold: Optional[float] = None,
     trigger_threshold: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """按档位融合模型分数与规则得分，返回融合分、最终标记与规则触发标记。"""
-
-    selected_profile = (profile or DEFAULT_RULE_PROFILE).strip().lower()
-    if not selected_profile:
-        selected_profile = DEFAULT_RULE_PROFILE
-    preset = PROFILE_PRESETS.get(selected_profile, PROFILE_PRESETS[DEFAULT_RULE_PROFILE])
-
-    if trigger_threshold is None:
-        trigger_threshold = float(preset.get("trigger_threshold", DEFAULT_TRIGGER_THRESHOLD))
-    if model_weight is None:
-        model_weight = float(preset.get("model_weight", DEFAULT_MODEL_WEIGHT))
-    if rule_weight is None:
-        rule_weight = float(preset.get("rule_weight", DEFAULT_RULE_WEIGHT))
-    if threshold is None:
-        threshold = float(preset.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
+    """融合模型与规则得分，并根据档位模式返回最终标记。"""
 
     model_arr = np.asarray(model_scores, dtype=np.float64).reshape(-1)
     if model_arr.size == 0:
@@ -727,24 +721,38 @@ def fuse_model_rule_votes(
     model_arr = np.clip(model_arr, 0.0, 1.0)
 
     if rule_scores is None:
-        normalized_rules = np.zeros_like(model_arr)
-        active_rule_weight = 0.0
-        rule_arr = normalized_rules
+        rule_arr = np.zeros_like(model_arr, dtype=np.float64)
     else:
         rule_arr = np.asarray(rule_scores, dtype=np.float64).reshape(-1)
         if rule_arr.size != model_arr.size:
             if rule_arr.size < model_arr.size:
-                padded = np.zeros_like(model_arr)
+                padded = np.zeros_like(model_arr, dtype=np.float64)
                 padded[: rule_arr.size] = rule_arr
                 rule_arr = padded
             else:
                 rule_arr = rule_arr[: model_arr.size]
-        normalized_rules = np.clip(rule_arr / 100.0, 0.0, 1.0)
-        active_rule_weight = float(rule_weight)
 
-    rules_triggered = (rule_arr >= float(trigger_threshold)).astype(bool)
+    normalized_rules = np.clip(rule_arr / 100.0, 0.0, 1.0)
 
-    fused_scores = float(model_weight) * model_arr + float(active_rule_weight) * normalized_rules
-    fused_flags = (fused_scores >= float(threshold)).astype(bool)
+    settings = get_rule_settings(profile)
+    trig_threshold = float(
+        trigger_threshold if trigger_threshold is not None else settings["trigger_threshold"]
+    )
+    fusion_threshold = float(
+        threshold if threshold is not None else settings["fusion_threshold"]
+    )
+    m_weight = float(model_weight if model_weight is not None else settings["model_weight"])
+    r_weight = float(rule_weight if rule_weight is not None else settings["rule_weight"])
+    mode = str(settings.get("mode", "conservative")).lower()
 
-    return fused_scores, fused_flags, rules_triggered
+    rules_triggered = (rule_arr >= trig_threshold).astype(bool)
+
+    fused_scores = m_weight * model_arr + r_weight * normalized_rules
+    fused_flags = (fused_scores >= fusion_threshold).astype(bool)
+
+    if mode.startswith("aggr"):
+        final_flags = np.logical_or(fused_flags, rules_triggered)
+    else:
+        final_flags = fused_flags
+
+    return fused_scores.astype(np.float64), final_flags.astype(bool), rules_triggered
