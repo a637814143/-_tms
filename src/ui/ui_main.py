@@ -1307,6 +1307,7 @@ class Ui_MainWindow(object):
         self.left_layout.addWidget(self.file_group)
 
     def _build_param_panel(self):
+        # 该面板仅保留内部状态，不再展示在 UI 中（根据用户反馈隐藏冗余项）
         self.param_group = QtWidgets.QGroupBox("查看流量信息参数")
         pg = QtWidgets.QFormLayout()
         pg.setContentsMargins(12, 10, 12, 10)
@@ -1392,7 +1393,7 @@ class Ui_MainWindow(object):
                 label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
         self.param_group.setLayout(pg)
-        self.left_layout.addWidget(self.param_group)
+        self.param_group.hide()
         self.mode_combo.currentIndexChanged.connect(self._update_batch_controls)
         self._update_batch_controls()
 
