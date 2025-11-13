@@ -78,6 +78,7 @@ try:
         DEFAULT_RULE_WEIGHT,
         DEFAULT_FUSION_THRESHOLD,
         fuse_model_rule_votes,
+        get_rule_settings,
         score_rules as apply_risk_rules,
     )
 except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
@@ -86,6 +87,16 @@ except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型�
     DEFAULT_MODEL_WEIGHT = 0.6  # type: ignore
     DEFAULT_RULE_WEIGHT = 0.4  # type: ignore
     DEFAULT_FUSION_THRESHOLD = 0.5  # type: ignore
+
+    def get_rule_settings(profile: Optional[str] = None) -> Dict[str, object]:  # type: ignore
+        return {
+            "params": {},
+            "trigger_threshold": float(DEFAULT_TRIGGER_THRESHOLD),
+            "model_weight": float(DEFAULT_MODEL_WEIGHT),
+            "rule_weight": float(DEFAULT_RULE_WEIGHT),
+            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+            "profile": profile,
+        }
 
     def fuse_model_rule_votes(
         model_flags: "np.ndarray | List[float] | List[int] | List[bool]",
@@ -1107,6 +1118,7 @@ class Ui_MainWindow(object):
         "btn_fe": "_on_extract_features",
         "btn_vector": "_on_preprocess_features",
         "btn_train": "_on_train_model",
+        "btn_full_retrain": "_on_full_retrain",
         "btn_analysis": "_on_run_analysis",
         "btn_predict": "_on_predict",
         "btn_export": "_on_export_results",
@@ -1465,6 +1477,7 @@ class Ui_MainWindow(object):
                 getattr(self, "btn_fe", None),
                 getattr(self, "btn_vector", None),
                 getattr(self, "btn_train", None),
+                getattr(self, "btn_full_retrain", None),
                 getattr(self, "btn_analysis", None),
                 getattr(self, "btn_predict", None),
                 getattr(self, "btn_export", None),
@@ -1475,6 +1488,98 @@ class Ui_MainWindow(object):
     def _set_action_buttons_enabled(self, enabled: bool) -> None:
         for btn in self._action_buttons():
             btn.setEnabled(enabled)
+
+    def _resolve_rule_settings(self, metadata: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        metadata_obj = metadata if isinstance(metadata, dict) else {}
+
+        profile_override = metadata_obj.get("rule_profile") if metadata_obj else None
+        if not isinstance(profile_override, str) or not profile_override.strip():
+            profile_override = None
+        else:
+            profile_override = profile_override.strip()
+
+        try:
+            settings = get_rule_settings(profile=profile_override)
+        except Exception:
+            settings = {}
+
+        params = settings.get("params") if isinstance(settings, dict) else {}
+        profile = (
+            profile_override
+            if profile_override
+            else (settings.get("profile") if isinstance(settings, dict) else None)
+        )
+        profile_name = profile.strip() if isinstance(profile, str) and profile.strip() else None
+
+        default_threshold = float(
+            settings.get("trigger_threshold", DEFAULT_TRIGGER_THRESHOLD)
+        ) if isinstance(settings, dict) else float(DEFAULT_TRIGGER_THRESHOLD)
+        default_model_weight = float(
+            settings.get("model_weight", DEFAULT_MODEL_WEIGHT)
+        ) if isinstance(settings, dict) else float(DEFAULT_MODEL_WEIGHT)
+        default_rule_weight = float(
+            settings.get("rule_weight", DEFAULT_RULE_WEIGHT)
+        ) if isinstance(settings, dict) else float(DEFAULT_RULE_WEIGHT)
+        default_fusion_threshold = float(
+            settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD)
+        ) if isinstance(settings, dict) else float(DEFAULT_FUSION_THRESHOLD)
+
+        rule_threshold = metadata_obj.get("rule_threshold") if metadata_obj else None
+        fusion_threshold = metadata_obj.get("fusion_threshold") if metadata_obj else None
+        fusion_model_weight = metadata_obj.get("fusion_model_weight") if metadata_obj else None
+        fusion_rule_weight = metadata_obj.get("fusion_rule_weight") if metadata_obj else None
+
+        try:
+            resolved_threshold = float(rule_threshold)
+        except (TypeError, ValueError):
+            resolved_threshold = float(default_threshold)
+
+        try:
+            resolved_fusion_threshold = float(fusion_threshold)
+        except (TypeError, ValueError):
+            resolved_fusion_threshold = float(default_fusion_threshold)
+
+        try:
+            resolved_model_weight = float(fusion_model_weight)
+        except (TypeError, ValueError):
+            resolved_model_weight = float(default_model_weight)
+
+        try:
+            resolved_rule_weight = float(fusion_rule_weight)
+        except (TypeError, ValueError):
+            resolved_rule_weight = float(default_rule_weight)
+
+        weights_meta = metadata_obj.get("fusion_weights") if metadata_obj else None
+        if isinstance(weights_meta, dict) and weights_meta:
+            try:
+                normalized_model = float(weights_meta.get("model", 1.0))
+            except (TypeError, ValueError):
+                normalized_model = 1.0
+            try:
+                normalized_rules = float(weights_meta.get("rules", 0.0))
+            except (TypeError, ValueError):
+                normalized_rules = 0.0
+        else:
+            total = float(resolved_model_weight + resolved_rule_weight)
+            if not math.isfinite(total) or total <= 0.0:
+                normalized_model = 1.0
+                normalized_rules = 0.0
+            else:
+                normalized_model = float(resolved_model_weight) / total
+                normalized_rules = float(resolved_rule_weight) / total
+
+        return {
+            "params": params if isinstance(params, dict) else {},
+            "threshold": float(resolved_threshold),
+            "model_weight": float(resolved_model_weight),
+            "rule_weight": float(resolved_rule_weight),
+            "fusion_threshold": float(resolved_fusion_threshold),
+            "profile": profile_name,
+            "normalized_weights": {
+                "model": float(normalized_model),
+                "rules": float(normalized_rules),
+            },
+        }
 
     def _start_background_task(
         self,
@@ -1612,6 +1717,7 @@ class Ui_MainWindow(object):
             ("btn_fe", "提取特征"),
             ("btn_vector", "数据预处理"),
             ("btn_train", "训练模型"),
+            ("btn_full_retrain", "完全重训"),
             ("btn_analysis", "运行分析"),
             ("btn_predict", "加载模型预测"),
             ("btn_export", "导出结果（异常）"),
@@ -1632,7 +1738,7 @@ class Ui_MainWindow(object):
 
         self._add_group_with_controls(
             "模型阶段",
-            (self.btn_train, self.btn_predict, self.btn_analysis),
+            (self.btn_train, self.btn_full_retrain, self.btn_predict, self.btn_analysis),
         )
 
         self._add_group_with_controls(
@@ -2063,6 +2169,7 @@ class Ui_MainWindow(object):
                 self.btn_fe: self._on_extract_features,
                 self.btn_vector: self._on_preprocess_features,
                 self.btn_train: self._on_train_model,
+                self.btn_full_retrain: self._on_full_retrain,
                 self.btn_analysis: self._on_run_analysis,
                 self.btn_predict: self._on_predict,
                 self.btn_open_results: self._open_results_dir,
@@ -3662,8 +3769,12 @@ class Ui_MainWindow(object):
         self.display_result(f"[错误] 数据预处理失败: {msg}")
         self.preprocess_worker = None
 
-    # --------- 训练模型（按顶部路径） ----------
-    def _on_train_model(self):
+    def _start_training_job(
+        self,
+        *,
+        reset: bool,
+        trigger_button: Optional[QtWidgets.QPushButton],
+    ) -> None:
         selection = self._ask_training_source()
         if not selection:
             self.display_result("[INFO] 已取消模型训练。")
@@ -3676,29 +3787,65 @@ class Ui_MainWindow(object):
 
         res_dir = self._default_results_dir()
         mdl_dir = self._default_models_dir()
-        os.makedirs(res_dir, exist_ok=True); os.makedirs(mdl_dir, exist_ok=True)
+        os.makedirs(res_dir, exist_ok=True)
+        os.makedirs(mdl_dir, exist_ok=True)
 
-        self.display_result(f"[INFO] 开始训练，输入: {path}")
+        prefix = "完全重训" if reset else "训练"
+        self.display_result(f"[INFO] 开始{prefix}，输入: {path}")
+
         self._set_action_buttons_enabled(False)
-        self.btn_train.setEnabled(False)
-        self._start_task_progress(self.btn_train)
+        for candidate in (getattr(self, "btn_train", None), getattr(self, "btn_full_retrain", None)):
+            if isinstance(candidate, QtWidgets.QPushButton):
+                candidate.setEnabled(False)
+        if isinstance(trigger_button, QtWidgets.QPushButton):
+            self._start_task_progress(trigger_button)
+
+        task_kwargs: Dict[str, object] = {}
+        if reset:
+            task_kwargs["reset_ensemble"] = True
+
         train_task = BackgroundTask(
             run_train,
             path,
             res_dir,
             mdl_dir,
+            **task_kwargs,
         )
+        self._active_train_button = trigger_button
         self._start_background_task(
             train_task,
-            self._on_train_finished,
-            self._on_train_error,
-            partial(self._update_task_progress, self.btn_train),
+            lambda result, btn=trigger_button, reset_flag=reset: self._on_train_finished(
+                result, btn, reset_flag
+            ),
+            lambda message, btn=trigger_button: self._on_train_error(message, btn),
+            partial(self._update_task_progress, trigger_button)
+            if isinstance(trigger_button, QtWidgets.QPushButton)
+            else None,
         )
 
-    def _on_train_finished(self, res):
-        self.btn_train.setEnabled(True)
-        self._finish_task_progress(self.btn_train)
+    # --------- 训练模型（按顶部路径） ----------
+    def _on_train_model(self):
+        self._start_training_job(reset=False, trigger_button=getattr(self, "btn_train", None))
+
+    def _on_full_retrain(self):
+        self._start_training_job(reset=True, trigger_button=getattr(self, "btn_full_retrain", None))
+
+    def _on_train_finished(
+        self,
+        res,
+        trigger_button: Optional[QtWidgets.QPushButton] = None,
+        reset_flag: bool = False,
+    ) -> None:
+        button = trigger_button or getattr(self, "_active_train_button", None)
+        for candidate in (getattr(self, "btn_train", None), getattr(self, "btn_full_retrain", None)):
+            if isinstance(candidate, QtWidgets.QPushButton):
+                candidate.setEnabled(True)
         self._set_action_buttons_enabled(True)
+        if isinstance(button, QtWidgets.QPushButton):
+            self._finish_task_progress(button)
+        self._active_train_button = None
+        if reset_flag:
+            self.display_result("[INFO] 完全重训已完成，已替换旧集成模型。")
         if not isinstance(res, dict):
             res = {} if res is None else {"result": res}
         threshold = res.get("threshold")
@@ -3763,6 +3910,8 @@ class Ui_MainWindow(object):
             f"- 标准化器: {res.get('scaler_path')}",
             f"样本总数={res.get('flows')} 异常数={res.get('malicious')}",
         ]
+        if reset_flag:
+            msg_lines.append("完全重训：是 (历史集成已清空)")
         if threshold is not None:
             msg_lines.append(f"得分阈值={threshold:.6f}")
         if vote_thr is not None:
@@ -3834,10 +3983,19 @@ class Ui_MainWindow(object):
         if res.get("active_learning_csv") and os.path.exists(res["active_learning_csv"]):
             self._add_output(res["active_learning_csv"])
 
-    def _on_train_error(self, msg):
-        self.btn_train.setEnabled(True)
-        self._fail_task_progress(self.btn_train)
+    def _on_train_error(
+        self,
+        msg,
+        trigger_button: Optional[QtWidgets.QPushButton] = None,
+    ) -> None:
+        button = trigger_button or getattr(self, "_active_train_button", None)
+        for candidate in (getattr(self, "btn_train", None), getattr(self, "btn_full_retrain", None)):
+            if isinstance(candidate, QtWidgets.QPushButton):
+                candidate.setEnabled(True)
         self._set_action_buttons_enabled(True)
+        if isinstance(button, QtWidgets.QPushButton):
+            self._fail_task_progress(button)
+        self._active_train_button = None
         QtWidgets.QMessageBox.critical(None, "训练失败", msg)
         self.display_result(f"[错误] 训练失败: {msg}")
 
@@ -4543,16 +4701,22 @@ class Ui_MainWindow(object):
                     status_text = "正常"
 
             out_df = df.copy()
-            rule_threshold_raw = None
-            if isinstance(metadata, dict):
-                rule_threshold_raw = metadata.get("rule_threshold")
-            rule_threshold = float(rule_threshold_raw) if rule_threshold_raw not in (None, "") else float(DEFAULT_TRIGGER_THRESHOLD)
+            rule_settings = self._resolve_rule_settings(metadata)
+            rule_params = rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
+            rule_threshold_value = float(rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD))
+            fusion_model_weight_base = float(rule_settings.get("model_weight", DEFAULT_MODEL_WEIGHT))
+            fusion_rule_weight_base = float(rule_settings.get("rule_weight", DEFAULT_RULE_WEIGHT))
+            fusion_threshold_value = float(rule_settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
+            rule_profile = rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
+            normalized_weights = rule_settings.get("normalized_weights")
+
+            rule_threshold = float(rule_threshold_value)
             rule_scores_series = None
             rule_reasons_series = None
             rule_flags = np.zeros(total_predictions, dtype=bool)
             if apply_risk_rules is not None and pd is not None and total_predictions:
                 try:
-                    score_series, reason_series = apply_risk_rules(out_df)
+                    score_series, reason_series = apply_risk_rules(out_df, params=rule_params)
                 except Exception:
                     score_series = None
                     reason_series = None
@@ -4575,9 +4739,9 @@ class Ui_MainWindow(object):
             fusion_scores_array, fusion_flags_array = fuse_model_rule_votes(
                 model_flag_array,
                 rule_scores_array,
-                model_weight=float(DEFAULT_MODEL_WEIGHT),
-                rule_weight=float(DEFAULT_RULE_WEIGHT),
-                threshold=float(DEFAULT_FUSION_THRESHOLD),
+                model_weight=float(fusion_model_weight_base),
+                rule_weight=float(fusion_rule_weight_base),
+                threshold=float(fusion_threshold_value),
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
@@ -4653,6 +4817,8 @@ class Ui_MainWindow(object):
                 summary_lines.append(
                     f"规则命中：{rule_hits} 条 (阈值 {rule_threshold:.1f})"
                 )
+            if rule_profile:
+                summary_lines.append(f"规则配置：{rule_profile}")
             messages.extend(summary_lines)
             if not silent:
                 for msg in summary_lines:
@@ -4660,15 +4826,15 @@ class Ui_MainWindow(object):
 
             row_messages = _format_row_messages(out_df)
 
-            active_rule_weight = float(DEFAULT_RULE_WEIGHT) if (
+            active_rule_weight = float(fusion_rule_weight_base) if (
                 rule_scores_array is not None and rule_scores_array.size
             ) else 0.0
-            total_weight = float(DEFAULT_MODEL_WEIGHT + active_rule_weight)
+            total_weight = float(fusion_model_weight_base + active_rule_weight)
             if not math.isfinite(total_weight) or total_weight <= 0.0:
                 fusion_weight_model = 1.0
                 fusion_weight_rules = 0.0
             else:
-                fusion_weight_model = float(DEFAULT_MODEL_WEIGHT) / total_weight
+                fusion_weight_model = float(fusion_model_weight_base) / total_weight
                 fusion_weight_rules = active_rule_weight / total_weight
 
             fusion_scores_list = [float(value) for value in fusion_scores]
@@ -4678,6 +4844,21 @@ class Ui_MainWindow(object):
                 if rule_scores_array is not None
                 else None
             )
+
+            if isinstance(normalized_weights, dict):
+                configured_weights = {
+                    "model": float(normalized_weights.get("model", fusion_weight_model)),
+                    "rules": float(normalized_weights.get("rules", fusion_weight_rules)),
+                }
+            else:
+                denom = float(fusion_model_weight_base + fusion_rule_weight_base)
+                if not math.isfinite(denom) or denom <= 0.0:
+                    configured_weights = {"model": 1.0, "rules": 0.0}
+                else:
+                    configured_weights = {
+                        "model": float(fusion_model_weight_base) / denom,
+                        "rules": float(fusion_rule_weight_base) / denom,
+                    }
 
             return {
                 "output_csv": out_csv,
@@ -4705,16 +4886,18 @@ class Ui_MainWindow(object):
                 "raw_statuses": raw_statuses,
                 "fusion_scores": fusion_scores_list,
                 "fusion_flags": fusion_flags_list,
-                "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+                "fusion_threshold": float(fusion_threshold_value),
                 "fusion_weights": {
                     "model": fusion_weight_model,
                     "rules": fusion_weight_rules,
                 },
+                "configured_fusion_weights": configured_weights,
                 "model_flags": [bool(flag) for flag in model_flag_values],
                 "rule_flags": [bool(flag) for flag in rule_flags],
                 "rule_scores": rule_scores_list,
                 "rule_threshold": rule_threshold,
                 "rule_hits": rule_hits,
+                "rule_profile": rule_profile,
             }
 
         models_dir = self._default_models_dir()
@@ -4836,15 +5019,23 @@ class Ui_MainWindow(object):
         model_flag_values = model_flags.astype(int)
         model_statuses = ["异常" if flag else "正常" for flag in model_flags]
 
-        rule_threshold_raw = metadata.get("rule_threshold") if isinstance(metadata, dict) else None
-        rule_threshold = float(rule_threshold_raw) if rule_threshold_raw not in (None, "") else float(DEFAULT_TRIGGER_THRESHOLD)
+        rule_settings = self._resolve_rule_settings(metadata)
+        rule_params = rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
+        rule_threshold_value = float(rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD))
+        fusion_model_weight_base = float(rule_settings.get("model_weight", DEFAULT_MODEL_WEIGHT))
+        fusion_rule_weight_base = float(rule_settings.get("rule_weight", DEFAULT_RULE_WEIGHT))
+        fusion_threshold_value = float(rule_settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
+        rule_profile = rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
+        normalized_weights = rule_settings.get("normalized_weights")
+
+        rule_threshold = float(rule_threshold_value)
         rule_scores_series = None
         rule_reasons_series = None
         total = int(len(out_df))
         rule_flags = np.zeros(total, dtype=bool)
         if apply_risk_rules is not None and pd is not None and total:
             try:
-                score_series, reason_series = apply_risk_rules(out_df)
+                score_series, reason_series = apply_risk_rules(out_df, params=rule_params)
             except Exception:
                 score_series = None
                 reason_series = None
@@ -4866,9 +5057,9 @@ class Ui_MainWindow(object):
         fusion_scores_array, fusion_flags_array = fuse_model_rule_votes(
             model_flag_values.astype(float),
             rule_scores_array,
-            model_weight=float(DEFAULT_MODEL_WEIGHT),
-            rule_weight=float(DEFAULT_RULE_WEIGHT),
-            threshold=float(DEFAULT_FUSION_THRESHOLD),
+            model_weight=float(fusion_model_weight_base),
+            rule_weight=float(fusion_rule_weight_base),
+            threshold=float(fusion_threshold_value),
         )
         fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
         fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
@@ -4925,6 +5116,8 @@ class Ui_MainWindow(object):
         rule_hits = int(rule_flags.sum()) if total else 0
         if rule_hits:
             summary_lines.append(f"规则命中：{rule_hits} 条 (阈值 {rule_threshold:.1f})")
+        if rule_profile:
+            summary_lines.append(f"规则配置：{rule_profile}")
 
         if output_dir is None:
             output_dir = self._prediction_out_dir()
@@ -4941,15 +5134,15 @@ class Ui_MainWindow(object):
 
         row_messages = _format_row_messages(out_df)
 
-        active_rule_weight = float(DEFAULT_RULE_WEIGHT) if (
+        active_rule_weight = float(fusion_rule_weight_base) if (
             rule_scores_array is not None and rule_scores_array.size
         ) else 0.0
-        total_weight = float(DEFAULT_MODEL_WEIGHT + active_rule_weight)
+        total_weight = float(fusion_model_weight_base + active_rule_weight)
         if not math.isfinite(total_weight) or total_weight <= 0.0:
             fusion_weight_model = 1.0
             fusion_weight_rules = 0.0
         else:
-            fusion_weight_model = float(DEFAULT_MODEL_WEIGHT) / total_weight
+            fusion_weight_model = float(fusion_model_weight_base) / total_weight
             fusion_weight_rules = active_rule_weight / total_weight
 
         rule_scores_list = (
@@ -4957,6 +5150,21 @@ class Ui_MainWindow(object):
             if rule_scores_array is not None
             else None
         )
+
+        if isinstance(normalized_weights, dict):
+            configured_weights = {
+                "model": float(normalized_weights.get("model", fusion_weight_model)),
+                "rules": float(normalized_weights.get("rules", fusion_weight_rules)),
+            }
+        else:
+            denom = float(fusion_model_weight_base + fusion_rule_weight_base)
+            if not math.isfinite(denom) or denom <= 0.0:
+                configured_weights = {"model": 1.0, "rules": 0.0}
+            else:
+                configured_weights = {
+                    "model": float(fusion_model_weight_base) / denom,
+                    "rules": float(fusion_rule_weight_base) / denom,
+                }
 
         return {
             "output_csv": out_csv,
@@ -4971,17 +5179,19 @@ class Ui_MainWindow(object):
             "anomaly_flags": [bool(flag) for flag in fusion_flags],
             "fusion_flags": [bool(flag) for flag in fusion_flags],
             "fusion_scores": [float(value) for value in fusion_scores],
-            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+            "fusion_threshold": float(fusion_threshold_value),
             "fusion_weights": {
                 "model": fusion_weight_model,
                 "rules": fusion_weight_rules,
             },
+            "configured_fusion_weights": configured_weights,
             "model_flags": [bool(flag) for flag in model_flags],
             "model_statuses": model_statuses,
             "rule_flags": [bool(flag) for flag in rule_flags],
             "rule_scores": rule_scores_list,
             "rule_threshold": rule_threshold,
             "rule_hits": rule_hits,
+            "rule_profile": rule_profile,
         }
 
 
