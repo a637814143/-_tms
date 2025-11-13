@@ -21,12 +21,17 @@ DEFAULTS = dict(
     EXFIL_BPS_RATIO = 0.8,   # bps 的经验百分位阈值（兼容旧逻辑）
     EXFIL_UP_RATIO = 0.8,    # 上行/总流量占比异常阈值
     EXFIL_STRICT_UP_RATIO = 0.9,  # 上行占比极高时的强烈外泄提示
-    SYN_HEAVY = 15,          # SYN 明显多于 ACK 的简易阈
+    SYN_HEAVY = 50,          # SYN 明显多于 ACK 的触发计数
+    SYN_HEAVY_RATIO = 3.0,   # SYN/ACK 比例阈值
     SHORT_FLOW_SEC = 3.0,        # “很短”的流，单位秒
     SMALL_FLOW_BYTES = 800.0,    # 总字节很小
     HTTP_BRUTE_MIN = 20,         # 同一 src→dst:port 的短小流次数
     SLOWLORIS_MIN_DURATION = 60.0, # 慢速连接最小时长（秒）
     SLOWLORIS_MAX_PPS = 5.0,     # 慢速连接的最大包速
+    HTTP_LONG_FLOW_SEC = 60.0,   # HTTP 会话判定“长连接”的阈值（秒）
+    SLOWLORIS_STRICT_DURATION = 90.0,  # Slowloris 强判定持续时间阈值
+    SLOWLORIS_STRICT_PPS = 1.0,        # Slowloris 强判定包速阈值
+    SLOWLORIS_MAX_PKT_MEAN = 200.0,    # Slowloris 强判定平均包长阈值
     ONEWAY_MIN_PKTS = 50.0,      # 单向流的最小总包数
     ONEWAY_RATIO = 0.9,          # 单向占比阈值
     DNS_TUNNEL_MIN_DURATION = 30.0,
@@ -55,18 +60,21 @@ DEFAULTS = dict(
     UNUSUAL_PROTO_PPS = 100.0,     # 非 TCP/UDP 协议高频阈值
     SHORT_SESSION_DURATION = 1.0,  # 过短会话
     LONG_SESSION_DURATION = 3600.0,# 过长会话
+    HIGH_BANDWIDTH_ABS = 100_000.0,     # 持续高带宽绝对阈值（bytes/s）
+    HIGH_BANDWIDTH_DURATION = 10.0,     # 持续高带宽持续时间（秒）
+    HIGH_BANDWIDTH_PERCENTILE = 95.0,   # 持续高带宽百分位参考
 )
 
 # 规则判定异常时的默认触发阈值
 DEFAULT_TRIGGER_THRESHOLD = 40.0
 
 # 规则触发的兜底高敏感阈值（UI/导出使用）
-RULE_TRIGGER_THRESHOLD = 60.0
+RULE_TRIGGER_THRESHOLD = 25.0
 
 # 模型与规则融合的默认权重与阈值
-DEFAULT_MODEL_WEIGHT = 0.7
-DEFAULT_RULE_WEIGHT = 0.3
-DEFAULT_FUSION_THRESHOLD = 0.5
+DEFAULT_MODEL_WEIGHT = 0.3
+DEFAULT_RULE_WEIGHT = 0.7
+DEFAULT_FUSION_THRESHOLD = 0.2
 
 
 def _load_rules_config() -> Dict[str, Any]:
@@ -202,8 +210,27 @@ def score_rules(
     )
     proto_upper = proto.str.upper()
 
+    # 目标端口（字符串形式，缺失时填充空串）
+    dst_port_series = (
+        df["dst_port"].astype(str)
+        if "dst_port" in df.columns
+        else pd.Series([""] * n, index=df.index, dtype=str)
+    )
+    http_service_ports = {"80", "443", "8080", "8000", "8443"}
+    http_port_mask_global = dst_port_series.isin(http_service_ports)
+    tcp_http_mask = proto_upper.eq("TCP") & http_port_mask_global
+
+    slowloris_strict_mask = pd.Series(np.zeros(n, dtype=bool), index=df.index)
+
     # 会话时长
-    flow_duration = col("flow_duration") + col("Flow Duration")
+    flow_duration_raw = col("flow_duration") + col("Flow Duration")
+    flow_duration_vals = flow_duration_raw.to_numpy()
+    if flow_duration_vals.size and np.nanmax(np.abs(flow_duration_vals)) > 1_000_000:
+        flow_duration = pd.Series(
+            flow_duration_vals / 1_000_000.0, index=df.index, dtype=np.float32
+        )
+    else:
+        flow_duration = flow_duration_raw
 
     # 包速：优先用 Flow Packets/s 或 flow_pkts_per_s
     pps = (
@@ -310,20 +337,43 @@ def score_rules(
 
     # 动态检测异常高带宽
     valid_rate = flow_rate[flow_rate > 0]
+    percentile_threshold = 0.0
+    if len(valid_rate) > 0:
+        percentile_threshold = np.percentile(
+            valid_rate.to_numpy(), params.get("HIGH_BANDWIDTH_PERCENTILE", 95.0)
+        )
+
+    dynamic_threshold = 0.0
     if len(valid_rate) > 1:
         mean_rate = valid_rate.mean()
         std_rate = valid_rate.std(ddof=0)
         dynamic_threshold = mean_rate + params["BPS_SIGMA_MULT"] * std_rate
-        sigma_mask = flow_rate >= dynamic_threshold
-        for i in np.where(sigma_mask)[0]:
-            score[i] += 20
-            reasons[i].append("瞬时带宽异常高")
 
-    # 5) SYN 异常（近似）：tcp_flag_count 不为 0 且超过阈值（如果你后续把各 flag 单独计数，这里可更精准）
-    synheavy_mask = (tcp_flags_count >= params["SYN_HEAVY"])
-    for i in np.where(synheavy_mask)[0]:
+    absolute_threshold = params.get("HIGH_BANDWIDTH_ABS", 100_000.0)
+    effective_threshold = max(absolute_threshold, percentile_threshold, dynamic_threshold)
+    duration_threshold = params.get("HIGH_BANDWIDTH_DURATION", 10.0)
+
+    high_bandwidth_mask = (flow_rate >= effective_threshold) & (flow_duration >= duration_threshold)
+    for i in np.where(high_bandwidth_mask.to_numpy())[0]:
+        score[i] += 10
+        reasons[i].append("持续高带宽传输")
+
+    # 5) SYN 异常（近似）：SYN/ACK 比例显著失衡
+    syn_count = col("SYN Flag Count") + col("Syn Flag Count") + col("syn_flag_count")
+    ack_count = col("ACK Flag Count") + col("Ack Flag Count") + col("ack_flag_count")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        syn_ack_ratio = np.divide(
+            syn_count.to_numpy(),
+            np.maximum(ack_count.to_numpy(), 1.0),
+            out=np.ones(n, dtype=np.float32),
+        )
+    syn_ratio_series = pd.Series(syn_ack_ratio, index=df.index, dtype=np.float32)
+    synheavy_mask = (syn_count >= params["SYN_HEAVY"]) & (
+        syn_ratio_series >= params.get("SYN_HEAVY_RATIO", 3.0)
+    )
+    for i in np.where(synheavy_mask.to_numpy())[0]:
         score[i] += 20
-        reasons[i].append("SYN 异常")
+        reasons[i].append("SYN/ACK 比例异常")
 
     # === 6) HTTP 短小高频访问：近似 Web 扫描 / 爆破 / 批量注入 ===
     # 不看 HTTP 内容，只用统计特征：同一 src_ip 对同一 dst_ip:dst_port 发起很多「很短 + 很小」的流
@@ -344,11 +394,7 @@ def score_rules(
             & (total_bytes <= params["SMALL_FLOW_BYTES"])
         )
 
-        http_port_mask = (
-            df["dst_port"].astype(str).isin(["80", "443", "8080", "8000", "8443"])
-            if "dst_port" in df.columns
-            else pd.Series([False] * n, index=df.index, dtype=bool)
-        )
+        http_port_mask = http_port_mask_global
 
         if http_port_mask.any():
             grp = df[http_port_mask].groupby(["src_ip", "dst_ip", "dst_port"], dropna=False)
@@ -368,16 +414,38 @@ def score_rules(
                 reasons[i].append("HTTP短小高频访问(疑似爆破/批量注入/扫描)")
 
     # === 7) 慢速 DoS / Slowloris 近似：长连接 + 包速极低 ===
-    if ("flow_duration" in df.columns) or ("Flow Duration" in df.columns):
-        slow_mask = (
-            (flow_duration >= params["SLOWLORIS_MIN_DURATION"])
-            & (pps > 0)
-            & (pps <= params["SLOWLORIS_MAX_PPS"])
-        )
-        slow_idx = np.where(slow_mask.to_numpy())[0]
-        score[slow_idx] += 25
-        for i in slow_idx:
+    http_long_threshold = params.get(
+        "HTTP_LONG_FLOW_SEC", params.get("SLOWLORIS_MIN_DURATION", 60.0)
+    )
+    slow_base_mask = (
+        tcp_http_mask
+        & (flow_duration >= http_long_threshold)
+        & (pps > 0)
+        & (pps <= params["SLOWLORIS_MAX_PPS"])
+    )
+
+    strict_duration = max(
+        params.get("SLOWLORIS_STRICT_DURATION", http_long_threshold),
+        http_long_threshold,
+    )
+    strict_pps = params.get("SLOWLORIS_STRICT_PPS", 1.0)
+    max_pkt_mean = params.get("SLOWLORIS_MAX_PKT_MEAN", 200.0)
+
+    slowloris_strict_mask = (
+        tcp_http_mask
+        & (flow_duration >= strict_duration)
+        & (pps > 0)
+        & (pps <= strict_pps)
+        & (packet_len_mean > 0)
+        & (packet_len_mean <= max_pkt_mean)
+    )
+
+    strict_idx = np.where(slowloris_strict_mask.to_numpy())[0]
+    if strict_idx.size:
+        score[strict_idx] += 20
+        for i in strict_idx:
             reasons[i].append("长时间低包速连接(疑似Slowloris/慢速DoS)")
+            reasons[i].append("疑似Slowloris攻击")
 
     # === 8) 单向流异常：大量包几乎只在一个方向 ===
     fwd_pkts = col("Total Fwd Packets") + col("total_fwd_pkts")
@@ -538,9 +606,21 @@ def score_rules(
         score[i] += 20
         reasons[i].append("会话持续时间过短")
 
-    long_session_mask = flow_duration >= params["LONG_SESSION_DURATION"]
-    for i in np.where(long_session_mask)[0]:
-        score[i] += 20
+    http_long_threshold = params.get(
+        "HTTP_LONG_FLOW_SEC", params.get("SLOWLORIS_MIN_DURATION", 60.0)
+    )
+    http_long_mask = tcp_http_mask & (flow_duration >= http_long_threshold)
+    http_long_idx = np.where(http_long_mask.to_numpy())[0]
+    for i in http_long_idx:
+        score[i] += 10
+        if bool(slow_base_mask.iloc[i]):
+            reasons[i].append("HTTP会话持续时间较长(低包速)")
+        else:
+            reasons[i].append("HTTP会话持续时间过长")
+
+    very_long_mask = (~http_long_mask) & (flow_duration >= params["LONG_SESSION_DURATION"])
+    for i in np.where(very_long_mask.to_numpy())[0]:
+        score[i] += 10
         reasons[i].append("会话持续时间过长")
 
     # 归一 & 文本
