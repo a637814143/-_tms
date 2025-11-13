@@ -462,10 +462,37 @@ def _run_prediction(
                 fusion_weight_model = float(fusion_model_weight_base) / total_weight
                 fusion_weight_rules = float(fusion_rule_weight_base) / total_weight
 
-            final_statuses = ["异常" if flag else "正常" for flag in fusion_flags_array]
-            anomaly_count = int(np.count_nonzero(fusion_flags_array))
-            normal_count = int(len(fusion_flags_array) - anomaly_count)
-            status_text = "异常" if anomaly_count > 0 else ("正常" if len(fusion_flags_array) else None)
+            profile_key = (rule_profile or "").strip().lower()
+            if rule_scores_array is not None:
+                rule_scores_for_logic = np.asarray(rule_scores_array, dtype=np.float64).reshape(-1)
+            else:
+                rule_scores_for_logic = np.zeros_like(fusion_scores_array, dtype=np.float64)
+            if rule_scores_for_logic.shape != fusion_scores_array.shape:
+                target_len = fusion_scores_array.shape[0]
+                current_len = rule_scores_for_logic.shape[0]
+                if current_len < target_len:
+                    padded = np.zeros_like(fusion_scores_array, dtype=np.float64)
+                    padded[:current_len] = rule_scores_for_logic
+                    rule_scores_for_logic = padded
+                else:
+                    rule_scores_for_logic = rule_scores_for_logic[:target_len]
+
+            strong_rule_flags = np.logical_or(
+                rule_scores_for_logic >= 80.0,
+                rules_triggered_array,
+            )
+            if profile_key == "aggressive":
+                final_flags_array = np.logical_or(
+                    fusion_scores_array >= float(fusion_threshold_value),
+                    strong_rule_flags,
+                )
+            else:
+                final_flags_array = fusion_scores_array >= float(fusion_threshold_value)
+
+            final_statuses = ["异常" if flag else "正常" for flag in final_flags_array]
+            anomaly_count = int(np.count_nonzero(final_flags_array))
+            normal_count = int(len(final_flags_array) - anomaly_count)
+            status_text = "异常" if anomaly_count > 0 else ("正常" if len(final_flags_array) else None)
 
             output_df = df.copy()
             output_df["prediction"] = preds_arr
@@ -475,7 +502,7 @@ def _run_prediction(
             output_df["model_status"] = model_statuses
             output_df["fusion_score"] = fusion_scores_array
             output_df["fusion_decision"] = fusion_flags_array.astype(int)
-            output_df["prediction_status"] = fusion_flags_array.astype(int)
+            output_df["prediction_status"] = final_flags_array.astype(int)
             output_df["fusion_status"] = final_statuses
             if rule_scores_array is not None:
                 output_df["rules_score"] = rule_scores_array
@@ -638,18 +665,45 @@ def _run_prediction(
                 fusion_weight_model = float(fusion_model_weight_base) / total_weight
                 fusion_weight_rules = float(fusion_rule_weight_base) / total_weight
 
-            final_statuses = ["异常" if flag else "正常" for flag in fusion_flags_array]
-            anomaly_count = int(np.count_nonzero(fusion_flags_array))
-            normal_count = int(len(fusion_flags_array) - anomaly_count)
-            status_text = "异常" if anomaly_count > 0 else ("正常" if len(fusion_flags_array) else None)
+            profile_key = (rule_profile or "").strip().lower()
+            if rule_scores_array is not None:
+                rule_scores_for_logic = np.asarray(rule_scores_array, dtype=np.float64).reshape(-1)
+            else:
+                rule_scores_for_logic = np.zeros_like(fusion_scores_array, dtype=np.float64)
+            if rule_scores_for_logic.shape != fusion_scores_array.shape:
+                target_len = fusion_scores_array.shape[0]
+                current_len = rule_scores_for_logic.shape[0]
+                if current_len < target_len:
+                    padded = np.zeros_like(fusion_scores_array, dtype=np.float64)
+                    padded[:current_len] = rule_scores_for_logic
+                    rule_scores_for_logic = padded
+                else:
+                    rule_scores_for_logic = rule_scores_for_logic[:target_len]
+
+            strong_rule_flags = np.logical_or(
+                rule_scores_for_logic >= 80.0,
+                rules_triggered_array,
+            )
+            if profile_key == "aggressive":
+                final_flags_array = np.logical_or(
+                    fusion_scores_array >= float(fusion_threshold_value),
+                    strong_rule_flags,
+                )
+            else:
+                final_flags_array = fusion_scores_array >= float(fusion_threshold_value)
+
+            final_statuses = ["异常" if flag else "正常" for flag in final_flags_array]
+            anomaly_count = int(np.count_nonzero(final_flags_array))
+            normal_count = int(len(final_flags_array) - anomaly_count)
+            status_text = "异常" if anomaly_count > 0 else ("正常" if len(final_flags_array) else None)
 
             output_df["model_flag"] = model_flags_bool.astype(int)
             output_df["model_status"] = model_statuses
             output_df["fusion_score"] = fusion_scores_array
             output_df["fusion_decision"] = fusion_flags_array.astype(int)
-            output_df["prediction_status"] = fusion_flags_array.astype(int)
+            output_df["prediction_status"] = final_flags_array.astype(int)
             output_df["fusion_status"] = final_statuses
-            output_df["is_malicious"] = fusion_flags_array.astype(int)
+            output_df["is_malicious"] = final_flags_array.astype(int)
 
             if rule_scores_array is not None:
                 output_df["rules_score"] = rule_scores_array
