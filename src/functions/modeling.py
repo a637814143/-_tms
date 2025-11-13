@@ -11,6 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Un
 import numpy as np
 from joblib import dump, load
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import f1_score, roc_auc_score
 
 from .feature_extractor import extract_pcap_features
 from .vectorizer import (
@@ -32,6 +33,7 @@ try:  # 规则引擎不是硬依赖
         DEFAULT_RULE_WEIGHT,
         DEFAULT_FUSION_THRESHOLD,
         fuse_model_rule_votes,
+        get_rule_settings,
         score_rules as apply_risk_rules,
     )
 except Exception:  # pragma: no cover - 缺少依赖时退化
@@ -40,6 +42,16 @@ except Exception:  # pragma: no cover - 缺少依赖时退化
     DEFAULT_MODEL_WEIGHT = 0.6  # type: ignore
     DEFAULT_RULE_WEIGHT = 0.4  # type: ignore
     DEFAULT_FUSION_THRESHOLD = 0.5  # type: ignore
+
+    def get_rule_settings(profile: Optional[str] = None) -> Dict[str, object]:  # type: ignore
+        return {
+            "params": {},
+            "trigger_threshold": float(DEFAULT_TRIGGER_THRESHOLD),
+            "model_weight": float(DEFAULT_MODEL_WEIGHT),
+            "rule_weight": float(DEFAULT_RULE_WEIGHT),
+            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+            "profile": profile,
+        }
 
     def fuse_model_rule_votes(
         model_flags: Iterable[object],
@@ -120,6 +132,9 @@ class EnsembleVotingClassifier:
         estimators: Sequence[Any],
         *,
         voting: str = "soft",
+        weights: Optional[Sequence[Optional[float]]] = None,
+        metadata: Optional[Sequence[Optional[Dict[str, Any]]]] = None,
+        weight_metric: Optional[str] = None,
     ) -> None:
         if not estimators:
             raise ValueError("estimators sequence cannot be empty")
@@ -143,6 +158,60 @@ class EnsembleVotingClassifier:
 
         self.classes_ = np.asarray(seen, dtype=object)
         self._class_index = {cls: idx for idx, cls in enumerate(self.classes_)}
+
+        self.estimator_weights_ = self._prepare_weights(weights)
+        self.estimator_metadata_ = self._prepare_metadata(metadata)
+        self.weight_metric_ = self._normalize_weight_metric(weight_metric)
+
+    @staticmethod
+    def _normalize_weight_metric(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        token = str(value).strip().lower()
+        if not token:
+            return None
+        if token in {"auc", "roc_auc"}:
+            return "auc"
+        if token in {"f1", "f1_score"}:
+            return "f1"
+        if token in {"samples", "sample_count", "rows"}:
+            return "samples"
+        return token
+
+    def _prepare_weights(
+        self, weights: Optional[Sequence[Optional[float]]]
+    ) -> List[float]:
+        sanitized: List[float] = []
+        for idx, _ in enumerate(self.estimators_):
+            candidate = weights[idx] if weights is not None and idx < len(weights) else None
+            sanitized.append(self._sanitize_weight(candidate))
+        if not sanitized:
+            raise ValueError("ensemble requires at least one estimator weight")
+        return sanitized
+
+    def _prepare_metadata(
+        self, metadata: Optional[Sequence[Optional[Dict[str, Any]]]]
+    ) -> List[Dict[str, Any]]:
+        prepared: List[Dict[str, Any]] = []
+        for idx, _ in enumerate(self.estimators_):
+            entry = metadata[idx] if metadata is not None and idx < len(metadata) else None
+            if isinstance(entry, dict):
+                prepared.append(dict(entry))
+            else:
+                prepared.append({})
+        return prepared
+
+    @staticmethod
+    def _sanitize_weight(value: Optional[float]) -> float:
+        if value is None:
+            return 1.0
+        try:
+            weight = float(value)
+        except (TypeError, ValueError):
+            return 1.0
+        if not np.isfinite(weight) or weight <= 0.0:
+            return 1.0
+        return weight
 
     def __len__(self) -> int:  # pragma: no cover - trivial
         return len(self.estimators_)
@@ -179,9 +248,9 @@ class EnsembleVotingClassifier:
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         accumulator: Optional[np.ndarray] = None
-        used = 0
+        total_weight = 0.0
 
-        for estimator in self.estimators_:
+        for estimator, weight in zip(self.estimators_, self.estimator_weights_):
             if hasattr(estimator, "predict_proba"):
                 proba = estimator.predict_proba(X)
                 proba = np.asarray(proba, dtype=np.float64)
@@ -193,13 +262,13 @@ class EnsembleVotingClassifier:
 
             if accumulator is None:
                 accumulator = np.zeros_like(aligned)
-            accumulator += aligned
-            used += 1
+            accumulator += aligned * weight
+            total_weight += weight
 
-        if accumulator is None or used == 0:
+        if accumulator is None or total_weight <= 0.0:
             raise RuntimeError("ensemble does not contain usable estimators")
 
-        averaged = accumulator / float(used)
+        averaged = accumulator / float(total_weight)
         row_sums = averaged.sum(axis=1, keepdims=True)
         with np.errstate(divide="ignore", invalid="ignore"):
             normalized = np.divide(
@@ -217,6 +286,194 @@ class EnsembleVotingClassifier:
         proba = self.predict_proba(X)
         indices = np.argmax(proba, axis=1)
         return self.classes_[indices]
+
+
+DEFAULT_MAX_ENSEMBLE_MEMBERS = 10
+
+
+def _normalized_weight_metric(value: Optional[str]) -> str:
+    normalized = EnsembleVotingClassifier._normalize_weight_metric(value)
+    if normalized in {None, ""}:
+        return "samples"
+    return str(normalized)
+
+
+def _compute_member_weight(
+    weight_metric: str,
+    sample_count: int,
+    metrics: Optional[Dict[str, float]] = None,
+) -> float:
+    metrics = metrics or {}
+    metric_value: Optional[float] = None
+
+    def _pick(keys: Sequence[str]) -> Optional[float]:
+        for key in keys:
+            value = metrics.get(key)
+            if value is None:
+                continue
+            try:
+                candidate = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(candidate) and candidate > 0.0:
+                return candidate
+        return None
+
+    metric_lower = weight_metric.strip().lower()
+    if metric_lower == "auc":
+        metric_value = _pick(["val_auc", "validation_auc", "train_auc", "train_auc_macro"])
+    elif metric_lower == "f1":
+        metric_value = _pick([
+            "val_f1", "validation_f1", "val_f1_weighted", "train_f1_weighted", "train_f1", "train_f1_macro",
+        ])
+
+    if metric_lower == "samples" or metric_value is None:
+        metric_value = float(sample_count or 1)
+
+    if not np.isfinite(metric_value) or metric_value <= 0.0:
+        return float(sample_count or 1)
+    return float(metric_value)
+
+
+def _resolve_rule_fusion_settings() -> Dict[str, object]:
+    try:
+        rule_settings = get_rule_settings()
+    except Exception:
+        rule_settings = {}
+
+    profile: Optional[str] = None
+    rule_threshold_value: Optional[float] = None
+    fusion_threshold_value: Optional[float] = None
+    fusion_model_weight_value: Optional[float] = None
+    fusion_rule_weight_value: Optional[float] = None
+
+    if isinstance(rule_settings, dict):
+        profile_raw = rule_settings.get("profile")
+        if isinstance(profile_raw, str) and profile_raw.strip():
+            profile = profile_raw.strip()
+
+        try:
+            rule_threshold_value = float(rule_settings.get("trigger_threshold"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            rule_threshold_value = float(DEFAULT_TRIGGER_THRESHOLD)
+
+        try:
+            fusion_threshold_value = float(rule_settings.get("fusion_threshold"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            fusion_threshold_value = float(DEFAULT_FUSION_THRESHOLD)
+
+        try:
+            fusion_model_weight_value = float(rule_settings.get("model_weight"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            fusion_model_weight_value = float(DEFAULT_MODEL_WEIGHT)
+
+        try:
+            fusion_rule_weight_value = float(rule_settings.get("rule_weight"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            fusion_rule_weight_value = float(DEFAULT_RULE_WEIGHT)
+
+    total_weight = float((fusion_model_weight_value or 0.0) + (fusion_rule_weight_value or 0.0))
+    if not np.isfinite(total_weight) or total_weight <= 0.0:
+        normalized_model = 1.0
+        normalized_rules = 0.0
+    else:
+        normalized_model = float(fusion_model_weight_value or 0.0) / total_weight
+        normalized_rules = float(fusion_rule_weight_value or 0.0) / total_weight
+
+    return {
+        "profile": profile,
+        "rule_threshold": rule_threshold_value,
+        "fusion_threshold": fusion_threshold_value,
+        "model_weight": fusion_model_weight_value,
+        "rule_weight": fusion_rule_weight_value,
+        "weights": {
+            "model": float(normalized_model),
+            "rules": float(normalized_rules),
+        },
+    }
+
+
+def _normalize_member_record(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    estimator = item.get("estimator")
+    if estimator is None:
+        return None
+
+    normalized: Dict[str, Any] = {"estimator": estimator}
+    normalized["weight"] = EnsembleVotingClassifier._sanitize_weight(item.get("weight"))
+
+    if "trained_at" in item and item.get("trained_at") is not None:
+        normalized["trained_at"] = str(item.get("trained_at"))
+    if "training_samples" in item and item.get("training_samples") is not None:
+        try:
+            normalized["training_samples"] = int(item.get("training_samples"))
+        except (TypeError, ValueError):
+            pass
+
+    metrics = item.get("metrics")
+    if isinstance(metrics, dict) and metrics:
+        metric_map: Dict[str, float] = {}
+        for key, value in metrics.items():
+            try:
+                metric_map[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        if metric_map:
+            normalized["metrics"] = metric_map
+
+    for extra_key in ("notes", "comment"):
+        if extra_key in item:
+            normalized[extra_key] = item[extra_key]
+
+    return normalized
+
+
+def _load_existing_ensemble(
+    model_path: Union[str, Path]
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    path = Path(model_path)
+    if not path.exists():
+        return [], None
+
+    try:
+        artifact = load(path)
+    except Exception:
+        return [], None
+
+    members: List[Dict[str, Any]] = []
+    weight_metric: Optional[str] = None
+
+    if isinstance(artifact, dict):
+        ensemble_blob = artifact.get("ensemble")
+        if isinstance(ensemble_blob, dict):
+            weight_metric = ensemble_blob.get("weight_metric")
+            raw_members = ensemble_blob.get("members")
+            if isinstance(raw_members, list):
+                for item in raw_members:
+                    if isinstance(item, dict):
+                        normalized = _normalize_member_record(item)
+                        if normalized is not None:
+                            members.append(normalized)
+        else:
+            model_obj = artifact.get("model")
+            if isinstance(model_obj, EnsembleVotingClassifier):
+                weight_metric = getattr(model_obj, "weight_metric_", None)
+                for est, weight, meta in zip(
+                    model_obj.estimators_,
+                    getattr(model_obj, "estimator_weights_", []),
+                    getattr(model_obj, "estimator_metadata_", []),
+                ):
+                    payload: Dict[str, Any] = {"estimator": est, "weight": weight}
+                    if isinstance(meta, dict):
+                        payload.update(meta)
+                    normalized = _normalize_member_record(payload)
+                    if normalized is not None:
+                        members.append(normalized)
+            elif model_obj is not None:
+                normalized = _normalize_member_record({"estimator": model_obj, "weight": 1.0})
+                if normalized is not None:
+                    members.append(normalized)
+
+    return members, weight_metric
 
 
 def _valid_estimator_param_names(model_class: type) -> Set[str]:
@@ -298,6 +555,7 @@ class DetectionResult:
     fusion_statuses: Optional[List[str]] = None
     fusion_threshold: Optional[float] = None
     fusion_weights: Optional[Dict[str, float]] = None
+    rule_profile: Optional[str] = None
 
 
 DEFAULT_MODEL_PARAMS: Dict[str, Union[int, float, None]] = {
@@ -479,6 +737,10 @@ def train_hist_gradient_boosting(
 ) -> TrainingSummary:
     """Train a tree-based classifier similar to the EMBER pipeline."""
 
+    max_members_raw = kwargs.pop("max_ensemble_members", None)
+    ensemble_weight_metric_raw = kwargs.pop("ensemble_weight_metric", None)
+    reset_ensemble_flag = kwargs.pop("reset_ensemble", None)
+
     X, y, feature_names, label_mapping, stats = load_vectorized_dataset(
         dataset_path, show_progress=True, return_stats=True
     )
@@ -497,10 +759,124 @@ def train_hist_gradient_boosting(
     clf = HistGradientBoostingClassifier(**params)
     clf.fit(X, y)
 
+    sample_count = int(X.shape[0])
+
+    metrics_map: Dict[str, float] = {}
+    try:
+        train_predictions = clf.predict(X)
+    except Exception:
+        train_predictions = None
+
+    if train_predictions is not None:
+        try:
+            metrics_map["train_f1_weighted"] = float(
+                f1_score(y, train_predictions, average="weighted")
+            )
+        except Exception:
+            pass
+
+    try:
+        if hasattr(clf, "predict_proba"):
+            proba_train = clf.predict_proba(X)
+        else:
+            proba_train = None
+    except Exception:
+        proba_train = None
+
+    if proba_train is not None and np.ndim(proba_train) == 2 and proba_train.size:
+        unique_labels = np.unique(y)
+        try:
+            if proba_train.shape[1] == 2 or unique_labels.size == 2:
+                pos_info = _resolve_positive_class(clf, label_mapping)
+                pos_index = pos_info.index if pos_info.index is not None else proba_train.shape[1] - 1
+                pos_index = max(0, min(proba_train.shape[1] - 1, int(pos_index)))
+                metrics_map["train_auc"] = float(
+                    roc_auc_score(y, proba_train[:, pos_index])
+                )
+            elif proba_train.shape[1] > 2 and unique_labels.size > 2:
+                metrics_map["train_auc_macro"] = float(
+                    roc_auc_score(y, proba_train, multi_class="ovr", average="macro")
+                )
+        except Exception:
+            pass
+
+    existing_members, existing_metric = _load_existing_ensemble(model_path)
+
+    try:
+        max_members = int(max_members_raw) if max_members_raw is not None else DEFAULT_MAX_ENSEMBLE_MEMBERS
+    except (TypeError, ValueError):
+        max_members = DEFAULT_MAX_ENSEMBLE_MEMBERS
+    max_members = max(1, max_members)
+
+    requested_metric = None
+    if ensemble_weight_metric_raw is not None:
+        requested_metric = str(ensemble_weight_metric_raw)
+    elif existing_metric is not None:
+        requested_metric = str(existing_metric)
+    weight_metric = _normalized_weight_metric(requested_metric)
+
+    reset_ensemble = bool(reset_ensemble_flag)
+    retained_members = list(existing_members)
+    total_dropped = 0
+
+    if reset_ensemble and retained_members:
+        total_dropped += len(retained_members)
+        retained_members = []
+
+    if max_members <= 1:
+        total_dropped += len(retained_members)
+        retained_members = []
+    else:
+        allowed_previous = max_members - 1
+        if len(retained_members) > allowed_previous:
+            drop_count = len(retained_members) - allowed_previous
+            total_dropped += drop_count
+            retained_members = retained_members[-allowed_previous:]
+
+    trained_at = datetime.now().isoformat(timespec="seconds")
+    member_weight = _compute_member_weight(weight_metric, sample_count, metrics_map)
+
+    new_member: Dict[str, Any] = {
+        "estimator": clf,
+        "weight": member_weight,
+        "trained_at": trained_at,
+        "training_samples": sample_count,
+    }
+    if metrics_map:
+        new_member["metrics"] = metrics_map
+    if reset_ensemble:
+        new_member["reset"] = True
+
+    ensemble_members = retained_members + [new_member]
+
+    estimators = [item["estimator"] for item in ensemble_members]
+    weights = [EnsembleVotingClassifier._sanitize_weight(item.get("weight")) for item in ensemble_members]
+    estimator_metadata = []
+    for item in ensemble_members:
+        meta = {key: value for key, value in item.items() if key not in {"estimator", "weight"}}
+        estimator_metadata.append(meta)
+
+    ensemble_model = EnsembleVotingClassifier(
+        estimators,
+        voting="soft",
+        weights=weights,
+        metadata=estimator_metadata,
+        weight_metric=weight_metric,
+    )
+
+    ensemble_info = {
+        "members": ensemble_members,
+        "max_members": max_members,
+        "weight_metric": weight_metric,
+        "updated_at": trained_at,
+        "reset": bool(reset_ensemble),
+    }
+
     artifact = {
-        "model": clf,
+        "model": ensemble_model,
         "feature_names": feature_names,
         "label_mapping": label_mapping,
+        "ensemble": ensemble_info,
     }
     dump(artifact, model_path)
 
@@ -510,6 +886,17 @@ def train_hist_gradient_boosting(
         model_params = params
     write_metadata(model_path, feature_names, label_mapping, model_params)
 
+    ensemble_count = len(ensemble_members)
+    retained_count = max(ensemble_count - 1, 0)
+    ensemble_metrics: Optional[Dict[str, float]] = {
+        "ensemble_members": float(ensemble_count),
+        "ensemble_added": 1.0,
+        "ensemble_retained": float(retained_count),
+        "ensemble_dropped": float(total_dropped),
+    }
+
+    fusion_settings = _resolve_rule_fusion_settings()
+
     _write_model_metadata(
         model_path,
         feature_names=feature_names,
@@ -517,18 +904,26 @@ def train_hist_gradient_boosting(
         decision_threshold=None,
         positive_label=None,
         positive_class=None,
-        metrics=None,
+        metrics=ensemble_metrics,
         class_weights=None,
-        ensemble_members=None,
-        ensemble_added=None,
-        ensemble_retained=None,
-        ensemble_dropped=None,
+        ensemble_members=ensemble_count,
+        ensemble_added=1,
+        ensemble_retained=retained_count,
+        ensemble_dropped=total_dropped,
+        ensemble_weight_metric=weight_metric,
+        ensemble_max_members=max_members,
+        rule_profile=fusion_settings.get("profile"),
+        rule_threshold=fusion_settings.get("rule_threshold"),
+        fusion_threshold=fusion_settings.get("fusion_threshold"),
+        fusion_model_weight=fusion_settings.get("model_weight"),
+        fusion_rule_weight=fusion_settings.get("rule_weight"),
+        fusion_weights=fusion_settings.get("weights"),
     )
 
     if label_mapping:
-        classes_display = [label_mapping.get(int(cls), str(cls)) for cls in clf.classes_]
+        classes_display = [label_mapping.get(int(cls), str(cls)) for cls in ensemble_model.classes_]
     else:
-        classes_display = [str(cls) for cls in clf.classes_]
+        classes_display = [str(cls) for cls in ensemble_model.classes_]
 
     return TrainingSummary(
         model_path=Path(model_path),
@@ -537,6 +932,7 @@ def train_hist_gradient_boosting(
         flow_count=int(X.shape[0]),
         label_mapping=label_mapping,
         dropped_flows=int(stats.dropped_rows),
+        metrics=ensemble_metrics,
     )
 
 
@@ -554,6 +950,14 @@ def _write_model_metadata(
     ensemble_added: Optional[int] = None,
     ensemble_retained: Optional[int] = None,
     ensemble_dropped: Optional[int] = None,
+    ensemble_weight_metric: Optional[str] = None,
+    ensemble_max_members: Optional[int] = None,
+    rule_profile: Optional[str] = None,
+    rule_threshold: Optional[float] = None,
+    fusion_threshold: Optional[float] = None,
+    fusion_model_weight: Optional[float] = None,
+    fusion_rule_weight: Optional[float] = None,
+    fusion_weights: Optional[Dict[str, float]] = None,
 ) -> Path:
     """Persist metadata alongside the trained model for UI alignment."""
 
@@ -599,6 +1003,38 @@ def _write_model_metadata(
         metadata["ensemble_retained"] = int(ensemble_retained)
     if ensemble_dropped is not None:
         metadata["ensemble_dropped"] = int(ensemble_dropped)
+    if ensemble_weight_metric:
+        metadata["ensemble_weight_metric"] = str(ensemble_weight_metric)
+    if ensemble_max_members is not None:
+        metadata["ensemble_max_members"] = int(ensemble_max_members)
+    if rule_profile:
+        metadata["rule_profile"] = str(rule_profile)
+    if rule_threshold is not None:
+        metadata["rule_threshold"] = float(rule_threshold)
+    if fusion_threshold is not None:
+        metadata["fusion_threshold"] = float(fusion_threshold)
+    if fusion_model_weight is not None:
+        metadata["fusion_model_weight"] = float(fusion_model_weight)
+    if fusion_rule_weight is not None:
+        metadata["fusion_rule_weight"] = float(fusion_rule_weight)
+
+    weights_payload: Optional[Dict[str, float]]
+    if isinstance(fusion_weights, dict) and fusion_weights:
+        weights_payload = {
+            "model": float(fusion_weights.get("model", 1.0)),
+            "rules": float(fusion_weights.get("rules", 0.0)),
+        }
+    else:
+        total = float((fusion_model_weight or 0.0) + (fusion_rule_weight or 0.0))
+        if not np.isfinite(total) or total <= 0.0:
+            weights_payload = {"model": 1.0, "rules": 0.0}
+        else:
+            weights_payload = {
+                "model": float(fusion_model_weight or 0.0) / total,
+                "rules": float(fusion_rule_weight or 0.0) / total,
+            }
+
+    metadata["fusion_weights"] = weights_payload
 
     with metadata_path.open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
@@ -751,6 +1187,44 @@ def _build_detection_result(
             model_flags[idx] = fallback_flag
             model_statuses.append("异常" if fallback_flag else "正常")
 
+    def _safe_float(value: object, fallback: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(fallback)
+
+    try:
+        rule_config = get_rule_settings()
+    except Exception:
+        rule_config = {}
+
+    rule_params_config = rule_config.get("params") if isinstance(rule_config, dict) else None
+    rule_params_dict = (
+        dict(rule_params_config) if isinstance(rule_params_config, dict) else {}
+    )
+    rule_profile = rule_config.get("profile") if isinstance(rule_config, dict) else None
+    if not isinstance(rule_profile, str) or not rule_profile.strip():
+        rule_profile = None
+    else:
+        rule_profile = rule_profile.strip()
+
+    default_rule_threshold = _safe_float(
+        rule_config.get("trigger_threshold") if isinstance(rule_config, dict) else None,
+        DEFAULT_TRIGGER_THRESHOLD,
+    )
+    fusion_model_weight_base = _safe_float(
+        rule_config.get("model_weight") if isinstance(rule_config, dict) else None,
+        DEFAULT_MODEL_WEIGHT,
+    )
+    fusion_rule_weight_base = _safe_float(
+        rule_config.get("rule_weight") if isinstance(rule_config, dict) else None,
+        DEFAULT_RULE_WEIGHT,
+    )
+    fusion_threshold_value = _safe_float(
+        rule_config.get("fusion_threshold") if isinstance(rule_config, dict) else None,
+        DEFAULT_FUSION_THRESHOLD,
+    )
+
     rule_scores: Optional[np.ndarray] = None
     rule_reasons: Optional[List[str]] = None
     rule_flags: Optional[np.ndarray] = None
@@ -761,7 +1235,7 @@ def _build_detection_result(
             frame = None
         if frame is not None and not frame.empty:
             try:
-                score_series, reason_series = apply_risk_rules(frame)
+                score_series, reason_series = apply_risk_rules(frame, params=rule_params_dict)
             except Exception:
                 score_series = None
                 reason_series = None
@@ -769,18 +1243,20 @@ def _build_detection_result(
                 rule_scores = np.asarray(score_series, dtype=np.float64).reshape(-1)
                 if reason_series is not None:
                     rule_reasons = [str(value) if value is not None else "" for value in reason_series.tolist()]
-                rule_flags = rule_scores >= float(DEFAULT_TRIGGER_THRESHOLD)
+                rule_flags = rule_scores >= float(default_rule_threshold)
 
-    active_rule_weight = float(DEFAULT_RULE_WEIGHT) if (
-        rule_scores is not None and getattr(rule_scores, "size", 0) > 0
-    ) else 0.0
+    active_rule_weight = (
+        float(fusion_rule_weight_base)
+        if rule_scores is not None and getattr(rule_scores, "size", 0) > 0
+        else 0.0
+    )
 
     fusion_scores, fusion_flags = fuse_model_rule_votes(
         model_flags.astype(np.float64),
         rule_scores,
-        model_weight=float(DEFAULT_MODEL_WEIGHT),
+        model_weight=float(fusion_model_weight_base),
         rule_weight=active_rule_weight,
-        threshold=float(DEFAULT_FUSION_THRESHOLD),
+        threshold=float(fusion_threshold_value),
     )
     fusion_scores = np.asarray(fusion_scores, dtype=np.float64).reshape(-1)
     fusion_flags = np.asarray(fusion_flags, dtype=bool).reshape(-1)
@@ -839,7 +1315,7 @@ def _build_detection_result(
     if rule_flags is not None:
         rule_flag_list = [bool(flag) for flag in rule_flags.tolist()]
     elif rule_score_list is not None:
-        rule_flag_list = [score >= float(DEFAULT_TRIGGER_THRESHOLD) for score in rule_score_list]
+        rule_flag_list = [score >= float(default_rule_threshold) for score in rule_score_list]
     else:
         rule_flag_list = None
 
@@ -848,12 +1324,12 @@ def _build_detection_result(
     else:
         rule_reason_list = None
 
-    total_weight = float(DEFAULT_MODEL_WEIGHT + active_rule_weight)
+    total_weight = float(fusion_model_weight_base + active_rule_weight)
     if not np.isfinite(total_weight) or total_weight <= 0.0:
         fusion_weight_model = 1.0
         fusion_weight_rules = 0.0
     else:
-        fusion_weight_model = float(DEFAULT_MODEL_WEIGHT) / total_weight
+        fusion_weight_model = float(fusion_model_weight_base) / total_weight
         fusion_weight_rules = active_rule_weight / total_weight
 
     return DetectionResult(
@@ -874,11 +1350,12 @@ def _build_detection_result(
         fusion_scores=fusion_score_list,
         fusion_flags=fusion_flag_list,
         fusion_statuses=final_statuses,
-        fusion_threshold=float(DEFAULT_FUSION_THRESHOLD),
+        fusion_threshold=float(fusion_threshold_value),
         fusion_weights={
             "model": fusion_weight_model,
             "rules": fusion_weight_rules,
         },
+        rule_profile=rule_profile,
     )
 
 
@@ -910,8 +1387,18 @@ class ModelTrainer:
         model_path: Union[str, Path],
         **kwargs: Union[int, float, None],
     ) -> TrainingSummary:
+        ensemble_options: Dict[str, Union[int, float, None]] = {}
+        for key in ("max_ensemble_members", "ensemble_weight_metric", "reset_ensemble"):
+            if key in kwargs:
+                ensemble_options[key] = kwargs.pop(key)
+
         model_kwargs = self._filter_params(**kwargs)
-        return train_hist_gradient_boosting(dataset_path, model_path, **model_kwargs)
+        return train_hist_gradient_boosting(
+            dataset_path,
+            model_path,
+            **ensemble_options,
+            **model_kwargs,
+        )
 
     def train_from_split(
         self,
@@ -926,6 +1413,12 @@ class ModelTrainer:
 
         model_path = models_root / "model.joblib"
 
+        ensemble_meta_options = {
+            key: kwargs.get(key)
+            for key in ("max_ensemble_members", "ensemble_weight_metric", "reset_ensemble")
+            if key in kwargs
+        }
+
         summary = self.train(dataset_path, model_path, **kwargs)
 
         timestamp = datetime.now()
@@ -935,6 +1428,23 @@ class ModelTrainer:
         numeric_names = numeric_feature_names()
 
         model_metadata_path = model_path.with_name("metadata.json")
+
+        weight_metric_meta: Optional[str] = None
+        max_members_meta: Optional[int] = None
+        if model_metadata_path.exists():
+            try:
+                with model_metadata_path.open("r", encoding="utf-8") as handle:
+                    base_meta = json.load(handle)
+                if isinstance(base_meta, dict):
+                    raw_weight_metric = base_meta.get("ensemble_weight_metric")
+                    if raw_weight_metric not in (None, ""):
+                        weight_metric_meta = str(raw_weight_metric)
+                    raw_max_members = base_meta.get("ensemble_max_members")
+                    if raw_max_members is not None:
+                        max_members_meta = int(raw_max_members)
+            except Exception:
+                weight_metric_meta = None
+                max_members_meta = None
 
         metadata: Dict[str, object] = {
             "schema_version": MODEL_SCHEMA_VERSION,
@@ -972,6 +1482,45 @@ class ModelTrainer:
             metadata["class_weights"] = summary.class_weights
         if summary.validation_samples is not None:
             metadata["validation_samples"] = int(summary.validation_samples)
+        if max_members_meta is not None:
+            metadata["ensemble_max_members"] = int(max_members_meta)
+        elif ensemble_meta_options.get("max_ensemble_members") is not None:
+            try:
+                metadata["ensemble_max_members"] = int(ensemble_meta_options["max_ensemble_members"])
+            except (TypeError, ValueError):
+                pass
+        if weight_metric_meta:
+            metadata["ensemble_weight_metric"] = weight_metric_meta
+        elif ensemble_meta_options.get("ensemble_weight_metric") is not None:
+            metadata["ensemble_weight_metric"] = str(ensemble_meta_options["ensemble_weight_metric"])
+        if ensemble_meta_options.get("reset_ensemble"):
+            metadata["ensemble_reset"] = True
+
+        fusion_settings = _resolve_rule_fusion_settings()
+        rule_profile = fusion_settings.get("profile")  # type: ignore[assignment]
+        rule_threshold_value = fusion_settings.get("rule_threshold")  # type: ignore[assignment]
+        fusion_threshold_value = fusion_settings.get("fusion_threshold")  # type: ignore[assignment]
+        fusion_model_weight_value = fusion_settings.get("model_weight")  # type: ignore[assignment]
+        fusion_rule_weight_value = fusion_settings.get("rule_weight")  # type: ignore[assignment]
+        fusion_weights = fusion_settings.get("weights")
+
+        if isinstance(rule_profile, str) and rule_profile:
+            metadata["rule_profile"] = rule_profile
+        if rule_threshold_value is not None:
+            metadata["rule_threshold"] = float(rule_threshold_value)
+        if fusion_threshold_value is not None:
+            metadata["fusion_threshold"] = float(fusion_threshold_value)
+        if fusion_model_weight_value is not None:
+            metadata["fusion_model_weight"] = float(fusion_model_weight_value)
+        if fusion_rule_weight_value is not None:
+            metadata["fusion_rule_weight"] = float(fusion_rule_weight_value)
+        if isinstance(fusion_weights, dict) and fusion_weights:
+            metadata["fusion_weights"] = {
+                "model": float(fusion_weights.get("model", 1.0)),
+                "rules": float(fusion_weights.get("rules", 0.0)),
+            }
+        else:
+            metadata["fusion_weights"] = {"model": 1.0, "rules": 0.0}
 
         metadata_path = models_root / f"iforest_metadata_{stamp_token}.json"
         latest_metadata_path = models_root / "latest_iforest_metadata.json"

@@ -5,7 +5,12 @@
 """
 import numpy as np
 import pandas as pd
-from typing import Iterable, Optional, Tuple, List, Dict
+from typing import Iterable, Optional, Tuple, List, Dict, Any
+
+try:  # 配置是可选依赖，缺失时保持默认行为
+    from src.configuration import load_config
+except Exception:  # pragma: no cover - 运行环境最小化时忽略配置
+    load_config = None  # type: ignore
 
 # 可调阈值（按你数据规模可再微调）
 DEFAULTS = dict(
@@ -50,18 +55,122 @@ DEFAULT_MODEL_WEIGHT = 0.6
 DEFAULT_RULE_WEIGHT = 0.4
 DEFAULT_FUSION_THRESHOLD = 0.5
 
+
+def _load_rules_config() -> Dict[str, Any]:
+    if load_config is None:  # pragma: no cover - 最小环境
+        return {}
+    try:
+        config = load_config() or {}
+    except Exception:  # pragma: no cover - 配置解析失败
+        return {}
+    rules_cfg = config.get("rules") if isinstance(config, dict) else {}
+    return rules_cfg if isinstance(rules_cfg, dict) else {}
+
+
+def get_rule_settings(profile: Optional[str] = None) -> Dict[str, Any]:
+    """从全局配置中解析规则参数、融合权重及触发阈值。"""
+
+    rules_cfg = _load_rules_config()
+
+    selected_profile = profile or rules_cfg.get("active_profile")
+    profiles_cfg = rules_cfg.get("profiles") if isinstance(rules_cfg.get("profiles"), dict) else {}
+
+    profile_params: Dict[str, Any] = {}
+    if isinstance(profiles_cfg, dict) and profiles_cfg:
+        if selected_profile and selected_profile in profiles_cfg:
+            candidate = profiles_cfg[selected_profile]
+            if isinstance(candidate, dict):
+                profile_params = candidate
+        else:
+            # 回退到首个 profile
+            for candidate_name, candidate in profiles_cfg.items():
+                if isinstance(candidate, dict):
+                    profile_params = candidate
+                    selected_profile = candidate_name
+                    break
+
+    params: Dict[str, float] = dict(DEFAULTS)
+    for key, value in profile_params.items():
+        try:
+            params[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+
+    fusion_cfg = rules_cfg.get("fusion") if isinstance(rules_cfg.get("fusion"), dict) else {}
+
+    trigger_threshold = rules_cfg.get("trigger_threshold", DEFAULT_TRIGGER_THRESHOLD)
+    model_weight = fusion_cfg.get("model_weight", rules_cfg.get("model_weight", DEFAULT_MODEL_WEIGHT))
+    rule_weight = fusion_cfg.get("rule_weight", rules_cfg.get("rule_weight", DEFAULT_RULE_WEIGHT))
+    fusion_threshold = fusion_cfg.get(
+        "decision_threshold",
+        rules_cfg.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD),
+    )
+
+    try:
+        trigger_threshold = float(trigger_threshold)
+    except (TypeError, ValueError):
+        trigger_threshold = float(DEFAULT_TRIGGER_THRESHOLD)
+
+    def _as_float(value: Any, default: float) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
+
+    settings = {
+        "params": params,
+        "trigger_threshold": trigger_threshold,
+        "model_weight": _as_float(model_weight, DEFAULT_MODEL_WEIGHT),
+        "rule_weight": _as_float(rule_weight, DEFAULT_RULE_WEIGHT),
+        "fusion_threshold": _as_float(fusion_threshold, DEFAULT_FUSION_THRESHOLD),
+        "profile": selected_profile,
+    }
+    return settings
+
+
+def _refresh_module_defaults() -> None:
+    settings = get_rule_settings()
+    global DEFAULT_TRIGGER_THRESHOLD, DEFAULT_MODEL_WEIGHT, DEFAULT_RULE_WEIGHT, DEFAULT_FUSION_THRESHOLD
+    try:
+        DEFAULT_TRIGGER_THRESHOLD = float(settings.get("trigger_threshold", DEFAULT_TRIGGER_THRESHOLD))
+    except (TypeError, ValueError):  # pragma: no cover - 兜底
+        DEFAULT_TRIGGER_THRESHOLD = 60.0
+    try:
+        DEFAULT_MODEL_WEIGHT = float(settings.get("model_weight", DEFAULT_MODEL_WEIGHT))
+    except (TypeError, ValueError):  # pragma: no cover - 兜底
+        DEFAULT_MODEL_WEIGHT = 0.6
+    try:
+        DEFAULT_RULE_WEIGHT = float(settings.get("rule_weight", DEFAULT_RULE_WEIGHT))
+    except (TypeError, ValueError):  # pragma: no cover
+        DEFAULT_RULE_WEIGHT = 0.4
+    try:
+        DEFAULT_FUSION_THRESHOLD = float(settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD))
+    except (TypeError, ValueError):  # pragma: no cover
+        DEFAULT_FUSION_THRESHOLD = 0.5
+
+
+try:  # 模块导入时同步一次配置（如果配置可用）
+    _refresh_module_defaults()
+except Exception:  # pragma: no cover - 容错
+    pass
+
 def _to_float(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce").fillna(0.0).astype(np.float32)
 
 def _exists(df: pd.DataFrame, cols: List[str]) -> bool:
     return all(c in df.columns for c in cols)
 
-def score_rules(df: pd.DataFrame, params: Dict=None) -> Tuple[pd.Series, pd.Series]:
+def score_rules(
+    df: pd.DataFrame,
+    params: Optional[Dict[str, float]] = None,
+    *,
+    profile: Optional[str] = None,
+) -> Tuple[pd.Series, pd.Series]:
     """
     返回 (rules_score[0-100], reasons[str])
     """
     if params is None:
-        params = DEFAULTS
+        params = get_rule_settings(profile).get("params", DEFAULTS)
 
     n = len(df)
     score = np.zeros(n, dtype=np.float32)

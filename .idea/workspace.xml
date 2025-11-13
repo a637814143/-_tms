@@ -6,6 +6,7 @@
   <component name="ChangeListManager">
     <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/modeling.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/modeling.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -43,35 +44,35 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent"><![CDATA[{
-  "keyToString": {
-    "Python.ROOT.executor": "Run",
-    "Python.analyze_results.executor": "Run",
-    "Python.extractor (1).executor": "Run",
-    "Python.extractor.executor": "Run",
-    "Python.feature_extractor.executor": "Run",
-    "Python.info.executor": "Run",
-    "Python.main.executor": "Run",
-    "Python.split.executor": "Run",
-    "Python.test.executor": "Run",
-    "Python.ui (1).executor": "Run",
-    "Python.ui.executor": "Run",
-    "Python.ui_main.executor": "Run",
-    "Python.unsupervised_train.executor": "Run",
-    "Python.新建 文本文档 (2).executor": "Run",
-    "RunOnceActivity.ShowReadmeOnStart": "true",
-    "RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252": "true",
-    "RunOnceActivity.git.unshallow": "true",
-    "git-widget-placeholder": "main",
-    "ignore.virus.scanning.warn.message": "true",
-    "settings.editor.selected.configurable": "org.jetbrains.plugins.github.ui.GithubSettingsConfigurable"
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;Python.ROOT.executor&quot;: &quot;Run&quot;,
+    &quot;Python.analyze_results.executor&quot;: &quot;Run&quot;,
+    &quot;Python.extractor (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.extractor.executor&quot;: &quot;Run&quot;,
+    &quot;Python.feature_extractor.executor&quot;: &quot;Run&quot;,
+    &quot;Python.info.executor&quot;: &quot;Run&quot;,
+    &quot;Python.main.executor&quot;: &quot;Run&quot;,
+    &quot;Python.split.executor&quot;: &quot;Run&quot;,
+    &quot;Python.test.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ui (1).executor&quot;: &quot;Run&quot;,
+    &quot;Python.ui.executor&quot;: &quot;Run&quot;,
+    &quot;Python.ui_main.executor&quot;: &quot;Run&quot;,
+    &quot;Python.unsupervised_train.executor&quot;: &quot;Run&quot;,
+    &quot;Python.新建 文本文档 (2).executor&quot;: &quot;Run&quot;,
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
+    &quot;ignore.virus.scanning.warn.message&quot;: &quot;true&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;org.jetbrains.plugins.github.ui.GithubSettingsConfigurable&quot;
   },
-  "keyToStringList": {
-    "com.intellij.ide.scratch.ScratchImplUtil$2/New Scratch File": [
-      "Properties"
+  &quot;keyToStringList&quot;: {
+    &quot;com.intellij.ide.scratch.ScratchImplUtil$2/New Scratch File&quot;: [
+      &quot;Properties&quot;
     ]
   }
-}]]></component>
+}</component>
   <component name="RunManager" selected="Python.ui_main">
     <configuration name="新建 文本文档 (2)" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="pythonProject8" />
@@ -215,22 +216,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1754543842572</updated>
-    </task>
-    <task id="LOCAL-00033" summary="8888">
-      <option name="closed" value="true" />
-      <created>1761998745560</created>
-      <option name="number" value="00033" />
-      <option name="presentableId" value="LOCAL-00033" />
-      <option name="project" value="LOCAL" />
-      <updated>1761998745560</updated>
-    </task>
-    <task id="LOCAL-00034" summary="8888">
-      <option name="closed" value="true" />
-      <created>1762001240089</created>
-      <option name="number" value="00034" />
-      <option name="presentableId" value="LOCAL-00034" />
-      <option name="project" value="LOCAL" />
-      <updated>1762001240089</updated>
     </task>
     <task id="LOCAL-00035" summary="8888">
       <option name="closed" value="true" />
@@ -608,7 +593,23 @@
       <option name="project" value="LOCAL" />
       <updated>1762857123996</updated>
     </task>
-    <option name="localTasksCounter" value="82" />
+    <task id="LOCAL-00082" summary="8888">
+      <option name="closed" value="true" />
+      <created>1762858910146</created>
+      <option name="number" value="00082" />
+      <option name="presentableId" value="LOCAL-00082" />
+      <option name="project" value="LOCAL" />
+      <updated>1762858910146</updated>
+    </task>
+    <task id="LOCAL-00083" summary="8888">
+      <option name="closed" value="true" />
+      <created>1762858960058</created>
+      <option name="number" value="00083" />
+      <option name="presentableId" value="LOCAL-00083" />
+      <option name="project" value="LOCAL" />
+      <updated>1762858960058</updated>
+    </task>
+    <option name="localTasksCounter" value="84" />
     <servers />
   </component>
   <component name="UnknownFeatures">
