@@ -756,3 +756,15 @@ def fuse_model_rule_votes(
         final_flags = fused_flags
 
     return fused_scores.astype(np.float64), final_flags.astype(bool), rules_triggered
+
+
+def get_fusion_settings(profile: Optional[str] = None) -> Dict[str, float]:
+    """Return fusion weights and threshold for the requested profile."""
+
+    settings = get_rule_settings(profile=profile)
+    return {
+        "model_weight": float(settings.get("model_weight", DEFAULT_MODEL_WEIGHT)),
+        "rule_weight": float(settings.get("rule_weight", DEFAULT_RULE_WEIGHT)),
+        "fusion_threshold": float(settings.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD)),
+        "profile": settings.get("profile") or profile or DEFAULT_RULE_PROFILE,
+    }

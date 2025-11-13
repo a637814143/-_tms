@@ -34,6 +34,7 @@ try:  # 规则引擎不是硬依赖
         DEFAULT_FUSION_THRESHOLD,
         RULE_TRIGGER_THRESHOLD,
         fuse_model_rule_votes,
+        get_fusion_settings,
         get_rule_settings,
         score_rules as apply_risk_rules,
     )
@@ -53,6 +54,14 @@ except Exception:  # pragma: no cover - 缺少依赖时退化
             "rule_weight": float(DEFAULT_RULE_WEIGHT),
             "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
             "profile": profile,
+        }
+
+    def get_fusion_settings(profile: Optional[str] = None) -> Dict[str, float]:  # type: ignore
+        return {
+            "model_weight": float(DEFAULT_MODEL_WEIGHT),
+            "rule_weight": float(DEFAULT_RULE_WEIGHT),
+            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+            "profile": profile or "baseline",
         }
 
     def fuse_model_rule_votes(
@@ -1204,6 +1213,21 @@ def _build_detection_result(
     else:
         rule_profile = rule_profile.strip()
 
+    try:
+        fusion_defaults = get_fusion_settings(profile=rule_profile)
+    except Exception:
+        fusion_defaults = {
+            "model_weight": DEFAULT_MODEL_WEIGHT,
+            "rule_weight": DEFAULT_RULE_WEIGHT,
+            "fusion_threshold": DEFAULT_FUSION_THRESHOLD,
+            "profile": rule_profile or "baseline",
+        }
+
+    if rule_profile is None:
+        profile_candidate = fusion_defaults.get("profile")
+        if isinstance(profile_candidate, str) and profile_candidate.strip():
+            rule_profile = profile_candidate.strip()
+
     default_rule_threshold = _safe_float(
         rule_config.get("trigger_threshold") if isinstance(rule_config, dict) else None,
         DEFAULT_TRIGGER_THRESHOLD,
@@ -1213,15 +1237,15 @@ def _build_detection_result(
         _safe_float(RULE_TRIGGER_THRESHOLD, default_rule_threshold),
     )
     fusion_model_weight_base = _safe_float(
-        rule_config.get("model_weight") if isinstance(rule_config, dict) else None,
+        fusion_defaults.get("model_weight") if isinstance(fusion_defaults, dict) else None,
         DEFAULT_MODEL_WEIGHT,
     )
     fusion_rule_weight_base = _safe_float(
-        rule_config.get("rule_weight") if isinstance(rule_config, dict) else None,
+        fusion_defaults.get("rule_weight") if isinstance(fusion_defaults, dict) else None,
         DEFAULT_RULE_WEIGHT,
     )
     fusion_threshold_value = _safe_float(
-        rule_config.get("fusion_threshold") if isinstance(rule_config, dict) else None,
+        fusion_defaults.get("fusion_threshold") if isinstance(fusion_defaults, dict) else None,
         DEFAULT_FUSION_THRESHOLD,
     )
 
@@ -1252,18 +1276,12 @@ def _build_detection_result(
     if rule_scores_array is not None and getattr(rule_scores_array, "size", 0) == 0:
         rule_scores_array = None
 
-    active_rule_weight = (
-        float(fusion_rule_weight_base)
-        if rule_scores_array is not None and getattr(rule_scores_array, "size", 0) > 0
-        else 0.0
-    )
-
     fusion_scores, fusion_flags, rules_triggered = fuse_model_rule_votes(
         computed_scores,
         rule_scores_array,
         profile=rule_profile,
         model_weight=float(fusion_model_weight_base),
-        rule_weight=active_rule_weight,
+        rule_weight=float(fusion_rule_weight_base),
         threshold=float(fusion_threshold_value),
         trigger_threshold=float(effective_rule_threshold),
     )
@@ -1336,13 +1354,13 @@ def _build_detection_result(
     else:
         rule_reason_list = None
 
-    total_weight = float(fusion_model_weight_base + active_rule_weight)
+    total_weight = float(fusion_model_weight_base + fusion_rule_weight_base)
     if not np.isfinite(total_weight) or total_weight <= 0.0:
         fusion_weight_model = 1.0
         fusion_weight_rules = 0.0
     else:
         fusion_weight_model = float(fusion_model_weight_base) / total_weight
-        fusion_weight_rules = active_rule_weight / total_weight
+        fusion_weight_rules = float(fusion_rule_weight_base) / total_weight
 
     return DetectionResult(
         path=Path(path),
