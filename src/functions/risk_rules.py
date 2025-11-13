@@ -65,16 +65,40 @@ DEFAULTS = dict(
     HIGH_BANDWIDTH_PERCENTILE = 95.0,   # 持续高带宽百分位参考
 )
 
-# 规则判定异常时的默认触发阈值
-DEFAULT_TRIGGER_THRESHOLD = 40.0
+# 规则档位预设：baseline / aggressive
+DEFAULT_RULE_PROFILE = "baseline"
+
+PROFILE_PRESETS: Dict[str, Dict[str, float]] = {
+    "baseline": {
+        # 规则总分 >= trigger_threshold 才认为“规则强烈命中”
+        "trigger_threshold": 60.0,
+        # 模型权重更高，规则只做辅助
+        "model_weight": 0.7,
+        "rule_weight": 0.3,
+        # 融合分 >= fusion_threshold 才判异常
+        "fusion_threshold": 0.5,
+    },
+    "aggressive": {
+        # 规则总分 >= 25 就认为“规则强烈命中”
+        "trigger_threshold": 25.0,
+        # 规则权重更高，对恶意流量更敏感
+        "model_weight": 0.3,
+        "rule_weight": 0.7,
+        # 判异常的阈值更低
+        "fusion_threshold": 0.2,
+    },
+}
+
+# 规则判定异常时的默认触发阈值（以 baseline 为默认）
+DEFAULT_TRIGGER_THRESHOLD = PROFILE_PRESETS[DEFAULT_RULE_PROFILE]["trigger_threshold"]
 
 # 规则触发的兜底高敏感阈值（UI/导出使用）
 RULE_TRIGGER_THRESHOLD = 25.0
 
-# 模型与规则融合的默认权重与阈值
-DEFAULT_MODEL_WEIGHT = 0.3
-DEFAULT_RULE_WEIGHT = 0.7
-DEFAULT_FUSION_THRESHOLD = 0.2
+# 模型与规则融合的默认权重与阈值（以 baseline 为默认）
+DEFAULT_MODEL_WEIGHT = PROFILE_PRESETS[DEFAULT_RULE_PROFILE]["model_weight"]
+DEFAULT_RULE_WEIGHT = PROFILE_PRESETS[DEFAULT_RULE_PROFILE]["rule_weight"]
+DEFAULT_FUSION_THRESHOLD = PROFILE_PRESETS[DEFAULT_RULE_PROFILE]["fusion_threshold"]
 
 
 def _load_rules_config() -> Dict[str, Any]:
@@ -93,38 +117,77 @@ def get_rule_settings(profile: Optional[str] = None) -> Dict[str, Any]:
 
     rules_cfg = _load_rules_config()
 
-    selected_profile = profile or rules_cfg.get("active_profile")
-    profiles_cfg = rules_cfg.get("profiles") if isinstance(rules_cfg.get("profiles"), dict) else {}
+    # 1) 确定当前 profile：UI 显式传入 > 配置 active_profile > 默认 baseline
+    selected_profile = profile or rules_cfg.get("active_profile") or DEFAULT_RULE_PROFILE
+    if not isinstance(selected_profile, str):
+        selected_profile = DEFAULT_RULE_PROFILE
+    selected_profile = selected_profile.strip().lower() or DEFAULT_RULE_PROFILE
+
+    # 2) YAML 中若配置了 profiles，优先使用；否则用内置预设
+    profiles_cfg_raw = rules_cfg.get("profiles")
+    if isinstance(profiles_cfg_raw, dict) and profiles_cfg_raw:
+        normalized_profiles: Dict[str, Dict[str, float]] = {}
+        for name, payload in profiles_cfg_raw.items():
+            if not isinstance(name, str):
+                continue
+            normalized_name = name.strip().lower()
+            if not normalized_name:
+                continue
+            if isinstance(payload, dict):
+                normalized_profiles[normalized_name] = payload
+        profiles_cfg = normalized_profiles or PROFILE_PRESETS
+    else:
+        profiles_cfg = PROFILE_PRESETS
 
     profile_params: Dict[str, Any] = {}
-    if isinstance(profiles_cfg, dict) and profiles_cfg:
-        if selected_profile and selected_profile in profiles_cfg:
-            candidate = profiles_cfg[selected_profile]
-            if isinstance(candidate, dict):
-                profile_params = candidate
-        else:
-            # 回退到首个 profile
-            for candidate_name, candidate in profiles_cfg.items():
-                if isinstance(candidate, dict):
-                    profile_params = candidate
-                    selected_profile = candidate_name
-                    break
+    if selected_profile in profiles_cfg:
+        candidate = profiles_cfg.get(selected_profile, {})
+        if isinstance(candidate, dict):
+            profile_params = candidate
+    else:
+        selected_profile = DEFAULT_RULE_PROFILE
+        fallback = profiles_cfg.get(DEFAULT_RULE_PROFILE, {})
+        if isinstance(fallback, dict):
+            profile_params = fallback
 
+    # 3) 规则阈值：拷贝 DEFAULTS，再用 profile 中同名键覆盖
     params: Dict[str, float] = dict(DEFAULTS)
     for key, value in profile_params.items():
-        try:
-            params[key] = float(value)
-        except (TypeError, ValueError):
-            continue
+        if key in params:
+            try:
+                params[key] = float(value)
+            except (TypeError, ValueError):
+                continue
 
+    # 4) 融合相关参数：预设 + YAML 覆盖
     fusion_cfg = rules_cfg.get("fusion") if isinstance(rules_cfg.get("fusion"), dict) else {}
 
-    trigger_threshold = rules_cfg.get("trigger_threshold", DEFAULT_TRIGGER_THRESHOLD)
-    model_weight = fusion_cfg.get("model_weight", rules_cfg.get("model_weight", DEFAULT_MODEL_WEIGHT))
-    rule_weight = fusion_cfg.get("rule_weight", rules_cfg.get("rule_weight", DEFAULT_RULE_WEIGHT))
+    preset_trigger = profile_params.get("trigger_threshold") or PROFILE_PRESETS.get(
+        selected_profile,
+        {},
+    ).get("trigger_threshold", DEFAULT_TRIGGER_THRESHOLD)
+
+    preset_model_w = profile_params.get("model_weight") or PROFILE_PRESETS.get(
+        selected_profile,
+        {},
+    ).get("model_weight", DEFAULT_MODEL_WEIGHT)
+
+    preset_rule_w = profile_params.get("rule_weight") or PROFILE_PRESETS.get(
+        selected_profile,
+        {},
+    ).get("rule_weight", DEFAULT_RULE_WEIGHT)
+
+    preset_fusion_th = profile_params.get("fusion_threshold") or PROFILE_PRESETS.get(
+        selected_profile,
+        {},
+    ).get("fusion_threshold", DEFAULT_FUSION_THRESHOLD)
+
+    trigger_threshold = rules_cfg.get("trigger_threshold", preset_trigger)
+    model_weight = fusion_cfg.get("model_weight", rules_cfg.get("model_weight", preset_model_w))
+    rule_weight = fusion_cfg.get("rule_weight", rules_cfg.get("rule_weight", preset_rule_w))
     fusion_threshold = fusion_cfg.get(
         "decision_threshold",
-        rules_cfg.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD),
+        rules_cfg.get("fusion_threshold", preset_fusion_th),
     )
 
     try:
@@ -636,8 +699,35 @@ def fuse_model_rule_votes(
     model_weight: float = DEFAULT_MODEL_WEIGHT,
     rule_weight: float = DEFAULT_RULE_WEIGHT,
     threshold: float = DEFAULT_FUSION_THRESHOLD,
+    profile: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Combine模型预测标记与规则得分，返回融合分数与最终判定。"""
+
+    if profile is not None:
+        try:
+            settings = get_rule_settings(profile)
+        except Exception:
+            settings = {}
+        else:
+            if isinstance(settings, dict):
+                preset_model = settings.get("model_weight")
+                preset_rule = settings.get("rule_weight")
+                preset_threshold = settings.get("fusion_threshold")
+                if preset_model is not None and model_weight == DEFAULT_MODEL_WEIGHT:
+                    try:
+                        model_weight = float(preset_model)
+                    except (TypeError, ValueError):
+                        pass
+                if preset_rule is not None and rule_weight == DEFAULT_RULE_WEIGHT:
+                    try:
+                        rule_weight = float(preset_rule)
+                    except (TypeError, ValueError):
+                        pass
+                if preset_threshold is not None and threshold == DEFAULT_FUSION_THRESHOLD:
+                    try:
+                        threshold = float(preset_threshold)
+                    except (TypeError, ValueError):
+                        pass
 
     model_arr = np.asarray(model_flags, dtype=np.float64).reshape(-1)
     if model_arr.size == 0:

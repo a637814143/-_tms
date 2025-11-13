@@ -62,6 +62,7 @@ except Exception:  # pragma: no cover - 缺少依赖时退化
         model_weight: float = DEFAULT_MODEL_WEIGHT,
         rule_weight: float = DEFAULT_RULE_WEIGHT,
         threshold: float = DEFAULT_FUSION_THRESHOLD,
+        profile: Optional[str] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         model_arr = np.asarray(model_flags, dtype=np.float64).reshape(-1)
         if model_arr.size == 0:
@@ -1241,7 +1242,11 @@ def _build_detection_result(
             frame = None
         if frame is not None and not frame.empty:
             try:
-                score_series, reason_series = apply_risk_rules(frame, params=rule_params_dict)
+                score_series, reason_series = apply_risk_rules(
+                    frame,
+                    params=rule_params_dict,
+                    profile=rule_profile,
+                )
             except Exception:
                 score_series = None
                 reason_series = None
@@ -1263,6 +1268,7 @@ def _build_detection_result(
         model_weight=float(fusion_model_weight_base),
         rule_weight=active_rule_weight,
         threshold=float(fusion_threshold_value),
+        profile=rule_profile,
     )
     fusion_scores = np.asarray(fusion_scores, dtype=np.float64).reshape(-1)
     fusion_flags = np.asarray(fusion_flags, dtype=bool).reshape(-1)

@@ -107,6 +107,7 @@ except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型�
         model_weight: float = DEFAULT_MODEL_WEIGHT,
         rule_weight: float = DEFAULT_RULE_WEIGHT,
         threshold: float = DEFAULT_FUSION_THRESHOLD,
+        profile: Optional[str] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         model_arr = np.asarray(model_flags, dtype=float).reshape(-1)
         if model_arr.size == 0:
@@ -1223,6 +1224,7 @@ class Ui_MainWindow(object):
         self._analysis_summary: Optional[dict] = None
         self._latest_prediction_summary: Optional[dict] = None
         self._auto_analyze_tip_shown: bool = False
+        self._last_rule_profile: str = "baseline"
 
         # 分页状态
         self._csv_paged_path: Optional[str] = None
@@ -1492,6 +1494,45 @@ class Ui_MainWindow(object):
     def _set_action_buttons_enabled(self, enabled: bool) -> None:
         for btn in self._action_buttons():
             btn.setEnabled(enabled)
+
+    def _ask_rule_profile(self) -> Optional[str]:
+        items = ["baseline", "aggressive"]
+        current = getattr(self, "_last_rule_profile", "baseline")
+        try:
+            default_index = items.index(current)
+        except ValueError:
+            default_index = 0
+        parent_widget = self._parent_widget()
+        profile, ok = QtWidgets.QInputDialog.getItem(
+            parent_widget,
+            "选择规则档位",
+            "规则档位（baseline=日常，aggressive=高敏感）:",
+            items,
+            default_index,
+            False,
+        )
+        if not ok:
+            return None
+        profile_str = str(profile).strip().lower()
+        if not profile_str:
+            return None
+        self._last_rule_profile = profile_str
+        return profile_str
+
+    @staticmethod
+    def _metadata_with_profile(
+        metadata: Optional[dict],
+        profile: Optional[str],
+    ) -> Optional[dict]:
+        if not profile:
+            return metadata
+        base: dict
+        if isinstance(metadata, dict):
+            base = dict(metadata)
+        else:
+            base = {}
+        base["rule_profile"] = profile
+        return base
 
     def _resolve_rule_settings(self, metadata: Optional[Dict[str, object]] = None) -> Dict[str, object]:
         metadata_obj = metadata if isinstance(metadata, dict) else {}
@@ -4726,7 +4767,11 @@ class Ui_MainWindow(object):
             rule_flags = np.zeros(total_predictions, dtype=bool)
             if apply_risk_rules is not None and pd is not None and total_predictions:
                 try:
-                    score_series, reason_series = apply_risk_rules(out_df, params=rule_params)
+                    score_series, reason_series = apply_risk_rules(
+                        out_df,
+                        params=rule_params,
+                        profile=rule_profile,
+                    )
                 except Exception:
                     score_series = None
                     reason_series = None
@@ -4752,6 +4797,7 @@ class Ui_MainWindow(object):
                 model_weight=float(fusion_model_weight_base),
                 rule_weight=float(fusion_rule_weight_base),
                 threshold=float(fusion_threshold_value),
+                profile=rule_profile,
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
@@ -5070,7 +5116,11 @@ class Ui_MainWindow(object):
         rule_flags = np.zeros(total, dtype=bool)
         if apply_risk_rules is not None and pd is not None and total:
             try:
-                score_series, reason_series = apply_risk_rules(out_df, params=rule_params)
+                score_series, reason_series = apply_risk_rules(
+                    out_df,
+                    params=rule_params,
+                    profile=rule_profile,
+                )
             except Exception:
                 score_series = None
                 reason_series = None
@@ -5095,6 +5145,7 @@ class Ui_MainWindow(object):
             model_weight=float(fusion_model_weight_base),
             rule_weight=float(fusion_rule_weight_base),
             threshold=float(fusion_threshold_value),
+            profile=rule_profile,
         )
         fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
         fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
@@ -5790,7 +5841,11 @@ class Ui_MainWindow(object):
                     payload = self._process_online_pcap(
                         pcap_path,
                         output_dir=output_dir,
-                        metadata=metadata_override,
+                        metadata=(
+                            dict(metadata_override)
+                            if isinstance(metadata_override, dict)
+                            else metadata_override
+                        ),
                         progress_cb=_update_progress,
                     )
                 except Exception as exc:
@@ -5804,7 +5859,11 @@ class Ui_MainWindow(object):
                 self._present_prediction_result(
                     prediction,
                     source_name=source_name,
-                    metadata_override=metadata_override,
+                    metadata_override=(
+                        dict(metadata_override)
+                        if isinstance(metadata_override, dict)
+                        else metadata_override
+                    ),
                     source_pcap=pcap_path,
                     show_dialog=False,
                 )
@@ -5905,6 +5964,10 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.warning(parent_widget, "缺少依赖", "当前环境未安装 pandas，无法执行预测。")
             return
 
+        profile_choice = self._ask_rule_profile()
+        if profile_choice is None:
+            return
+
         selected_df: Optional["pd.DataFrame"] = None
         selection_model = getattr(self.table_view, "selectionModel", None)
         if callable(selection_model):
@@ -5963,6 +6026,8 @@ class Ui_MainWindow(object):
                 if isinstance(meta_candidate, dict):
                     metadata_override = meta_candidate
 
+            metadata_override = self._metadata_with_profile(metadata_override, profile_choice)
+
             self.display_result(f"[INFO] 使用已选流量 {len(selected_df)} 条执行模型预测。")
 
             button = getattr(self, "btn_predict", None)
@@ -5978,7 +6043,11 @@ class Ui_MainWindow(object):
                 result = self._predict_dataframe(
                     selected_df,
                     source_name=f"选中流量({selection_count})",
-                    metadata_override=metadata_override,
+                    metadata_override=(
+                        dict(metadata_override)
+                        if isinstance(metadata_override, dict)
+                        else metadata_override
+                    ),
                     silent=True,
                 )
             except Exception as exc:
@@ -5993,7 +6062,11 @@ class Ui_MainWindow(object):
                             result = self._predict_dataframe(
                                 fallback_cleaned,
                                 source_name=f"选中流量({selection_count})",
-                                metadata_override=metadata_override,
+                                metadata_override=(
+                                    dict(metadata_override)
+                                    if isinstance(metadata_override, dict)
+                                    else metadata_override
+                                ),
                                 silent=True,
                             )
                         except Exception as exc_inner:
@@ -6021,7 +6094,11 @@ class Ui_MainWindow(object):
             self._present_prediction_result(
                 result,
                 source_name=f"选中流量({selection_count})",
-                metadata_override=metadata_override,
+                metadata_override=(
+                    dict(metadata_override)
+                    if isinstance(metadata_override, dict)
+                    else metadata_override
+                ),
                 show_dialog=True,
             )
             return
@@ -6058,6 +6135,8 @@ class Ui_MainWindow(object):
             metadata_override = (
                 self._selected_metadata if isinstance(self._selected_metadata, dict) else None
             )
+
+            metadata_override = self._metadata_with_profile(metadata_override, profile_choice)
 
             deduped_files: List[str] = []
             seen: Set[str] = set()
@@ -6096,6 +6175,8 @@ class Ui_MainWindow(object):
         metadata_override = (
             self._selected_metadata if isinstance(self._selected_metadata, dict) else None
         )
+
+        metadata_override = self._metadata_with_profile(metadata_override, profile_choice)
 
         if os.path.isdir(chosen_path):
             pcap_candidates = self._list_sorted(chosen_path)
@@ -6140,7 +6221,11 @@ class Ui_MainWindow(object):
                 payload = self._process_online_pcap(
                     chosen_path,
                     output_dir=self._prediction_out_dir(),
-                    metadata=metadata_override,
+                    metadata=(
+                        dict(metadata_override)
+                        if isinstance(metadata_override, dict)
+                        else metadata_override
+                    ),
                     progress_cb=_single_progress,
                 )
             except Exception as exc:
@@ -6159,7 +6244,11 @@ class Ui_MainWindow(object):
             self._present_prediction_result(
                 prediction,
                 source_name=source_name,
-                metadata_override=metadata_override,
+                metadata_override=(
+                    dict(metadata_override)
+                    if isinstance(metadata_override, dict)
+                    else metadata_override
+                ),
                 source_pcap=chosen_path,
                 show_dialog=True,
             )
@@ -6181,7 +6270,11 @@ class Ui_MainWindow(object):
             result = self._predict_dataframe(
                 df,
                 source_name=source_name,
-                metadata_override=metadata_override,
+                metadata_override=(
+                    dict(metadata_override)
+                    if isinstance(metadata_override, dict)
+                    else metadata_override
+                ),
                 silent=True,
             )
         except Exception as exc:
@@ -6191,7 +6284,11 @@ class Ui_MainWindow(object):
         self._present_prediction_result(
             result,
             source_name=source_name,
-            metadata_override=metadata_override,
+            metadata_override=(
+                dict(metadata_override)
+                if isinstance(metadata_override, dict)
+                else metadata_override
+            ),
             source_csv=chosen_path,
             show_dialog=True,
         )

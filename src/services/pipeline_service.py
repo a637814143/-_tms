@@ -115,6 +115,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
         model_weight: float = DEFAULT_MODEL_WEIGHT,
         rule_weight: float = DEFAULT_RULE_WEIGHT,
         threshold: float = DEFAULT_FUSION_THRESHOLD,
+        profile: Optional[str] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         model_arr = np.asarray(model_flags, dtype=np.float64).reshape(-1)
         if model_arr.size == 0:
@@ -394,7 +395,11 @@ def _run_prediction(
             rule_flags_array: Optional[np.ndarray] = None
             if apply_risk_rules is not None and pd is not None:
                 try:
-                    score_series, reason_series = apply_risk_rules(df, params=rule_params)
+                    score_series, reason_series = apply_risk_rules(
+                        df,
+                        params=rule_params,
+                        profile=rule_profile,
+                    )
                 except Exception:
                     score_series = None
                     reason_series = None
@@ -419,6 +424,7 @@ def _run_prediction(
                 model_weight=float(fusion_model_weight_base),
                 rule_weight=active_rule_weight,
                 threshold=float(fusion_threshold_value),
+                profile=rule_profile,
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=np.float64).reshape(-1)
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
@@ -569,7 +575,11 @@ def _run_prediction(
             rule_flags_array: Optional[np.ndarray] = None
             if apply_risk_rules is not None and pd is not None:
                 try:
-                    score_series, reason_series = apply_risk_rules(df, params=rule_params)
+                    score_series, reason_series = apply_risk_rules(
+                        df,
+                        params=rule_params,
+                        profile=rule_profile,
+                    )
                 except Exception:
                     score_series = None
                     reason_series = None
@@ -594,6 +604,7 @@ def _run_prediction(
                 model_weight=float(fusion_model_weight_base),
                 rule_weight=active_rule_weight,
                 threshold=float(fusion_threshold_value),
+                profile=rule_profile,
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=np.float64).reshape(-1)
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
