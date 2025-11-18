@@ -63,6 +63,13 @@ DEFAULTS = dict(
     HIGH_BANDWIDTH_ABS = 100_000.0,     # 持续高带宽绝对阈值（bytes/s）
     HIGH_BANDWIDTH_DURATION = 10.0,     # 持续高带宽持续时间（秒）
     HIGH_BANDWIDTH_PERCENTILE = 95.0,   # 持续高带宽百分位参考
+    FLOW_PPS_THRESHOLD = 200.0,         # Flow Packets/s 触发阈值（pkt/s）
+    FLOW_BPS_THRESHOLD = 1_000_000.0,   # Flow Bytes/s 触发阈值（bytes/s）
+    FLOW_DURATION_SHORT = 1.0,          # 短流持续时间阈值（秒）
+    SPECIAL_DURATION_THRESHOLD = 0.25,  # 超短流持续时间阈值（秒）
+    UP_RATIO_THRESHOLD = 0.95,          # 上行占比阈值
+    MIN_PKT_LEN_THRESHOLD = 40.0,       # 最小包长阈值（字节）
+    TOTAL_DIRECTIONAL_PKTS = 100.0,     # 单向最小包数阈值
 )
 
 # 规则档位预设：baseline / aggressive
@@ -73,23 +80,37 @@ PROFILE_PRESETS: Dict[str, Dict[str, Any]] = {
         # 触发规则的分数线（规则总分低于它，基本不参与决策）
         "trigger_threshold": 60.0,
         # 模型权重更大，规则只做轻微修正
-        "model_weight": 0.85,
-        "rule_weight": 0.15,
+        "model_weight": 0.70,
+        "rule_weight": 0.30,
         # 融合得分必须比较高才算异常
         "fusion_threshold": 0.70,
         # baseline 模式：只看融合得分
         "mode": "conservative",
+        "FLOW_PPS_THRESHOLD": 200.0,
+        "FLOW_BPS_THRESHOLD": 1_000_000.0,
+        "FLOW_DURATION_SHORT": 1.0,
+        "SPECIAL_DURATION_THRESHOLD": 0.25,
+        "UP_RATIO_THRESHOLD": 0.95,
+        "MIN_PKT_LEN_THRESHOLD": 40.0,
+        "TOTAL_DIRECTIONAL_PKTS": 100.0,
     },
     "aggressive": {
-        # 只要规则分数达到 30 就当“很可疑”
-        "trigger_threshold": 30.0,
+        # 只要规则分数达到 35 就当“很可疑”
+        "trigger_threshold": 35.0,
         # 规则权重更高，宁可多报一点
-        "model_weight": 0.30,
-        "rule_weight": 0.70,
+        "model_weight": 0.40,
+        "rule_weight": 0.60,
         # 融合阈值放宽
-        "fusion_threshold": 0.35,
+        "fusion_threshold": 0.40,
         # aggressive 模式：融合得分 OR 强规则命中
         "mode": "aggressive",
+        "FLOW_PPS_THRESHOLD": 100.0,
+        "FLOW_BPS_THRESHOLD": 500_000.0,
+        "FLOW_DURATION_SHORT": 0.5,
+        "SPECIAL_DURATION_THRESHOLD": 0.15,
+        "UP_RATIO_THRESHOLD": 0.90,
+        "MIN_PKT_LEN_THRESHOLD": 20.0,
+        "TOTAL_DIRECTIONAL_PKTS": 50.0,
     },
 }
 
@@ -261,12 +282,42 @@ def score_rules(
     """
     返回 (rules_score[0-100], reasons[str])
     """
+    settings = get_rule_settings(profile)
+    active_profile = str(settings.get("profile", profile or DEFAULT_RULE_PROFILE)).strip().lower() or DEFAULT_RULE_PROFILE
+    profile_is_aggressive = active_profile.startswith("agg")
+
     if params is None:
-        params = get_rule_settings(profile).get("params", DEFAULTS)
+        params = settings.get("params", DEFAULTS)
 
     n = len(df)
     score = np.zeros(n, dtype=np.float32)
     reasons: List[List[str]] = [[] for _ in range(n)]
+
+    def _apply_profiled_rule(
+        mask: Union[pd.Series, np.ndarray, Sequence[bool]],
+        baseline_points: float,
+        aggressive_points: float,
+        base_reason: str,
+        aggressive_reason: Optional[str] = None,
+    ) -> None:
+        if isinstance(mask, pd.Series):
+            mask_arr = mask.to_numpy(dtype=bool)
+        else:
+            mask_arr = np.asarray(mask, dtype=bool)
+        idx = np.where(mask_arr)[0]
+        if idx.size == 0:
+            return
+        points = aggressive_points if profile_is_aggressive else baseline_points
+        reason = (
+            aggressive_reason
+            if profile_is_aggressive and aggressive_reason is not None
+            else base_reason
+        )
+        suffix = " – aggressive" if profile_is_aggressive else " – baseline"
+        reason_text = f"{reason}{suffix}" if reason else suffix.strip()
+        score[idx] += points
+        for i in idx:
+            reasons[i].append(reason_text)
 
     # 统一需要的列（兼容多种命名）
     col = (
@@ -347,12 +398,78 @@ def score_rules(
     flow_rate = col("flow_byts_per_s") if "flow_byts_per_s" in df.columns else bps
     flow_pkts_per_s = col("flow_pkts_per_s") if "flow_pkts_per_s" in df.columns else pps
     packet_len_mean = col("packet_length_mean") + col("Packet Length Mean")
+    min_packet_len = col("min_packet_length") + col("Min Packet Length")
     unique_ports = col("unique_ports_accessed")
     unique_dst_ports = col("unique_dst_ports")
     unique_dst_ips = col("unique_dst_ips")
     unique_src_ips = col("unique_src_ips")
     total_len_fwd_pkts = col("total_len_fwd_pkts")
     total_len_bwd_pkts = col("total_len_bwd_pkts")
+    total_fwd_direction = col("Total Fwd Packets") + col("Tot Fwd Pkts") + col("total_fwd_pkts")
+    total_bwd_direction = col("Total Backward Packets") + col("Tot Bwd Pkts") + col("total_bwd_pkts")
+
+    # 档位敏感度：基础统计特征触发
+    flow_pps_threshold = params.get("FLOW_PPS_THRESHOLD", DEFAULTS["FLOW_PPS_THRESHOLD"])
+    _apply_profiled_rule(
+        flow_pkts_per_s >= flow_pps_threshold,
+        20,
+        30,
+        "High Packets/s",
+    )
+
+    flow_bps_threshold = params.get("FLOW_BPS_THRESHOLD", DEFAULTS["FLOW_BPS_THRESHOLD"])
+    _apply_profiled_rule(
+        flow_rate >= flow_bps_threshold,
+        20,
+        30,
+        "High Bytes/s",
+    )
+
+    duration_threshold = params.get("FLOW_DURATION_SHORT", DEFAULTS["FLOW_DURATION_SHORT"])
+    short_duration_mask = (flow_duration > 0) & (flow_duration <= duration_threshold)
+    _apply_profiled_rule(short_duration_mask, 15, 20, "Short Flow Duration")
+
+    special_duration_threshold = params.get(
+        "SPECIAL_DURATION_THRESHOLD",
+        DEFAULTS["SPECIAL_DURATION_THRESHOLD"],
+    )
+    special_duration_mask = (flow_duration > 0) & (flow_duration <= special_duration_threshold)
+    _apply_profiled_rule(
+        special_duration_mask,
+        10,
+        15,
+        "Ultra-short Flow Duration",
+        aggressive_reason="Ultra-short Flow Duration",
+    )
+
+    if _exists(df, ["flow_bytes", "flow_up_bytes"]):
+        total = flow_bytes.to_numpy()
+        up_bytes = flow_up_bytes.to_numpy()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            up_ratio = np.divide(
+                up_bytes,
+                total,
+                out=np.zeros(n, dtype=np.float32),
+                where=total > 0,
+            )
+        up_ratio_threshold = params.get("UP_RATIO_THRESHOLD", DEFAULTS["UP_RATIO_THRESHOLD"])
+        up_ratio_mask = (total > 0) & (up_ratio >= up_ratio_threshold)
+        _apply_profiled_rule(up_ratio_mask, 15, 20, "Upstream-heavy Flow")
+
+    min_pkt_threshold = params.get("MIN_PKT_LEN_THRESHOLD", DEFAULTS["MIN_PKT_LEN_THRESHOLD"])
+    min_pkt_mask = (min_packet_len > 0) & (min_packet_len <= min_pkt_threshold)
+    _apply_profiled_rule(min_pkt_mask, 10, 15, "Min Packet Length Anomaly")
+
+    directional_threshold = params.get(
+        "TOTAL_DIRECTIONAL_PKTS",
+        DEFAULTS["TOTAL_DIRECTIONAL_PKTS"],
+    )
+    directional_max = np.maximum(
+        total_fwd_direction.to_numpy(),
+        total_bwd_direction.to_numpy(),
+    )
+    directional_mask = pd.Series(directional_max, index=df.index) >= directional_threshold
+    _apply_profiled_rule(directional_mask, 10, 15, "Directional Packet Volume")
 
     # 1) UDP Flood：UDP 且包速高
     udp_mask = proto.isin(["17", "udp", "UDP", "Udp"])
