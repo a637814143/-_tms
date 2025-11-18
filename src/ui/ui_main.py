@@ -122,6 +122,7 @@ except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型�
         rule_weight: Optional[float] = None,
         threshold: Optional[float] = None,
         trigger_threshold: Optional[float] = None,
+        model_confidence: "Optional[np.ndarray | List[float]]" = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         model_arr = np.asarray(model_scores, dtype=float).reshape(-1)
         if model_arr.size == 0:
@@ -150,9 +151,44 @@ except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型�
         trig_threshold = float(trigger_threshold or DEFAULT_TRIGGER_THRESHOLD)
         rules_triggered = (rule_arr >= trig_threshold).astype(bool)
 
-        fused_scores = float(model_weight or DEFAULT_MODEL_WEIGHT) * model_arr + float(
-            active_rule_weight
-        ) * normalized_rules
+        if model_confidence is not None:
+            conf_arr = np.asarray(model_confidence, dtype=float).reshape(-1)
+            if conf_arr.size == 0:
+                conf_arr = np.zeros_like(model_arr)
+            elif conf_arr.size == 1:
+                conf_arr = np.full_like(model_arr, float(conf_arr[0]))
+            elif conf_arr.size != model_arr.size:
+                limit = min(conf_arr.size, model_arr.size)
+                padded = np.empty_like(model_arr)
+                padded[:limit] = conf_arr[:limit]
+                if limit < model_arr.size:
+                    padded[limit:] = conf_arr[limit - 1]
+                conf_arr = padded
+            conf_arr = np.clip(conf_arr, 0.0, 1.0)
+        else:
+            conf_arr = None
+
+        model_w = float(model_weight or DEFAULT_MODEL_WEIGHT)
+        rule_w = float(active_rule_weight)
+        total = model_w + rule_w
+        if not np.isfinite(total) or total <= 0.0:
+            total = 1.0
+
+        profile_key = str(profile or "baseline").strip().lower()
+        if profile_key.startswith("agg"):
+            high_pair = (0.5, 0.5)
+            low_pair = (0.35, 0.65)
+        else:
+            high_pair = (0.8, 0.2)
+            low_pair = (0.6, 0.4)
+
+        if conf_arr is not None:
+            high_mask = conf_arr >= 0.8
+            model_weights = np.where(high_mask, total * high_pair[0], total * low_pair[0])
+            rule_weights = np.where(high_mask, total * high_pair[1], total * low_pair[1])
+            fused_scores = model_weights * model_arr + rule_weights * normalized_rules
+        else:
+            fused_scores = model_w * model_arr + rule_w * normalized_rules
         fused_flags = (fused_scores >= float(threshold or DEFAULT_FUSION_THRESHOLD)).astype(bool)
 
         return fused_scores, fused_flags, rules_triggered
@@ -1518,7 +1554,71 @@ class Ui_MainWindow(object):
         for btn in self._action_buttons():
             btn.setEnabled(enabled)
 
+    def _current_rule_profile(self) -> Optional[str]:
+        combo = getattr(self, "rule_profile_combo", None)
+        if isinstance(combo, QtWidgets.QComboBox):
+            data = combo.currentData()
+            candidate = data if isinstance(data, str) else combo.currentText()
+            candidate = str(candidate).strip().lower()
+            if candidate:
+                return candidate
+        stored = getattr(self, "_last_rule_profile", None)
+        if isinstance(stored, str) and stored.strip():
+            return stored.strip().lower()
+        return None
+
+    def _update_rule_profile_tip(self, profile: Optional[str]) -> None:
+        label = getattr(self, "rule_profile_hint", None)
+        if not isinstance(label, QtWidgets.QLabel):
+            return
+        token = (profile or "baseline").strip().lower()
+        if token.startswith("agg"):
+            label.setText("Aggressive：规则阈值更低、得分权重更高，适合高敏监测。")
+        else:
+            label.setText("Baseline：模型主导，规则较保守，适合日常巡检。")
+
+    def _select_rule_profile(self, profile: str) -> None:
+        normalized = str(profile).strip().lower()
+        if not normalized:
+            return
+        self._last_rule_profile = normalized
+        combo = getattr(self, "rule_profile_combo", None)
+        if isinstance(combo, QtWidgets.QComboBox):
+            for idx in range(combo.count()):
+                data = combo.itemData(idx)
+                text = combo.itemText(idx)
+                candidates = [
+                    str(data).strip().lower() if isinstance(data, str) else None,
+                    str(text).strip().lower() if isinstance(text, str) else None,
+                ]
+                if normalized in {value for value in candidates if value}:
+                    prev_state = combo.blockSignals(True)
+                    combo.setCurrentIndex(idx)
+                    combo.blockSignals(prev_state)
+                    break
+        self._update_rule_profile_tip(normalized)
+
+    def _on_rule_profile_changed(self, *args) -> None:
+        profile = self._current_rule_profile()
+        if not profile:
+            return
+        self._last_rule_profile = profile
+        self._update_rule_profile_tip(profile)
+        if getattr(self, "_loading_settings", False):
+            return
+        settings = getattr(self, "_settings", None)
+        if settings is None or not getattr(self, "_settings_ready", False):
+            return
+        try:
+            settings.set("rule_profile", profile)
+        except Exception:
+            pass
+
     def _ask_rule_profile(self) -> Optional[str]:
+        combo_profile = self._current_rule_profile()
+        if combo_profile:
+            self._last_rule_profile = combo_profile
+            return combo_profile
         items = ["baseline", "aggressive"]
         current = getattr(self, "_last_rule_profile", "baseline")
         try:
@@ -1823,6 +1923,19 @@ class Ui_MainWindow(object):
             "模型阶段",
             (self.btn_train, self.btn_full_retrain, self.btn_predict, self.btn_analysis),
         )
+
+        profile_group, profile_layout = self._create_collapsible_group("规则档位", spacing=6)
+        self.rule_profile_combo = QtWidgets.QComboBox()
+        self.rule_profile_combo.setMinimumHeight(36)
+        self.rule_profile_combo.addItem("Baseline（常规）", userData="baseline")
+        self.rule_profile_combo.addItem("Aggressive（高敏）", userData="aggressive")
+        profile_layout.addWidget(self.rule_profile_combo)
+        self.rule_profile_hint = QtWidgets.QLabel()
+        self.rule_profile_hint.setWordWrap(True)
+        profile_layout.addWidget(self.rule_profile_hint)
+        self.right_layout.addWidget(profile_group)
+        self.rule_profile_combo.currentIndexChanged.connect(self._on_rule_profile_changed)
+        self._update_rule_profile_tip(getattr(self, "_last_rule_profile", "baseline"))
 
         self._add_group_with_controls(
             "输出管理",
@@ -4865,6 +4978,7 @@ class Ui_MainWindow(object):
             )
 
             model_score_array = np.clip(np.asarray(scores, dtype=float), 0.0, 1.0)
+            model_confidence_array = np.maximum(model_score_array, 1.0 - model_score_array)
             fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
                 model_score_array,
                 rule_scores_array,
@@ -4873,6 +4987,7 @@ class Ui_MainWindow(object):
                 threshold=float(fusion_threshold_value),
                 trigger_threshold=float(rule_threshold),
                 profile=rule_profile,
+                model_confidence=model_confidence_array,
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
@@ -5226,6 +5341,7 @@ class Ui_MainWindow(object):
         )
 
         model_scores_input = np.clip(np.asarray(risk_score, dtype=float), 0.0, 1.0)
+        model_confidence_input = np.maximum(model_scores_input, 1.0 - model_scores_input)
         fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
             model_scores_input,
             rule_scores_array,
@@ -5234,6 +5350,7 @@ class Ui_MainWindow(object):
             threshold=float(fusion_threshold_value),
             trigger_threshold=float(rule_threshold),
             profile=rule_profile,
+            model_confidence=model_confidence_input,
         )
         fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
         fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
@@ -6496,6 +6613,11 @@ class Ui_MainWindow(object):
             last_path = self._settings.get("last_input_path")
             if isinstance(last_path, str) and last_path:
                 self.file_edit.setText(last_path)
+            saved_profile = self._settings.get("rule_profile")
+            if isinstance(saved_profile, str) and saved_profile.strip():
+                self._select_rule_profile(saved_profile)
+            else:
+                self._update_rule_profile_tip(self._current_rule_profile())
         finally:
             self._loading_settings = False
             self._settings_ready = True

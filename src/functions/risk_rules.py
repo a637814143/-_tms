@@ -826,6 +826,7 @@ def fuse_model_rule_votes(
     rule_weight: Optional[float] = None,
     threshold: Optional[float] = None,
     trigger_threshold: Optional[float] = None,
+    model_confidence: Optional[Union[np.ndarray, Sequence[float], float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """融合模型与规则得分，并根据档位模式返回最终标记。"""
 
@@ -861,10 +862,56 @@ def fuse_model_rule_votes(
     m_weight = float(model_weight if model_weight is not None else settings["model_weight"])
     r_weight = float(rule_weight if rule_weight is not None else settings["rule_weight"])
     mode = str(settings.get("mode", "conservative")).lower()
+    profile_token = str(settings.get("profile", profile or "baseline")).strip().lower()
 
     rules_triggered = (rule_arr >= trig_threshold).astype(bool)
 
-    fused_scores = m_weight * model_arr + r_weight * normalized_rules
+    confidence_weights: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    if model_confidence is not None:
+        conf_arr = np.asarray(model_confidence, dtype=np.float64).reshape(-1)
+        if conf_arr.size == 0:
+            conf_arr = np.zeros_like(model_arr, dtype=np.float64)
+        elif conf_arr.size == 1:
+            conf_arr = np.full_like(model_arr, float(conf_arr[0]), dtype=np.float64)
+        elif conf_arr.size != model_arr.size:
+            aligned = np.empty_like(model_arr, dtype=np.float64)
+            limit = min(conf_arr.size, model_arr.size)
+            aligned[:limit] = conf_arr[:limit]
+            if limit < model_arr.size:
+                aligned[limit:] = conf_arr[limit - 1]
+            conf_arr = aligned
+        conf_arr = np.clip(conf_arr, 0.0, 1.0)
+
+        base_total_weight = float(m_weight + r_weight)
+        if not np.isfinite(base_total_weight) or base_total_weight <= 0.0:
+            base_total_weight = 1.0
+
+        profile_is_aggressive = profile_token.startswith("agg")
+        if profile_is_aggressive:
+            high_model_ratio, high_rule_ratio = 0.5, 0.5
+            low_model_ratio, low_rule_ratio = 0.35, 0.65
+        else:
+            high_model_ratio, high_rule_ratio = 0.8, 0.2
+            low_model_ratio, low_rule_ratio = 0.6, 0.4
+
+        high_model_weight = base_total_weight * high_model_ratio
+        high_rule_weight = base_total_weight * high_rule_ratio
+        low_model_weight = base_total_weight * low_model_ratio
+        low_rule_weight = base_total_weight * low_rule_ratio
+
+        high_conf_mask = conf_arr >= 0.8
+        model_weights = np.where(high_conf_mask, high_model_weight, low_model_weight)
+        rule_weights = np.where(high_conf_mask, high_rule_weight, low_rule_weight)
+        confidence_weights = (
+            model_weights.astype(np.float64, copy=False),
+            rule_weights.astype(np.float64, copy=False),
+        )
+
+    if confidence_weights is None:
+        fused_scores = m_weight * model_arr + r_weight * normalized_rules
+    else:
+        dynamic_model_weight, dynamic_rule_weight = confidence_weights
+        fused_scores = dynamic_model_weight * model_arr + dynamic_rule_weight * normalized_rules
     fused_flags = (fused_scores >= fusion_threshold).astype(bool)
 
     if mode.startswith("aggr"):
