@@ -126,6 +126,7 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
         rule_weight: Optional[float] = None,
         threshold: Optional[float] = None,
         trigger_threshold: Optional[float] = None,
+        model_confidence: Optional[Iterable[object]] = None,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         model_arr = np.asarray(model_scores, dtype=np.float64).reshape(-1)
         if model_arr.size == 0:
@@ -154,9 +155,44 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
         trig_threshold = float(trigger_threshold or DEFAULT_TRIGGER_THRESHOLD)
         rules_triggered = (rule_arr >= trig_threshold).astype(bool)
 
-        fused_scores = float(model_weight or DEFAULT_MODEL_WEIGHT) * model_arr + float(
-            active_rule_weight
-        ) * normalized_rules
+        if model_confidence is not None:
+            conf_arr = np.asarray(model_confidence, dtype=np.float64).reshape(-1)
+            if conf_arr.size == 0:
+                conf_arr = np.zeros_like(model_arr)
+            elif conf_arr.size == 1:
+                conf_arr = np.full_like(model_arr, float(conf_arr[0]))
+            elif conf_arr.size != model_arr.size:
+                limit = min(conf_arr.size, model_arr.size)
+                padded = np.empty_like(model_arr)
+                padded[:limit] = conf_arr[:limit]
+                if limit < model_arr.size:
+                    padded[limit:] = conf_arr[limit - 1]
+                conf_arr = padded
+            conf_arr = np.clip(conf_arr, 0.0, 1.0)
+        else:
+            conf_arr = None
+
+        model_w = float(model_weight or DEFAULT_MODEL_WEIGHT)
+        rule_w = float(active_rule_weight)
+        total = model_w + rule_w
+        if not np.isfinite(total) or total <= 0.0:
+            total = 1.0
+
+        profile_key = str(profile or "baseline").strip().lower()
+        if profile_key.startswith("agg"):
+            high_pair = (0.5, 0.5)
+            low_pair = (0.35, 0.65)
+        else:
+            high_pair = (0.8, 0.2)
+            low_pair = (0.6, 0.4)
+
+        if conf_arr is not None:
+            high_mask = conf_arr >= 0.8
+            model_weights = np.where(high_mask, total * high_pair[0], total * low_pair[0])
+            rule_weights = np.where(high_mask, total * high_pair[1], total * low_pair[1])
+            fused_scores = model_weights * model_arr + rule_weights * normalized_rules
+        else:
+            fused_scores = model_w * model_arr + rule_w * normalized_rules
         fused_flags = (fused_scores >= float(threshold or DEFAULT_FUSION_THRESHOLD)).astype(bool)
 
         return fused_scores, fused_flags, rules_triggered
@@ -438,6 +474,7 @@ def _run_prediction(
                 rule_scores_array = None
 
             model_score_input = np.clip(scores_arr, 0.0, 1.0)
+            model_confidence = np.maximum(model_score_input, 1.0 - model_score_input)
 
             fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
                 model_score_input,
@@ -447,6 +484,7 @@ def _run_prediction(
                 rule_weight=float(fusion_rule_weight_base),
                 threshold=float(fusion_threshold_value),
                 trigger_threshold=float(effective_rule_threshold),
+                model_confidence=model_confidence,
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=np.float64).reshape(-1)
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
@@ -641,6 +679,7 @@ def _run_prediction(
                 rule_scores_array = None
 
             model_score_input = np.clip(risk_score, 0.0, 1.0)
+            model_confidence = np.maximum(model_score_input, 1.0 - model_score_input)
 
             fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
                 model_score_input,
@@ -650,6 +689,7 @@ def _run_prediction(
                 rule_weight=float(fusion_rule_weight_base),
                 threshold=float(fusion_threshold_value),
                 trigger_threshold=float(effective_rule_threshold),
+                model_confidence=model_confidence,
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=np.float64).reshape(-1)
             fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
