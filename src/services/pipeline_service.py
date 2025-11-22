@@ -206,6 +206,9 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
 logger = get_logger(__name__)
 
 
+METRIC_LABEL_CANDIDATES = ["Label", "label", "class", "ground_truth"]
+
+
 def compute_detection_metrics(
     df,
     *,
@@ -240,7 +243,18 @@ def compute_detection_metrics(
         return None
 
     y_true = y_true[mask].astype(int)
-    y_pred = df.loc[mask, pred_col].astype(int)
+
+    try:
+        y_pred_numeric = pd.to_numeric(df.loc[mask, pred_col], errors="coerce")
+    except Exception:
+        return None
+
+    pred_mask = y_pred_numeric.isin([0, 1])
+    if pred_mask.sum() == 0:
+        return None
+
+    y_true = y_true[pred_mask]
+    y_pred = y_pred_numeric[pred_mask].astype(int)
 
     acc = accuracy_score(y_true, y_pred)
     rec = recall_score(y_true, y_pred, pos_label=1)
@@ -376,8 +390,7 @@ def _run_prediction(
     metadata_obj: Dict[str, object] = dict(metadata_payload)
 
     def _maybe_compute_metrics(frame) -> Optional[Dict[str, object]]:
-        label_candidates = ["Label", "label", "class", "ground_truth"]
-        for candidate in label_candidates:
+        for candidate in METRIC_LABEL_CANDIDATES:
             metrics = compute_detection_metrics(frame, label_col=candidate)
             if metrics:
                 metrics["label_column"] = candidate

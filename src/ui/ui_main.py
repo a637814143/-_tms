@@ -66,8 +66,13 @@ from src.functions.annotations import (
     apply_annotations_to_frame,
 )
 try:
-    from src.services.pipeline_service import compute_detection_metrics
+    from src.services.pipeline_service import (
+        METRIC_LABEL_CANDIDATES,
+        compute_detection_metrics,
+    )
 except Exception:  # pragma: no cover - metrics helper is optional
+
+    METRIC_LABEL_CANDIDATES = ["Label", "label", "class", "ground_truth"]
 
     def compute_detection_metrics(*args, **kwargs):  # type: ignore[return-type]
         return None
@@ -5435,7 +5440,7 @@ class Ui_MainWindow(object):
             summary_lines.append(f"规则配置：{rule_profile}")
 
         metrics = None
-        for candidate in ["Label", "label", "class", "ground_truth"]:
+        for candidate in METRIC_LABEL_CANDIDATES:
             metrics = compute_detection_metrics(
                 out_df,
                 label_col=candidate,
