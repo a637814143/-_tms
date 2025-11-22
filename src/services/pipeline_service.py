@@ -197,7 +197,59 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
 
         return fused_scores, fused_flags, rules_triggered
 
+try:  # Optional metrics helpers
+    from sklearn.metrics import accuracy_score, recall_score
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    accuracy_score = None  # type: ignore[assignment]
+    recall_score = None  # type: ignore[assignment]
+
 logger = get_logger(__name__)
+
+
+def compute_detection_metrics(
+    df,
+    *,
+    label_col: str = "Label",
+    pred_col: str = "prediction_status",
+):
+    """计算二分类检测的准确率与召回率。
+
+    当缺少真实标签列或缺少预测列时返回 ``None``，以便在无标签场景下优雅降级。
+    """
+
+    if accuracy_score is None or recall_score is None or pd is None:
+        return None
+
+    if not hasattr(df, "columns") or label_col not in df.columns or pred_col not in df.columns:
+        return None
+
+    y_true = df[label_col]
+
+    if y_true.dtype == "O":
+        mapping = {
+            "BENIGN": 0,
+            "NORMAL": 0,
+            "BENIGN/NEUTRAL": 0,
+            "MALICIOUS": 1,
+            "ATTACK": 1,
+        }
+        y_true = y_true.map(mapping)
+
+    mask = y_true.isin([0, 1])
+    if mask.sum() == 0:
+        return None
+
+    y_true = y_true[mask].astype(int)
+    y_pred = df.loc[mask, pred_col].astype(int)
+
+    acc = accuracy_score(y_true, y_pred)
+    rec = recall_score(y_true, y_pred, pos_label=1)
+
+    return {
+        "accuracy": float(acc),
+        "recall": float(rec),
+        "support": int(len(y_true)),
+    }
 
 
 def _safe_float(value: object, fallback: float) -> float:
@@ -322,6 +374,15 @@ def _run_prediction(
             logger.warning("Failed to load metadata %s: %s", metadata_path, exc)
 
     metadata_obj: Dict[str, object] = dict(metadata_payload)
+
+    def _maybe_compute_metrics(frame) -> Optional[Dict[str, object]]:
+        label_candidates = ["Label", "label", "class", "ground_truth"]
+        for candidate in label_candidates:
+            metrics = compute_detection_metrics(frame, label_col=candidate)
+            if metrics:
+                metrics["label_column"] = candidate
+                return metrics
+        return None
 
     if pipeline_path.lower().endswith(".json"):
         if load_simple_model is None or simple_predict is None:
@@ -570,6 +631,9 @@ def _run_prediction(
                     "rules": fusion_weight_rules,
                 },
             }
+            metrics = _maybe_compute_metrics(output_df)
+            if metrics:
+                result_info["metrics"] = metrics
             if rule_profile:
                 result_info["rule_profile"] = rule_profile
         else:
@@ -795,6 +859,10 @@ def _run_prediction(
                 }
             if metadata_obj:
                 result_info["metadata"] = metadata_obj
+
+            metrics = _maybe_compute_metrics(output_df)
+            if metrics:
+                result_info["metrics"] = metrics
 
     if metadata_obj and "metadata" not in result_info:
         result_info["metadata"] = metadata_obj

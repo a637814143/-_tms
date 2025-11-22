@@ -66,6 +66,13 @@ from src.functions.annotations import (
     apply_annotations_to_frame,
 )
 try:
+    from src.services.pipeline_service import compute_detection_metrics
+except Exception:  # pragma: no cover - metrics helper is optional
+
+    def compute_detection_metrics(*args, **kwargs):  # type: ignore[return-type]
+        return None
+
+try:
     from src.functions.logging_utils import get_log_dir as _get_app_log_dir
 except Exception:  # pragma: no cover - logging helper may be absent in minimal envs
     _get_app_log_dir = None  # type: ignore
@@ -5427,6 +5434,28 @@ class Ui_MainWindow(object):
         if rule_profile:
             summary_lines.append(f"规则配置：{rule_profile}")
 
+        metrics = None
+        for candidate in ["Label", "label", "class", "ground_truth"]:
+            metrics = compute_detection_metrics(
+                out_df,
+                label_col=candidate,
+                pred_col="prediction_status",
+            )
+            if metrics:
+                metrics["label_column"] = candidate
+                support = metrics.get("support", 0)
+                acc = metrics.get("accuracy")
+                rec = metrics.get("recall")
+                metrics_text = (
+                    f"有标签样本 {support} 条，准确率={acc:.4f} ({acc:.2%})，召回率={rec:.4f} ({rec:.2%})"
+                )
+                summary_lines.append(metrics_text)
+                break
+
+        if metrics is None:
+            no_metrics_text = "当前数据集没有有效标签，无法计算准确率/召回率。"
+            messages.append(no_metrics_text)
+
         if output_dir is None:
             output_dir = self._prediction_out_dir()
         os.makedirs(output_dir, exist_ok=True)
@@ -5497,6 +5526,7 @@ class Ui_MainWindow(object):
             "rule_threshold": rule_threshold,
             "rule_hits": rule_hits,
             "rule_profile": rule_profile,
+            "metrics": metrics,
         }
 
 
