@@ -39,11 +39,11 @@ try:
     from src.functions.modeling import (
         compute_risk_components,
         summarize_prediction_labels,
-        train_unsupervised_on_split,
+        train_supervised_on_split,
     )
 except ModuleNotFoundError:  # pragma: no cover - triggered in lightweight envs
     compute_risk_components = None  # type: ignore[assignment]
-    train_unsupervised_on_split = None  # type: ignore[assignment]
+    train_supervised_on_split = None  # type: ignore[assignment]
 
     def summarize_prediction_labels(
         predictions: Iterable[object],
@@ -415,7 +415,7 @@ def _run_prediction(
             "normal_count": None,
         }
     else:
-        if compute_risk_components is None or train_unsupervised_on_split is None:
+        if compute_risk_components is None or train_supervised_on_split is None:
             raise RuntimeError(
                 "缺少建模依赖（如 scikit-learn），无法加载完整模型。"
             )
@@ -453,21 +453,11 @@ def _run_prediction(
             model = pipeline["model"]
             preds_arr = np.asarray(model.predict(matrix)).reshape(-1)
 
-            if hasattr(model, "predict_proba"):
-                proba = model.predict_proba(matrix)
-                if np.ndim(proba) == 2:
-                    scores_arr = np.asarray(proba, dtype=np.float64).max(axis=1)
-                else:
-                    scores_arr = np.asarray(proba, dtype=np.float64).reshape(-1)
-            elif hasattr(model, "decision_function"):
-                decision = model.decision_function(matrix)
-                decision_arr = np.asarray(decision, dtype=np.float64)
-                if decision_arr.ndim == 1:
-                    scores_arr = 1.0 / (1.0 + np.exp(-decision_arr))
-                else:
-                    scores_arr = decision_arr.max(axis=1)
-            else:
-                scores_arr = np.asarray(preds_arr, dtype=np.float64)
+            scores_arr = _extract_positive_probability(
+                model,
+                matrix,
+                label_mapping if isinstance(label_mapping, dict) else None,
+            )
 
             label_mapping = pipeline.get("label_mapping")
             labels, _, _, _ = summarize_prediction_labels(
@@ -893,6 +883,75 @@ def _run_prediction(
     return result_info
 
 
+def _resolve_positive_index(classes: Iterable[object], label_mapping: Optional[Dict[int, str]] = None) -> Optional[int]:
+    candidates = list(classes) if classes is not None else []
+    for idx, cls in enumerate(candidates):
+        try:
+            value = int(cls)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            value = None
+        if value == 1:
+            return idx
+    for idx, cls in enumerate(candidates):
+        try:
+            value = int(cls)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if value == -1:
+            return idx
+        if label_mapping and value is not None:
+            mapped = label_mapping.get(value)
+            if isinstance(mapped, str) and mapped.upper().startswith("MAL"):
+                return idx
+    return None
+
+
+def _extract_positive_probability(
+    model: object,
+    matrix: "np.ndarray",
+    label_mapping: Optional[Dict[int, str]] = None,
+) -> "np.ndarray":
+    if hasattr(model, "predict_proba"):
+        try:
+            proba = model.predict_proba(matrix)
+        except Exception:
+            proba = None
+        if proba is not None:
+            proba_arr = np.asarray(proba, dtype=np.float64)
+            if proba_arr.ndim == 2 and proba_arr.shape[1] >= 2:
+                classes = getattr(model, "classes_", None)
+                pos_index = _resolve_positive_index(classes, label_mapping)
+                if pos_index is None:
+                    pos_index = proba_arr.shape[1] - 1
+                pos_index = max(0, min(proba_arr.shape[1] - 1, int(pos_index)))
+                return proba_arr[:, pos_index]
+            return proba_arr.reshape(-1)
+
+    if hasattr(model, "decision_function"):
+        try:
+            decision = model.decision_function(matrix)
+        except Exception:
+            decision = None
+        if decision is not None:
+            decision_arr = np.asarray(decision, dtype=np.float64)
+            if decision_arr.ndim == 1:
+                return 1.0 / (1.0 + np.exp(-decision_arr))
+            if decision_arr.ndim == 2 and decision_arr.shape[1] >= 2:
+                classes = getattr(model, "classes_", None)
+                pos_index = _resolve_positive_index(classes, label_mapping)
+                if pos_index is None:
+                    pos_index = decision_arr.shape[1] - 1
+                pos_index = max(0, min(decision_arr.shape[1] - 1, int(pos_index)))
+                return decision_arr[:, pos_index]
+            return decision_arr.reshape(-1)
+
+    try:
+        predictions = model.predict(matrix)
+    except Exception:
+        predictions = np.zeros(matrix.shape[0])
+    return np.asarray(predictions, dtype=np.float64).reshape(-1)
+
+
 def _handle_extract(args: argparse.Namespace) -> int:
     if extract_features_dir is None:
         raise RuntimeError("提取功能需要 dpkt 等可选依赖。")
@@ -912,7 +971,7 @@ def _handle_extract(args: argparse.Namespace) -> int:
 
 
 def _handle_train(args: argparse.Namespace) -> int:
-    if train_unsupervised_on_split is None:
+    if train_supervised_on_split is None:
         raise RuntimeError("缺少建模依赖（如 scikit-learn），无法执行训练流程。")
     train_kwargs: Dict[str, object] = {}
     if getattr(args, "max_ensemble_members", None) is not None:
@@ -921,7 +980,7 @@ def _handle_train(args: argparse.Namespace) -> int:
         train_kwargs["ensemble_weight_metric"] = args.ensemble_weight_metric
     if getattr(args, "reset_ensemble", False):
         train_kwargs["reset_ensemble"] = True
-    result = train_unsupervised_on_split(
+    result = train_supervised_on_split(
         args.split_dir,
         args.results_dir,
         args.models_dir,
@@ -1086,7 +1145,7 @@ if FastAPI is not None:
                     train_kwargs["ensemble_weight_metric"] = req.ensemble_weight_metric
                 if req.reset_ensemble:
                     train_kwargs["reset_ensemble"] = True
-                result = train_unsupervised_on_split(
+                result = train_supervised_on_split(
                     req.split_dir,
                     req.results_dir,
                     req.models_dir,

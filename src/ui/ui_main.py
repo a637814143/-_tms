@@ -34,7 +34,7 @@ from src.functions.csv_utils import read_csv_flexible
 try:
     from src.functions.modeling import (
         META_COLUMNS as TRAIN_META_COLUMNS,
-        train_unsupervised_on_split as run_train,
+        train_supervised_on_split as run_train,
     )
 except Exception:  # pragma: no cover - fallback for minimal environments
     from src.functions.simple_unsupervised import train_unsupervised_on_split as run_train  # type: ignore
