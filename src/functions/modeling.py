@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -20,11 +21,16 @@ from .vectorizer import (
     numeric_feature_names,
     vectorize_flows,
 )
+from .csv_utils import read_csv_flexible
+from .logging_utils import get_logger
 
 try:  # pandas 在预测阶段可选
     import pandas as pd  # type: ignore
 except Exception:  # pragma: no cover - 预测模块可在无 pandas 环境运行
     pd = None  # type: ignore
+
+
+logger = get_logger(__name__)
 
 try:  # 规则引擎不是硬依赖
     from .risk_rules import (  # type: ignore
@@ -155,6 +161,7 @@ __all__ = [
     "ModelPredictor",
     "EnsembleVotingClassifier",
     "train_hist_gradient_boosting",
+    "train_supervised_on_split",
     "train_unsupervised_on_split",
     "detect_pcap_with_model",
     "summarize_prediction_labels",
@@ -1705,6 +1712,158 @@ def detect_pcap_with_model(
 
     flows = [dict(flow) for flow in result.get("flows", [])]
     return _build_detection_result(model, feature_names, label_mapping, flows, pcap_path)
+
+
+def train_supervised_on_split(
+    split_dir: Union[str, Path],
+    results_dir: Optional[Union[str, Path]] = None,
+    models_dir: Optional[Union[str, Path]] = None,
+    *,
+    model_tag: str = "latest",
+    label_col: str = "Label",
+    positive_labels: Sequence[str] = ("MALICIOUS", "ATTACK"),
+    **kwargs: Union[int, float, None],
+) -> Dict[str, object]:
+    """Train a supervised classifier on labelled split CSVs.
+
+    This mirrors the return structure of :func:`train_unsupervised_on_split` so the
+    UI/CLI can stay unchanged while switching the underlying model family.
+    """
+
+    if pd is None:
+        raise RuntimeError("训练流程需要 pandas 依赖，请先安装相关依赖。")
+
+    split_path = Path(split_dir)
+    if not split_path.exists():
+        raise FileNotFoundError(f"未找到训练数据目录: {split_dir}")
+
+    csv_files: List[Path] = []
+    for root, _, files in os.walk(split_path):
+        for name in files:
+            if name.lower().endswith(".csv"):
+                csv_files.append(Path(root) / name)
+
+    if not csv_files:
+        raise RuntimeError(f"未在 {split_dir} 找到任何 CSV 用于训练")
+
+    frames: List[pd.DataFrame] = []
+    for path in sorted(csv_files):
+        try:
+            frames.append(read_csv_flexible(path))
+        except Exception as exc:  # pragma: no cover - 容错读取
+            logger.warning("跳过无法读取的文件 %s: %s", path, exc)
+            continue
+
+    if not frames:
+        raise RuntimeError("无法从训练目录读取任何有效的特征 CSV。")
+
+    full_df = pd.concat(frames, ignore_index=True)
+    if full_df.empty:
+        raise RuntimeError("训练数据为空，无法进行有监督建模。")
+
+    if label_col not in full_df.columns:
+        raise ValueError(f"数据中不存在标签列 {label_col}")
+
+    raw_labels = full_df[label_col]
+    if raw_labels.dtype == "O":
+        positive_set = {str(value).upper() for value in positive_labels}
+        y = raw_labels.astype(str).str.upper().isin(positive_set).astype(int)
+    else:
+        y = raw_labels.astype(int)
+
+    feature_columns = list(numeric_feature_names())
+    feature_df = full_df.reindex(columns=feature_columns, fill_value=0.0)
+    feature_df = feature_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    X = feature_df.to_numpy(dtype=np.float64, copy=False)
+    y_arr = y.to_numpy(dtype=np.int64, copy=False)
+
+    filtered_params = _filter_estimator_params(HistGradientBoostingClassifier, **kwargs)
+    params = DEFAULT_MODEL_PARAMS.copy()
+    params.update(filtered_params)
+
+    clf = HistGradientBoostingClassifier(**params)
+    clf.fit(X, y_arr)
+
+    label_mapping = {0: "BENIGN", 1: "MALICIOUS"}
+
+    models_root = Path(models_dir) if models_dir else split_path
+    models_root.mkdir(parents=True, exist_ok=True)
+    model_path = models_root / "model.joblib"
+
+    pipeline_payload = {
+        "model": clf,
+        "feature_names": feature_columns,
+        "label_mapping": label_mapping,
+    }
+    dump(pipeline_payload, model_path)
+
+    timestamp = datetime.now()
+    timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+    stamp_token = timestamp.strftime("%Y%m%d_%H%M%S")
+
+    metadata: Dict[str, object] = {
+        "schema_version": MODEL_SCHEMA_VERSION,
+        "timestamp": timestamp_str,
+        "pipeline_latest": model_path.name,
+        "pipeline_path": model_path.name,
+        "feature_order": feature_columns,
+        "feature_names_in": feature_columns,
+        "feature_columns": feature_columns,
+        "label_mapping": label_mapping,
+        "model_tag": model_tag,
+        "model_type": "supervised_hist_gradient_boosting",
+        "label_column": label_col,
+        "positive_labels": list(positive_labels),
+        "positive_class": 1,
+        "positive_label": "MALICIOUS",
+        "n_samples": int(X.shape[0]),
+        "n_features": int(X.shape[1]),
+        "ensemble_members": 1,
+    }
+
+    metadata_path = models_root / f"iforest_metadata_{stamp_token}.json"
+    latest_metadata_path = models_root / "latest_iforest_metadata.json"
+    model_metadata_path = model_path.with_suffix(".json")
+
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
+    with latest_metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
+    with model_metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+
+    if results_dir:
+        Path(results_dir).mkdir(parents=True, exist_ok=True)
+
+    return {
+        "model_path": str(model_path),
+        "pipeline_path": str(model_path),
+        "pipeline_latest": str(model_path),
+        "metadata_path": str(metadata_path),
+        "metadata_latest": str(latest_metadata_path),
+        "model_metadata_path": str(model_metadata_path),
+        "model_joblib": str(model_path),
+        "results_csv": None,
+        "summary_csv": None,
+        "scaler_path": None,
+        "flows": int(X.shape[0]),
+        "malicious": int(np.count_nonzero(y_arr)),
+        "feature_columns": feature_columns,
+        "classes": ["0", "1"],
+        "label_mapping": label_mapping,
+        "dropped_flows": 0,
+        "timestamp": timestamp_str,
+        "schema_version": MODEL_SCHEMA_VERSION,
+        "summary": None,
+        "metadata": metadata,
+        "decision_threshold": None,
+        "model_metrics": None,
+        "positive_label": "MALICIOUS",
+        "positive_class": 1,
+    }
 
 
 def train_unsupervised_on_split(
