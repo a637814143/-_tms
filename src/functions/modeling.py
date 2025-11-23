@@ -1738,10 +1738,15 @@ def train_supervised_on_split(
         raise FileNotFoundError(f"未找到训练数据目录: {split_dir}")
 
     csv_files: List[Path] = []
-    for root, _, files in os.walk(split_path):
-        for name in files:
-            if name.lower().endswith(".csv"):
-                csv_files.append(Path(root) / name)
+    if split_path.is_file():
+        if split_path.suffix.lower() != ".csv":
+            raise RuntimeError("训练数据必须为 CSV 文件或包含 CSV 的目录。")
+        csv_files.append(split_path)
+    else:
+        for root, _, files in os.walk(split_path):
+            for name in files:
+                if name.lower().endswith(".csv"):
+                    csv_files.append(Path(root) / name)
 
     if not csv_files:
         raise RuntimeError(f"未在 {split_dir} 找到任何 CSV 用于训练")
