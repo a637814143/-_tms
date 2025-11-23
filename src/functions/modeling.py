@@ -172,6 +172,23 @@ __all__ = [
 _PARAM_CACHE: Dict[type, Set[str]] = {}
 
 
+def _normalise_label_name(name: str) -> str:
+    """Normalise label column names for tolerant matching."""
+
+    return name.strip().lstrip("\ufeff").lower()
+
+
+def _find_label_column(columns: Sequence[str], desired: str) -> Optional[str]:
+    """Locate the label column, ignoring case, whitespace and BOM markers."""
+
+    if desired in columns:
+        return desired
+
+    target = _normalise_label_name(desired)
+    normalised = {_normalise_label_name(col): col for col in columns}
+    return normalised.get(target)
+
+
 class EnsembleVotingClassifier:
     """A lightweight voting classifier for incrementally trained ensembles."""
 
@@ -1766,10 +1783,15 @@ def train_supervised_on_split(
     if full_df.empty:
         raise RuntimeError("训练数据为空，无法进行有监督建模。")
 
-    if label_col not in full_df.columns:
-        raise ValueError(f"数据中不存在标签列 {label_col}")
+    matched_label_col = _find_label_column(full_df.columns, label_col)
+    if matched_label_col is None:
+        available = ", ".join(str(col) for col in full_df.columns)
+        raise ValueError(f"数据中不存在标签列 {label_col} (现有列: {available})")
 
-    raw_labels = full_df[label_col]
+    if matched_label_col != label_col:
+        logger.info("检测到标签列 %s ，将替代期望列 %s", matched_label_col, label_col)
+
+    raw_labels = full_df[matched_label_col]
     if raw_labels.dtype == "O":
         positive_set = {str(value).upper() for value in positive_labels}
         y = raw_labels.astype(str).str.upper().isin(positive_set).astype(int)
