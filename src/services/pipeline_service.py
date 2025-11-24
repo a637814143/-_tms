@@ -37,13 +37,13 @@ from src.functions.logging_utils import get_logger, log_model_event
 from src.functions.csv_utils import read_csv_flexible
 try:
     from src.functions.modeling import (
+        ModelTrainer,
         compute_risk_components,
         summarize_prediction_labels,
-        train_supervised_on_split,
     )
 except ModuleNotFoundError:  # pragma: no cover - triggered in lightweight envs
+    ModelTrainer = None  # type: ignore[assignment]
     compute_risk_components = None  # type: ignore[assignment]
-    train_supervised_on_split = None  # type: ignore[assignment]
 
     def summarize_prediction_labels(
         predictions: Iterable[object],
@@ -388,7 +388,7 @@ def _run_prediction(
                 return metrics
         return None
 
-    if compute_risk_components is None or train_supervised_on_split is None:
+    if compute_risk_components is None:
         raise RuntimeError("缺少建模依赖（如 scikit-learn），无法加载完整模型。")
     if joblib_load is None or pd is None or np is None:
         raise RuntimeError("缺少 numpy/pandas/joblib 依赖，无法加载完整模型。")
@@ -940,8 +940,10 @@ def _handle_extract(args: argparse.Namespace) -> int:
 
 
 def _handle_train(args: argparse.Namespace) -> int:
-    if train_supervised_on_split is None:
+    if ModelTrainer is None:
         raise RuntimeError("缺少建模依赖（如 scikit-learn），无法执行训练流程。")
+
+    trainer = ModelTrainer()
     train_kwargs: Dict[str, object] = {}
     if getattr(args, "max_ensemble_members", None) is not None:
         train_kwargs["max_ensemble_members"] = args.max_ensemble_members
@@ -949,19 +951,22 @@ def _handle_train(args: argparse.Namespace) -> int:
         train_kwargs["ensemble_weight_metric"] = args.ensemble_weight_metric
     if getattr(args, "reset_ensemble", False):
         train_kwargs["reset_ensemble"] = True
-    result = train_supervised_on_split(
+    result = trainer.train_from_split(
         args.split_dir,
-        args.results_dir,
-        args.models_dir,
+        results_dir=args.results_dir,
+        models_dir=args.models_dir,
         **train_kwargs,
     )
+    output_path = result.get("pipeline_latest") if isinstance(result, dict) else result
     summary = {
-        "results_csv": result.get("results_csv"),
-        "model_path": result.get("pipeline_path"),
-        "metadata_path": result.get("metadata_path"),
-        "packets": result.get("packets"),
+        "results_csv": result.get("results_csv") if isinstance(result, dict) else None,
+        "model_path": output_path,
+        "metadata_path": result.get("metadata_path") if isinstance(result, dict) else None,
+        "packets": result.get("packets") if isinstance(result, dict) else None,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if output_path:
+        print(output_path)
     log_model_event(
         "cli.train",
         {
@@ -1027,7 +1032,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_extract.add_argument("--fast", action="store_true", help="使用快速模式（可能精度稍低）")
     p_extract.set_defaults(func=_handle_extract)
 
-    p_train = sub.add_parser("train", help="训练无监督模型")
+    p_train = sub.add_parser("train", help="训练/追加监督集成模型")
     p_train.add_argument("split_dir", help="预处理数据集或 PCAP 目录")
     p_train.add_argument("results_dir", help="训练结果目录")
     p_train.add_argument("models_dir", help="模型输出目录")
@@ -1107,6 +1112,9 @@ if FastAPI is not None:
         @app.post("/train")
         def train_endpoint(req: TrainRequest):
             try:
+                if ModelTrainer is None:
+                    raise RuntimeError("缺少建模依赖（如 scikit-learn），无法执行训练流程。")
+                trainer = ModelTrainer()
                 train_kwargs: Dict[str, object] = {}
                 if req.max_ensemble_members is not None:
                     train_kwargs["max_ensemble_members"] = req.max_ensemble_members
@@ -1114,10 +1122,10 @@ if FastAPI is not None:
                     train_kwargs["ensemble_weight_metric"] = req.ensemble_weight_metric
                 if req.reset_ensemble:
                     train_kwargs["reset_ensemble"] = True
-                result = train_supervised_on_split(
+                result = trainer.train_from_split(
                     req.split_dir,
-                    req.results_dir,
-                    req.models_dir,
+                    results_dir=req.results_dir,
+                    models_dir=req.models_dir,
                     **train_kwargs,
                 )
                 log_model_event(
