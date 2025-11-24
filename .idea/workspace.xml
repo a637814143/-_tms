@@ -6,7 +6,7 @@
   <component name="ChangeListManager">
     <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/csv_utils.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/csv_utils.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/services/pipeline_service.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/services/pipeline_service.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -218,14 +218,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1754543842572</updated>
-    </task>
-    <task id="LOCAL-00059" summary="8888">
-      <option name="closed" value="true" />
-      <created>1762786703089</created>
-      <option name="number" value="00059" />
-      <option name="presentableId" value="LOCAL-00059" />
-      <option name="project" value="LOCAL" />
-      <updated>1762786703089</updated>
     </task>
     <task id="LOCAL-00060" summary="8888">
       <option name="closed" value="true" />
@@ -611,7 +603,15 @@
       <option name="project" value="LOCAL" />
       <updated>1763910415458</updated>
     </task>
-    <option name="localTasksCounter" value="108" />
+    <task id="LOCAL-00108" summary="8888">
+      <option name="closed" value="true" />
+      <created>1763984849241</created>
+      <option name="number" value="00108" />
+      <option name="presentableId" value="LOCAL-00108" />
+      <option name="project" value="LOCAL" />
+      <updated>1763984849241</updated>
+    </task>
+    <option name="localTasksCounter" value="109" />
     <servers />
   </component>
   <component name="UnknownFeatures">

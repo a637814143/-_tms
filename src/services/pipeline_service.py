@@ -70,15 +70,6 @@ except ModuleNotFoundError:  # pragma: no cover - triggered in lightweight envs
         status = "异常" if anomaly_count > 0 else ("正常" if labels else None)
         return labels, anomaly_count, normal_count, status
 
-try:  # Optional lightweight inference helpers.
-    from src.functions.simple_unsupervised import (
-        simple_predict,
-        load_simple_model,
-    )
-except ModuleNotFoundError:  # pragma: no cover - optional dependency
-    simple_predict = None  # type: ignore[assignment]
-    load_simple_model = None  # type: ignore[assignment]
-
 try:
     from src.functions.risk_rules import (  # type: ignore
         fuse_model_rule_votes,
@@ -397,475 +388,453 @@ def _run_prediction(
                 return metrics
         return None
 
-    if pipeline_path.lower().endswith(".json"):
-        if load_simple_model is None or simple_predict is None:
-            raise RuntimeError(
-                "当前环境不支持 JSON 模型推理，请安装 simple_unsupervised 模块或提供完整模型管线。"
-            )
-        model = load_simple_model(pipeline_path)
-        output_path, _ = simple_predict(
-            model,
-            feature_csv,
-            output_path=output_path,
+    if compute_risk_components is None or train_supervised_on_split is None:
+        raise RuntimeError("缺少建模依赖（如 scikit-learn），无法加载完整模型。")
+    if joblib_load is None or pd is None or np is None:
+        raise RuntimeError("缺少 numpy/pandas/joblib 依赖，无法加载完整模型。")
+
+    pipeline = joblib_load(pipeline_path)
+    try:
+        df = read_csv_flexible(feature_csv)
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"无法读取特征 CSV，请检查文件编码：{exc}") from exc
+    if df.empty:
+        raise RuntimeError("特征 CSV 为空，无法预测。")
+
+    if isinstance(pipeline, dict) and "model" in pipeline and "feature_names" in pipeline:
+        feature_names = [str(name) for name in pipeline.get("feature_names", [])]
+        if not feature_names:
+            raise RuntimeError("模型缺少特征列描述，无法执行预测。")
+
+        missing = [col for col in feature_names if col not in df.columns]
+        if missing:
+            sample = ", ".join(missing[:8])
+            more = " ..." if len(missing) > 8 else ""
+            raise RuntimeError(f"特征 CSV 缺少必要列: {sample}{more}")
+
+        matrix = (
+            df.loc[:, feature_names]
+            .apply(pd.to_numeric, errors="coerce")
+            .fillna(0.0)
+            .to_numpy(dtype=np.float64, copy=False)
         )
-        result_info: Dict[str, object] = {
-            "output_path": output_path,
-            "status_text": None,
-            "anomaly_count": None,
-            "normal_count": None,
-        }
-    else:
-        if compute_risk_components is None or train_supervised_on_split is None:
-            raise RuntimeError(
-                "缺少建模依赖（如 scikit-learn），无法加载完整模型。"
-            )
-        if joblib_load is None or pd is None or np is None:
-            raise RuntimeError(
-                "缺少 numpy/pandas/joblib 依赖，无法加载完整模型。"
-            )
 
-        pipeline = joblib_load(pipeline_path)
-        try:
-            df = read_csv_flexible(feature_csv)
-        except UnicodeDecodeError as exc:
-            raise RuntimeError(f"无法读取特征 CSV，请检查文件编码：{exc}") from exc
-        if df.empty:
-            raise RuntimeError("特征 CSV 为空，无法预测。")
+        model = pipeline["model"]
+        preds_arr = np.asarray(model.predict(matrix)).reshape(-1)
 
-        if isinstance(pipeline, dict) and "model" in pipeline and "feature_names" in pipeline:
-            feature_names = [str(name) for name in pipeline.get("feature_names", [])]
-            if not feature_names:
-                raise RuntimeError("模型缺少特征列描述，无法执行预测。")
+        scores_arr = _extract_positive_probability(
+            model,
+            matrix,
+            label_mapping if isinstance(label_mapping, dict) else None,
+        )
 
-            missing = [col for col in feature_names if col not in df.columns]
-            if missing:
-                sample = ", ".join(missing[:8])
-                more = " ..." if len(missing) > 8 else ""
-                raise RuntimeError(f"特征 CSV 缺少必要列: {sample}{more}")
+        label_mapping = pipeline.get("label_mapping")
+        labels, _, _, _ = summarize_prediction_labels(
+            preds_arr,
+            label_mapping if isinstance(label_mapping, dict) else None,
+        )
 
-            matrix = (
-                df.loc[:, feature_names]
-                .apply(pd.to_numeric, errors="coerce")
-                .fillna(0.0)
-                .to_numpy(dtype=np.float64, copy=False)
-            )
-
-            model = pipeline["model"]
-            preds_arr = np.asarray(model.predict(matrix)).reshape(-1)
-
-            scores_arr = _extract_positive_probability(
-                model,
-                matrix,
-                label_mapping if isinstance(label_mapping, dict) else None,
-            )
-
-            label_mapping = pipeline.get("label_mapping")
-            labels, _, _, _ = summarize_prediction_labels(
-                preds_arr,
-                label_mapping if isinstance(label_mapping, dict) else None,
-            )
-
-            model_flags_bool = np.zeros(preds_arr.shape[0], dtype=bool)
-            model_statuses: List[str] = []
-            for idx, label in enumerate(labels):
-                if label == "异常":
-                    model_flags_bool[idx] = True
-                    model_statuses.append("异常")
-                elif label == "正常":
-                    model_flags_bool[idx] = False
-                    model_statuses.append("正常")
-                else:
-                    fallback_flag = bool(scores_arr[idx] >= 0.5)
-                    model_flags_bool[idx] = fallback_flag
-                    model_statuses.append("异常" if fallback_flag else "正常")
-
-            pipeline_meta = pipeline.get("metadata") if isinstance(pipeline, dict) else None
-            if isinstance(pipeline_meta, dict):
-                metadata_obj.update(pipeline_meta)
-            if metadata_payload:
-                metadata_obj.update(metadata_payload)
-
-            rule_settings = _resolve_rule_config(metadata_obj)
-            rule_params = (
-                rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
-            )
-            rule_threshold_value = float(
-                rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD)
-            )
-            rule_profile = (
-                rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
-            )
-            fusion_defaults = get_fusion_settings(profile=rule_profile)
-            fusion_model_weight_base = float(
-                rule_settings.get("model_weight", fusion_defaults["model_weight"])
-            )
-            fusion_rule_weight_base = float(
-                rule_settings.get("rule_weight", fusion_defaults["rule_weight"])
-            )
-            fusion_threshold_value = float(
-                rule_settings.get("fusion_threshold", fusion_defaults["fusion_threshold"])
-            )
-            rule_profile = (
-                fusion_defaults.get("profile") if rule_profile is None else rule_profile
-            )
-            normalized_weights = rule_settings.get("normalized_weights")
-
-            effective_rule_threshold = float(rule_threshold_value)
-
-            rule_scores_array: Optional[np.ndarray] = None
-            rule_reasons_list: Optional[List[str]] = None
-            rule_flags_array: Optional[np.ndarray] = None
-            if apply_risk_rules is not None and pd is not None:
-                try:
-                    score_series, reason_series = apply_risk_rules(
-                        df,
-                        params=rule_params,
-                        profile=rule_profile,
-                    )
-                except Exception:
-                    score_series = None
-                    reason_series = None
-                if score_series is not None:
-                    try:
-                        rule_scores_array = score_series.astype(float, copy=False).to_numpy(dtype=float)
-                    except Exception:
-                        rule_scores_array = np.asarray(score_series, dtype=np.float64).reshape(-1)
-                    if reason_series is not None:
-                        rule_reasons_list = reason_series.astype(str, copy=False).tolist()
-                    rule_flags_array = rule_scores_array >= float(effective_rule_threshold)
-
-            if rule_scores_array is not None and rule_scores_array.size == 0:
-                rule_scores_array = None
-
-            model_score_input = np.clip(scores_arr, 0.0, 1.0)
-            model_confidence = np.maximum(model_score_input, 1.0 - model_score_input)
-
-            fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
-                model_score_input,
-                rule_scores_array,
-                profile=rule_profile,
-                model_weight=float(fusion_model_weight_base),
-                rule_weight=float(fusion_rule_weight_base),
-                threshold=float(fusion_threshold_value),
-                trigger_threshold=float(effective_rule_threshold),
-                model_confidence=model_confidence,
-            )
-            fusion_scores_array = np.asarray(fusion_scores_array, dtype=np.float64).reshape(-1)
-            fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
-            rules_triggered_array = np.asarray(rules_triggered_array, dtype=bool).reshape(-1)
-
-            rule_flags_array = rules_triggered_array
-
-            total_weight = float(fusion_model_weight_base + fusion_rule_weight_base)
-            if not np.isfinite(total_weight) or total_weight <= 0.0:
-                fusion_weight_model = 1.0
-                fusion_weight_rules = 0.0
+        model_flags_bool = np.zeros(preds_arr.shape[0], dtype=bool)
+        model_statuses: List[str] = []
+        for idx, label in enumerate(labels):
+            if label == "异常":
+                model_flags_bool[idx] = True
+                model_statuses.append("异常")
+            elif label == "正常":
+                model_flags_bool[idx] = False
+                model_statuses.append("正常")
             else:
-                fusion_weight_model = float(fusion_model_weight_base) / total_weight
-                fusion_weight_rules = float(fusion_rule_weight_base) / total_weight
+                fallback_flag = bool(scores_arr[idx] >= 0.5)
+                model_flags_bool[idx] = fallback_flag
+                model_statuses.append("异常" if fallback_flag else "正常")
 
-            profile_key = (rule_profile or "").strip().lower()
-            if rule_scores_array is not None:
-                rule_scores_for_logic = np.asarray(rule_scores_array, dtype=np.float64).reshape(-1)
-            else:
-                rule_scores_for_logic = np.zeros_like(fusion_scores_array, dtype=np.float64)
-            if rule_scores_for_logic.shape != fusion_scores_array.shape:
-                target_len = fusion_scores_array.shape[0]
-                current_len = rule_scores_for_logic.shape[0]
-                if current_len < target_len:
-                    padded = np.zeros_like(fusion_scores_array, dtype=np.float64)
-                    padded[:current_len] = rule_scores_for_logic
-                    rule_scores_for_logic = padded
-                else:
-                    rule_scores_for_logic = rule_scores_for_logic[:target_len]
+        pipeline_meta = pipeline.get("metadata") if isinstance(pipeline, dict) else None
+        if isinstance(pipeline_meta, dict):
+            metadata_obj.update(pipeline_meta)
+        if metadata_payload:
+            metadata_obj.update(metadata_payload)
 
-            strong_rule_flags = np.logical_or(
-                rule_scores_for_logic >= 80.0,
-                rules_triggered_array,
-            )
-            if profile_key == "aggressive":
-                final_flags_array = np.logical_or(
-                    fusion_scores_array >= float(fusion_threshold_value),
-                    strong_rule_flags,
+        rule_settings = _resolve_rule_config(metadata_obj)
+        rule_params = (
+            rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
+        )
+        rule_threshold_value = float(
+            rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD)
+        )
+        rule_profile = (
+            rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
+        )
+        fusion_defaults = get_fusion_settings(profile=rule_profile)
+        fusion_model_weight_base = float(
+            rule_settings.get("model_weight", fusion_defaults["model_weight"])
+        )
+        fusion_rule_weight_base = float(
+            rule_settings.get("rule_weight", fusion_defaults["rule_weight"])
+        )
+        fusion_threshold_value = float(
+            rule_settings.get("fusion_threshold", fusion_defaults["fusion_threshold"])
+        )
+        rule_profile = (
+            fusion_defaults.get("profile") if rule_profile is None else rule_profile
+        )
+        normalized_weights = rule_settings.get("normalized_weights")
+
+        effective_rule_threshold = float(rule_threshold_value)
+
+        rule_scores_array: Optional[np.ndarray] = None
+        rule_reasons_list: Optional[List[str]] = None
+        rule_flags_array: Optional[np.ndarray] = None
+        if apply_risk_rules is not None and pd is not None:
+            try:
+                score_series, reason_series = apply_risk_rules(
+                    df,
+                    params=rule_params,
+                    profile=rule_profile,
                 )
-            else:
-                final_flags_array = fusion_scores_array >= float(fusion_threshold_value)
+            except Exception:
+                score_series = None
+                reason_series = None
+            if score_series is not None:
+                try:
+                    rule_scores_array = score_series.astype(float, copy=False).to_numpy(dtype=float)
+                except Exception:
+                    rule_scores_array = np.asarray(score_series, dtype=np.float64).reshape(-1)
+                if reason_series is not None:
+                    rule_reasons_list = reason_series.astype(str, copy=False).tolist()
+                rule_flags_array = rule_scores_array >= float(effective_rule_threshold)
 
-            final_statuses = ["异常" if flag else "正常" for flag in final_flags_array]
-            anomaly_count = int(np.count_nonzero(final_flags_array))
-            normal_count = int(len(final_flags_array) - anomaly_count)
-            status_text = "异常" if anomaly_count > 0 else ("正常" if len(final_flags_array) else None)
+        if rule_scores_array is not None and rule_scores_array.size == 0:
+            rule_scores_array = None
 
-            output_df = df.copy()
-            output_df["prediction"] = preds_arr
-            output_df["prediction_label"] = labels
-            output_df["malicious_score"] = scores_arr
-            output_df["model_flag"] = model_flags_bool.astype(int)
-            output_df["model_status"] = model_statuses
-            output_df["fusion_score"] = fusion_scores_array
-            output_df["fusion_decision"] = fusion_flags_array.astype(int)
-            output_df["prediction_status"] = final_flags_array.astype(int)
-            output_df["fusion_status"] = final_statuses
-            if rule_scores_array is not None:
-                output_df["rules_score"] = rule_scores_array
-            else:
-                output_df["rules_score"] = np.zeros(len(output_df), dtype=float)
+        model_score_input = np.clip(scores_arr, 0.0, 1.0)
+        model_confidence = np.maximum(model_score_input, 1.0 - model_score_input)
 
-            output_df["rules_flag"] = rule_flags_array.astype(int)
-            output_df["rules_triggered"] = rule_flags_array.astype(bool)
-            if rule_reasons_list is not None:
-                output_df["rules_reasons"] = rule_reasons_list
-            elif "rules_reasons" not in output_df.columns:
-                output_df["rules_reasons"] = ["" for _ in range(len(output_df))]
+        fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
+            model_score_input,
+            rule_scores_array,
+            profile=rule_profile,
+            model_weight=float(fusion_model_weight_base),
+            rule_weight=float(fusion_rule_weight_base),
+            threshold=float(fusion_threshold_value),
+            trigger_threshold=float(effective_rule_threshold),
+            model_confidence=model_confidence,
+        )
+        fusion_scores_array = np.asarray(fusion_scores_array, dtype=np.float64).reshape(-1)
+        fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
+        rules_triggered_array = np.asarray(rules_triggered_array, dtype=bool).reshape(-1)
 
-            if output_path is None:
-                base = Path(feature_csv).with_suffix("")
-                output_path = str(base) + "_predictions.csv"
-            output_df.to_csv(output_path, index=False, encoding="utf-8")
+        rule_flags_array = rules_triggered_array
 
-            result_info = {
-                "output_path": output_path,
-                "status_text": status_text,
-                "anomaly_count": anomaly_count,
-                "normal_count": normal_count,
-                "fusion_threshold": float(fusion_threshold_value),
-                "fusion_weights": {
-                    "model": fusion_weight_model,
-                    "rules": fusion_weight_rules,
-                },
-            }
-            metrics = _maybe_compute_metrics(output_df)
-            if metrics:
-                result_info["metrics"] = metrics
-            if rule_profile:
-                result_info["rule_profile"] = rule_profile
+        total_weight = float(fusion_model_weight_base + fusion_rule_weight_base)
+        if not np.isfinite(total_weight) or total_weight <= 0.0:
+            fusion_weight_model = 1.0
+            fusion_weight_rules = 0.0
         else:
-            metadata: Dict[str, object] = dict(metadata_payload)
+            fusion_weight_model = float(fusion_model_weight_base) / total_weight
+            fusion_weight_rules = float(fusion_rule_weight_base) / total_weight
 
-            detector = pipeline.named_steps.get("detector")
-            if detector is None:
-                raise RuntimeError("管线中缺少 detector 步骤。")
-
-            transformed = pipeline[:-1].transform(df)
-            scores = detector.score_samples(transformed)
-            preds = detector.predict(transformed)
-
-            vote_ratio = detector.last_vote_ratio_
-            if vote_ratio is None and detector.fit_votes_:
-                vote_ratio = np.vstack(
-                    [np.where(v == -1, 1.0, 0.0) for v in detector.fit_votes_.values()]
-                ).mean(axis=0)
-            if vote_ratio is None:
-                vote_ratio = np.ones_like(scores)
-
-            threshold = metadata.get("threshold") if isinstance(metadata, dict) else None
-            if threshold is None and getattr(detector, "threshold_", None) is not None:
-                threshold = float(detector.threshold_)
-            elif threshold is None:
-                threshold = float(np.quantile(scores, 0.05))
-
-            score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
-            if score_std is None:
-                score_std = float(np.std(scores) or 1.0)
-
-            vote_threshold = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
-            if vote_threshold is None and getattr(detector, "vote_threshold_", None) is not None:
-                vote_threshold = float(detector.vote_threshold_)
-            elif vote_threshold is None:
-                vote_threshold = float(np.clip(np.mean(vote_ratio), 0.0, 1.0))
-
-            risk_score, score_component, vote_component = compute_risk_components(
-                scores,
-                vote_ratio,
-                float(threshold),
-                float(vote_threshold),
-                float(score_std),
-            )
-
-            output_df = df.copy()
-            output_df["anomaly_score"] = scores
-            output_df["vote_ratio"] = vote_ratio
-            output_df["score_component"] = score_component
-            output_df["vote_component"] = vote_component
-            output_df["risk_score"] = risk_score
-            output_df["prediction"] = preds
-
-            model_flags_bool = (preds == -1).astype(bool)
-            model_statuses = ["异常" if flag else "正常" for flag in model_flags_bool]
-
-            rule_settings = _resolve_rule_config(metadata)
-            rule_params = (
-                rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
-            )
-            rule_threshold_value = float(
-                rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD)
-            )
-            rule_profile = (
-                rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
-            )
-            fusion_defaults = get_fusion_settings(profile=rule_profile)
-            fusion_model_weight_base = float(
-                rule_settings.get("model_weight", fusion_defaults["model_weight"])
-            )
-            fusion_rule_weight_base = float(
-                rule_settings.get("rule_weight", fusion_defaults["rule_weight"])
-            )
-            fusion_threshold_value = float(
-                rule_settings.get("fusion_threshold", fusion_defaults["fusion_threshold"])
-            )
-            rule_profile = (
-                fusion_defaults.get("profile") if rule_profile is None else rule_profile
-            )
-            normalized_weights = rule_settings.get("normalized_weights")
-
-            effective_rule_threshold = float(rule_threshold_value)
-
-            rule_scores_array: Optional[np.ndarray] = None
-            rule_reasons_list: Optional[List[str]] = None
-            rule_flags_array: Optional[np.ndarray] = None
-            if apply_risk_rules is not None and pd is not None:
-                try:
-                    score_series, reason_series = apply_risk_rules(
-                        df,
-                        params=rule_params,
-                        profile=rule_profile,
-                    )
-                except Exception:
-                    score_series = None
-                    reason_series = None
-                if score_series is not None:
-                    try:
-                        rule_scores_array = score_series.astype(float, copy=False).to_numpy(dtype=float)
-                    except Exception:
-                        rule_scores_array = np.asarray(score_series, dtype=np.float64).reshape(-1)
-                    if reason_series is not None:
-                        rule_reasons_list = reason_series.astype(str, copy=False).tolist()
-                    rule_flags_array = rule_scores_array >= float(effective_rule_threshold)
-
-            if rule_scores_array is not None and rule_scores_array.size == 0:
-                rule_scores_array = None
-
-            model_score_input = np.clip(risk_score, 0.0, 1.0)
-            model_confidence = np.maximum(model_score_input, 1.0 - model_score_input)
-
-            fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
-                model_score_input,
-                rule_scores_array,
-                profile=rule_profile,
-                model_weight=float(fusion_model_weight_base),
-                rule_weight=float(fusion_rule_weight_base),
-                threshold=float(fusion_threshold_value),
-                trigger_threshold=float(effective_rule_threshold),
-                model_confidence=model_confidence,
-            )
-            fusion_scores_array = np.asarray(fusion_scores_array, dtype=np.float64).reshape(-1)
-            fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
-            rules_triggered_array = np.asarray(rules_triggered_array, dtype=bool).reshape(-1)
-
-            rule_flags_array = rules_triggered_array
-
-            total_weight = float(fusion_model_weight_base + fusion_rule_weight_base)
-            if not np.isfinite(total_weight) or total_weight <= 0.0:
-                fusion_weight_model = 1.0
-                fusion_weight_rules = 0.0
+        profile_key = (rule_profile or "").strip().lower()
+        if rule_scores_array is not None:
+            rule_scores_for_logic = np.asarray(rule_scores_array, dtype=np.float64).reshape(-1)
+        else:
+            rule_scores_for_logic = np.zeros_like(fusion_scores_array, dtype=np.float64)
+        if rule_scores_for_logic.shape != fusion_scores_array.shape:
+            target_len = fusion_scores_array.shape[0]
+            current_len = rule_scores_for_logic.shape[0]
+            if current_len < target_len:
+                padded = np.zeros_like(fusion_scores_array, dtype=np.float64)
+                padded[:current_len] = rule_scores_for_logic
+                rule_scores_for_logic = padded
             else:
-                fusion_weight_model = float(fusion_model_weight_base) / total_weight
-                fusion_weight_rules = float(fusion_rule_weight_base) / total_weight
+                rule_scores_for_logic = rule_scores_for_logic[:target_len]
 
-            profile_key = (rule_profile or "").strip().lower()
-            if rule_scores_array is not None:
-                rule_scores_for_logic = np.asarray(rule_scores_array, dtype=np.float64).reshape(-1)
-            else:
-                rule_scores_for_logic = np.zeros_like(fusion_scores_array, dtype=np.float64)
-            if rule_scores_for_logic.shape != fusion_scores_array.shape:
-                target_len = fusion_scores_array.shape[0]
-                current_len = rule_scores_for_logic.shape[0]
-                if current_len < target_len:
-                    padded = np.zeros_like(fusion_scores_array, dtype=np.float64)
-                    padded[:current_len] = rule_scores_for_logic
-                    rule_scores_for_logic = padded
-                else:
-                    rule_scores_for_logic = rule_scores_for_logic[:target_len]
-
-            strong_rule_flags = np.logical_or(
-                rule_scores_for_logic >= 80.0,
-                rules_triggered_array,
+        strong_rule_flags = np.logical_or(
+            rule_scores_for_logic >= 80.0,
+            rules_triggered_array,
+        )
+        if profile_key == "aggressive":
+            final_flags_array = np.logical_or(
+                fusion_scores_array >= float(fusion_threshold_value),
+                strong_rule_flags,
             )
-            if profile_key == "aggressive":
-                final_flags_array = np.logical_or(
-                    fusion_scores_array >= float(fusion_threshold_value),
-                    strong_rule_flags,
+        else:
+            final_flags_array = fusion_scores_array >= float(fusion_threshold_value)
+
+        final_statuses = ["异常" if flag else "正常" for flag in final_flags_array]
+        anomaly_count = int(np.count_nonzero(final_flags_array))
+        normal_count = int(len(final_flags_array) - anomaly_count)
+        status_text = "异常" if anomaly_count > 0 else ("正常" if len(final_flags_array) else None)
+
+        output_df = df.copy()
+        output_df["prediction"] = preds_arr
+        output_df["prediction_label"] = labels
+        output_df["malicious_score"] = scores_arr
+        output_df["model_flag"] = model_flags_bool.astype(int)
+        output_df["model_status"] = model_statuses
+        output_df["fusion_score"] = fusion_scores_array
+        output_df["fusion_decision"] = fusion_flags_array.astype(int)
+        output_df["prediction_status"] = final_flags_array.astype(int)
+        output_df["fusion_status"] = final_statuses
+        if rule_scores_array is not None:
+            output_df["rules_score"] = rule_scores_array
+        else:
+            output_df["rules_score"] = np.zeros(len(output_df), dtype=float)
+
+        output_df["rules_flag"] = rule_flags_array.astype(int)
+        output_df["rules_triggered"] = rule_flags_array.astype(bool)
+        if rule_reasons_list is not None:
+            output_df["rules_reasons"] = rule_reasons_list
+        elif "rules_reasons" not in output_df.columns:
+            output_df["rules_reasons"] = ["" for _ in range(len(output_df))]
+
+        if output_path is None:
+            base = Path(feature_csv).with_suffix("")
+            output_path = str(base) + "_predictions.csv"
+        output_df.to_csv(output_path, index=False, encoding="utf-8")
+
+        result_info = {
+            "output_path": output_path,
+            "status_text": status_text,
+            "anomaly_count": anomaly_count,
+            "normal_count": normal_count,
+            "fusion_threshold": float(fusion_threshold_value),
+            "fusion_weights": {
+                "model": fusion_weight_model,
+                "rules": fusion_weight_rules,
+            },
+        }
+        metrics = _maybe_compute_metrics(output_df)
+        if metrics:
+            result_info["metrics"] = metrics
+        if rule_profile:
+            result_info["rule_profile"] = rule_profile
+    else:
+        metadata: Dict[str, object] = dict(metadata_payload)
+
+        detector = pipeline.named_steps.get("detector")
+        if detector is None:
+            raise RuntimeError("管线中缺少 detector 步骤。")
+
+        transformed = pipeline[:-1].transform(df)
+        scores = detector.score_samples(transformed)
+        preds = detector.predict(transformed)
+
+        vote_ratio = detector.last_vote_ratio_
+        if vote_ratio is None and detector.fit_votes_:
+            vote_ratio = np.vstack(
+                [np.where(v == -1, 1.0, 0.0) for v in detector.fit_votes_.values()]
+            ).mean(axis=0)
+        if vote_ratio is None:
+            vote_ratio = np.ones_like(scores)
+
+        threshold = metadata.get("threshold") if isinstance(metadata, dict) else None
+        if threshold is None and getattr(detector, "threshold_", None) is not None:
+            threshold = float(detector.threshold_)
+        elif threshold is None:
+            threshold = float(np.quantile(scores, 0.05))
+
+        score_std = metadata.get("score_std") if isinstance(metadata, dict) else None
+        if score_std is None:
+            score_std = float(np.std(scores) or 1.0)
+
+        vote_threshold = metadata.get("vote_threshold") if isinstance(metadata, dict) else None
+        if vote_threshold is None and getattr(detector, "vote_threshold_", None) is not None:
+            vote_threshold = float(detector.vote_threshold_)
+        elif vote_threshold is None:
+            vote_threshold = float(np.clip(np.mean(vote_ratio), 0.0, 1.0))
+
+        risk_score, score_component, vote_component = compute_risk_components(
+            scores,
+            vote_ratio,
+            float(threshold),
+            float(vote_threshold),
+            float(score_std),
+        )
+
+        output_df = df.copy()
+        output_df["anomaly_score"] = scores
+        output_df["vote_ratio"] = vote_ratio
+        output_df["score_component"] = score_component
+        output_df["vote_component"] = vote_component
+        output_df["risk_score"] = risk_score
+        output_df["prediction"] = preds
+
+        model_flags_bool = (preds == -1).astype(bool)
+        model_statuses = ["异常" if flag else "正常" for flag in model_flags_bool]
+
+        rule_settings = _resolve_rule_config(metadata)
+        rule_params = (
+            rule_settings.get("params") if isinstance(rule_settings.get("params"), dict) else {}
+        )
+        rule_threshold_value = float(
+            rule_settings.get("threshold", DEFAULT_TRIGGER_THRESHOLD)
+        )
+        rule_profile = (
+            rule_settings.get("profile") if isinstance(rule_settings.get("profile"), str) else None
+        )
+        fusion_defaults = get_fusion_settings(profile=rule_profile)
+        fusion_model_weight_base = float(
+            rule_settings.get("model_weight", fusion_defaults["model_weight"])
+        )
+        fusion_rule_weight_base = float(
+            rule_settings.get("rule_weight", fusion_defaults["rule_weight"])
+        )
+        fusion_threshold_value = float(
+            rule_settings.get("fusion_threshold", fusion_defaults["fusion_threshold"])
+        )
+        rule_profile = (
+            fusion_defaults.get("profile") if rule_profile is None else rule_profile
+        )
+        normalized_weights = rule_settings.get("normalized_weights")
+
+        effective_rule_threshold = float(rule_threshold_value)
+
+        rule_scores_array: Optional[np.ndarray] = None
+        rule_reasons_list: Optional[List[str]] = None
+        rule_flags_array: Optional[np.ndarray] = None
+        if apply_risk_rules is not None and pd is not None:
+            try:
+                score_series, reason_series = apply_risk_rules(
+                    df,
+                    params=rule_params,
+                    profile=rule_profile,
                 )
+            except Exception:
+                score_series = None
+                reason_series = None
+            if score_series is not None:
+                try:
+                    rule_scores_array = score_series.astype(float, copy=False).to_numpy(dtype=float)
+                except Exception:
+                    rule_scores_array = np.asarray(score_series, dtype=np.float64).reshape(-1)
+                if reason_series is not None:
+                    rule_reasons_list = reason_series.astype(str, copy=False).tolist()
+                rule_flags_array = rule_scores_array >= float(effective_rule_threshold)
+
+        if rule_scores_array is not None and rule_scores_array.size == 0:
+            rule_scores_array = None
+
+        model_score_input = np.clip(risk_score, 0.0, 1.0)
+        model_confidence = np.maximum(model_score_input, 1.0 - model_score_input)
+
+        fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
+            model_score_input,
+            rule_scores_array,
+            profile=rule_profile,
+            model_weight=float(fusion_model_weight_base),
+            rule_weight=float(fusion_rule_weight_base),
+            threshold=float(fusion_threshold_value),
+            trigger_threshold=float(effective_rule_threshold),
+            model_confidence=model_confidence,
+        )
+        fusion_scores_array = np.asarray(fusion_scores_array, dtype=np.float64).reshape(-1)
+        fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool).reshape(-1)
+        rules_triggered_array = np.asarray(rules_triggered_array, dtype=bool).reshape(-1)
+
+        rule_flags_array = rules_triggered_array
+
+        total_weight = float(fusion_model_weight_base + fusion_rule_weight_base)
+        if not np.isfinite(total_weight) or total_weight <= 0.0:
+            fusion_weight_model = 1.0
+            fusion_weight_rules = 0.0
+        else:
+            fusion_weight_model = float(fusion_model_weight_base) / total_weight
+            fusion_weight_rules = float(fusion_rule_weight_base) / total_weight
+
+        profile_key = (rule_profile or "").strip().lower()
+        if rule_scores_array is not None:
+            rule_scores_for_logic = np.asarray(rule_scores_array, dtype=np.float64).reshape(-1)
+        else:
+            rule_scores_for_logic = np.zeros_like(fusion_scores_array, dtype=np.float64)
+        if rule_scores_for_logic.shape != fusion_scores_array.shape:
+            target_len = fusion_scores_array.shape[0]
+            current_len = rule_scores_for_logic.shape[0]
+            if current_len < target_len:
+                padded = np.zeros_like(fusion_scores_array, dtype=np.float64)
+                padded[:current_len] = rule_scores_for_logic
+                rule_scores_for_logic = padded
             else:
-                final_flags_array = fusion_scores_array >= float(fusion_threshold_value)
+                rule_scores_for_logic = rule_scores_for_logic[:target_len]
 
-            final_statuses = ["异常" if flag else "正常" for flag in final_flags_array]
-            anomaly_count = int(np.count_nonzero(final_flags_array))
-            normal_count = int(len(final_flags_array) - anomaly_count)
-            status_text = "异常" if anomaly_count > 0 else ("正常" if len(final_flags_array) else None)
+        strong_rule_flags = np.logical_or(
+            rule_scores_for_logic >= 80.0,
+            rules_triggered_array,
+        )
+        if profile_key == "aggressive":
+            final_flags_array = np.logical_or(
+                fusion_scores_array >= float(fusion_threshold_value),
+                strong_rule_flags,
+            )
+        else:
+            final_flags_array = fusion_scores_array >= float(fusion_threshold_value)
 
-            output_df["model_flag"] = model_flags_bool.astype(int)
-            output_df["model_status"] = model_statuses
-            output_df["fusion_score"] = fusion_scores_array
-            output_df["fusion_decision"] = fusion_flags_array.astype(int)
-            output_df["prediction_status"] = final_flags_array.astype(int)
-            output_df["fusion_status"] = final_statuses
-            output_df["is_malicious"] = final_flags_array.astype(int)
+        final_statuses = ["异常" if flag else "正常" for flag in final_flags_array]
+        anomaly_count = int(np.count_nonzero(final_flags_array))
+        normal_count = int(len(final_flags_array) - anomaly_count)
+        status_text = "异常" if anomaly_count > 0 else ("正常" if len(final_flags_array) else None)
 
-            if rule_scores_array is not None:
-                output_df["rules_score"] = rule_scores_array
-            else:
-                output_df["rules_score"] = np.zeros(len(output_df), dtype=float)
+        output_df["model_flag"] = model_flags_bool.astype(int)
+        output_df["model_status"] = model_statuses
+        output_df["fusion_score"] = fusion_scores_array
+        output_df["fusion_decision"] = fusion_flags_array.astype(int)
+        output_df["prediction_status"] = final_flags_array.astype(int)
+        output_df["fusion_status"] = final_statuses
+        output_df["is_malicious"] = final_flags_array.astype(int)
 
-            output_df["rules_flag"] = rule_flags_array.astype(int)
-            output_df["rules_triggered"] = rule_flags_array.astype(bool)
-            if rule_reasons_list is not None:
-                output_df["rules_reasons"] = rule_reasons_list
-            elif "rules_reasons" not in output_df.columns:
-                output_df["rules_reasons"] = ["" for _ in range(len(output_df))]
+        if rule_scores_array is not None:
+            output_df["rules_score"] = rule_scores_array
+        else:
+            output_df["rules_score"] = np.zeros(len(output_df), dtype=float)
 
-            if output_path is None:
-                base = Path(feature_csv).with_suffix("")
-                output_path = str(base) + "_predictions.csv"
-            output_df.to_csv(output_path, index=False, encoding="utf-8")
+        output_df["rules_flag"] = rule_flags_array.astype(int)
+        output_df["rules_triggered"] = rule_flags_array.astype(bool)
+        if rule_reasons_list is not None:
+            output_df["rules_reasons"] = rule_reasons_list
+        elif "rules_reasons" not in output_df.columns:
+            output_df["rules_reasons"] = ["" for _ in range(len(output_df))]
 
-            result_info = {
-                "output_path": output_path,
-                "status_text": status_text,
-                "anomaly_count": anomaly_count,
-                "normal_count": normal_count,
-                "fusion_threshold": float(fusion_threshold_value),
-                "fusion_weights": {
-                    "model": fusion_weight_model,
-                    "rules": fusion_weight_rules,
-                },
+        if output_path is None:
+            base = Path(feature_csv).with_suffix("")
+            output_path = str(base) + "_predictions.csv"
+        output_df.to_csv(output_path, index=False, encoding="utf-8")
+
+        result_info = {
+            "output_path": output_path,
+            "status_text": status_text,
+            "anomaly_count": anomaly_count,
+            "normal_count": normal_count,
+            "fusion_threshold": float(fusion_threshold_value),
+            "fusion_weights": {
+                "model": fusion_weight_model,
+                "rules": fusion_weight_rules,
+            },
+        }
+        if rule_profile:
+            result_info["rule_profile"] = rule_profile
+        if isinstance(normalized_weights, dict):
+            result_info["configured_fusion_weights"] = {
+                "model": float(normalized_weights.get("model", fusion_weight_model)),
+                "rules": float(normalized_weights.get("rules", fusion_weight_rules)),
             }
-            if rule_profile:
-                result_info["rule_profile"] = rule_profile
-            if isinstance(normalized_weights, dict):
-                result_info["configured_fusion_weights"] = {
-                    "model": float(normalized_weights.get("model", fusion_weight_model)),
-                    "rules": float(normalized_weights.get("rules", fusion_weight_rules)),
-                }
-            elif math.isfinite(fusion_model_weight_base + fusion_rule_weight_base) and (
-                fusion_model_weight_base + fusion_rule_weight_base
-            ) > 0.0:
-                total_config = float(fusion_model_weight_base + fusion_rule_weight_base)
-                result_info["configured_fusion_weights"] = {
-                    "model": float(fusion_model_weight_base) / total_config,
-                    "rules": float(fusion_rule_weight_base) / total_config,
-                }
-            else:
-                result_info["configured_fusion_weights"] = {
-                    "model": fusion_weight_model,
-                    "rules": fusion_weight_rules,
-                }
-            if metadata_obj:
-                result_info["metadata"] = metadata_obj
+        elif math.isfinite(fusion_model_weight_base + fusion_rule_weight_base) and (
+            fusion_model_weight_base + fusion_rule_weight_base
+        ) > 0.0:
+            total_config = float(fusion_model_weight_base + fusion_rule_weight_base)
+            result_info["configured_fusion_weights"] = {
+                "model": float(fusion_model_weight_base) / total_config,
+                "rules": float(fusion_rule_weight_base) / total_config,
+            }
+        else:
+            result_info["configured_fusion_weights"] = {
+                "model": fusion_weight_model,
+                "rules": fusion_weight_rules,
+            }
+        if metadata_obj:
+            result_info["metadata"] = metadata_obj
 
-            metrics = _maybe_compute_metrics(output_df)
-            if metrics:
-                result_info["metrics"] = metrics
+        metrics = _maybe_compute_metrics(output_df)
+        if metrics:
+            result_info["metrics"] = metrics
 
     if metadata_obj and "metadata" not in result_info:
         result_info["metadata"] = metadata_obj
