@@ -422,13 +422,12 @@ def _run_prediction(
         model = pipeline["model"]
         preds_arr = np.asarray(model.predict(matrix)).reshape(-1)
 
+        label_mapping = pipeline.get("label_mapping")
         scores_arr = _extract_positive_probability(
             model,
             matrix,
             label_mapping if isinstance(label_mapping, dict) else None,
         )
-
-        label_mapping = pipeline.get("label_mapping")
         labels, _, _, _ = summarize_prediction_labels(
             preds_arr,
             label_mapping if isinstance(label_mapping, dict) else None,
