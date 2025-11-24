@@ -31,25 +31,10 @@ from src.functions.feature_extractor import (
     get_loaded_plugin_info,
 )
 from src.functions.csv_utils import read_csv_flexible
-try:
-    from src.functions.modeling import (
-        META_COLUMNS as TRAIN_META_COLUMNS,
-        train_supervised_on_split as run_train,
-    )
-except Exception:  # pragma: no cover - fallback for minimal environments
-    from src.functions.simple_unsupervised import train_unsupervised_on_split as run_train  # type: ignore
-
-    TRAIN_META_COLUMNS = {
-        "pcap_file",
-        "flow_id",
-        "src_ip",
-        "dst_ip",
-        "src_port",
-        "dst_port",
-        "protocol",
-        "__source_file__",
-        "__source_path__",
-    }
+from src.functions.modeling import (
+    META_COLUMNS as TRAIN_META_COLUMNS,
+    train_supervised_on_split as run_train,
+)
 
 try:
     from src.functions import summarize_prediction_labels
