@@ -92,6 +92,7 @@ def read_csv_flexible(
             attempt_kwargs["encoding"] = encoding
         try:
             df = pd.read_csv(csv_path, **attempt_kwargs)
+            df.columns = [str(col).strip() for col in df.columns]
         except UnicodeDecodeError as exc:
             tried_encodings.append(encoding or "<default>")
             last_unicode_error = exc

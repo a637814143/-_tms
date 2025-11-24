@@ -133,6 +133,7 @@ _STRING_COLUMNS = {"Flow ID", "Source IP", "Destination IP", "Timestamp"}
 _LABEL_COLUMN = "Label"
 CSV_READ_ENCODINGS: Sequence[str] = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
 _CSV_READ_ENCODINGS = CSV_READ_ENCODINGS
+_OPTIONAL_COLUMNS = {"LabelBinary"}
 
 ProgressCallback = Optional[Callable[[int], None]]
 FeatureSource = Union[str, Sequence[str]]
@@ -206,6 +207,17 @@ def _align_dataframe(frame: "pd.DataFrame") -> "pd.DataFrame":
             df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
 
     return df.loc[:, header]
+
+
+def _encode_label_binary(df: "pd.DataFrame") -> "pd.DataFrame":
+    if pd is None:
+        raise RuntimeError("缺少 pandas 依赖，无法执行标签编码。")
+    if _LABEL_COLUMN not in df.columns:
+        return df
+
+    text = df[_LABEL_COLUMN].astype(str).str.upper()
+    df["LabelBinary"] = (~text.str.contains("BENIGN")).astype(int)
+    return df
 
 
 def _normalise_csv_record(record: Dict[str, object], header: Sequence[str]) -> Tuple[List[object], bool]:
@@ -579,16 +591,26 @@ def vectorize_jsonl_files(
 class DataPreprocessor:
     """High level helper that orchestrates dataset cleaning and aggregation."""
 
-    def __init__(self, *, feature_columns: Sequence[str] = CSV_COLUMNS):
+    def __init__(
+        self, *, feature_columns: Sequence[str] = CSV_COLUMNS, include_label_binary: bool = True
+    ):
         self.feature_columns = list(feature_columns)
+        self.include_label_binary = include_label_binary
 
     def clean_data(self, frame: "pd.DataFrame") -> "pd.DataFrame":
         if pd is None:
             raise RuntimeError("缺少 pandas 依赖，无法执行 DataFrame 清洗。")
-        return _align_dataframe(frame)
+        aligned = _align_dataframe(frame)
+        if self.include_label_binary:
+            aligned = _encode_label_binary(aligned)
+        return aligned
 
     def select_features(self, frame: "pd.DataFrame") -> "pd.DataFrame":
-        return frame.loc[:, self.feature_columns]
+        columns = list(self.feature_columns)
+        if self.include_label_binary and "LabelBinary" in frame.columns:
+            if "LabelBinary" not in columns:
+                columns.append("LabelBinary")
+        return frame.loc[:, columns]
 
     def vectorize(self, frame: "pd.DataFrame") -> "pd.DataFrame":
         cleaned = self.clean_data(frame)
@@ -619,6 +641,8 @@ class DataPreprocessor:
             counter += 1
 
         header = list(self.feature_columns)
+        if self.include_label_binary and "LabelBinary" not in header:
+            header.append("LabelBinary")
         with open(dataset_path, "w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(header)
@@ -735,7 +759,8 @@ def _load_dataset_from_reader(
 
     normalized_header = [column.strip() for column in header]
     expected_header = list(CSV_COLUMNS)
-    if normalized_header != expected_header:
+    valid_headers = {tuple(expected_header), tuple(expected_header + ["LabelBinary"])}
+    if tuple(normalized_header) not in valid_headers:
         raise ValueError("CSV dataset header does not match the expected format")
 
     counts: Dict[str, int] = defaultdict(int)
@@ -747,6 +772,8 @@ def _load_dataset_from_reader(
         counts[column] += 1
         if column == _LABEL_COLUMN:
             label_index = index
+            continue
+        if column in _OPTIONAL_COLUMNS:
             continue
         if column in _STRING_COLUMNS:
             continue
