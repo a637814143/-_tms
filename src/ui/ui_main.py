@@ -33,8 +33,14 @@ from src.functions.feature_extractor import (
 from src.functions.csv_utils import read_csv_flexible
 from src.functions.modeling import (
     META_COLUMNS as TRAIN_META_COLUMNS,
-    train_supervised_on_split as run_train,
+    ModelTrainer,
 )
+
+trainer = ModelTrainer()
+
+
+def run_train(split_dir, results_dir, models_dir, **kwargs):
+    return trainer.train_from_split(split_dir, results_dir, models_dir, **kwargs)
 
 try:
     from src.functions import summarize_prediction_labels
