@@ -220,6 +220,52 @@ def _encode_label_binary(df: "pd.DataFrame") -> "pd.DataFrame":
     return df
 
 
+def build_clean_training_dataset(
+    input_csv: Union[str, Path],
+    output_csv: Union[str, Path],
+    *,
+    feature_columns: Optional[Sequence[str]] = None,
+    include_label_binary: bool = True,
+) -> Path:
+    """Clean a raw CIC flow CSV into a numeric training-ready dataset.
+
+    The routine closely follows the explicit pandas workflow shared in the
+    user instructions: strip column whitespace, retain only the ordered numeric
+    features and ``Label`` column, derive a binary label, coerce features to
+    numeric values (filling invalid entries with ``0``), and write the result to
+    ``output_csv``.
+    """
+
+    if pd is None:  # pragma: no cover - pandas may be optional at runtime
+        raise RuntimeError("缺少 pandas 依赖，无法清洗原始数据集。")
+
+    features = list(feature_columns) if feature_columns is not None else numeric_feature_names()
+
+    raw = pd.read_csv(input_csv)
+    raw.columns = [str(column).strip() for column in raw.columns]
+
+    if _LABEL_COLUMN not in raw.columns:
+        raise ValueError("原始数据集中缺少 Label 列，无法生成训练集。")
+
+    cleaned = raw.copy()
+    for column in features:
+        if column not in cleaned.columns:
+            cleaned[column] = 0.0
+
+    cleaned = cleaned.loc[:, features + [_LABEL_COLUMN]]
+
+    if include_label_binary:
+        text = cleaned[_LABEL_COLUMN].astype(str).str.upper()
+        cleaned["LabelBinary"] = (~text.str.contains("BENIGN")).astype(int)
+
+    cleaned[features] = cleaned[features].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    output_path = Path(output_csv)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    cleaned.to_csv(output_path, index=False)
+    return output_path
+
+
 def _normalise_csv_record(record: Dict[str, object], header: Sequence[str]) -> Tuple[List[object], bool]:
     """Normalise a CSV row without pandas and report whether it is labelled."""
 
@@ -759,7 +805,13 @@ def _load_dataset_from_reader(
 
     normalized_header = [column.strip() for column in header]
     expected_header = list(CSV_COLUMNS)
-    valid_headers = {tuple(expected_header), tuple(expected_header + ["LabelBinary"])}
+    numeric_header = list(_NUMERIC_FEATURE_NAMES)
+    valid_headers = {
+        tuple(expected_header),
+        tuple(expected_header + ["LabelBinary"]),
+        tuple(numeric_header + [_LABEL_COLUMN]),
+        tuple(numeric_header + [_LABEL_COLUMN, "LabelBinary"]),
+    }
     if tuple(normalized_header) not in valid_headers:
         raise ValueError("CSV dataset header does not match the expected format")
 
