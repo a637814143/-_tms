@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 from pathlib import Path
 from typing import Iterable, Optional, Sequence, Union, cast
 
@@ -128,4 +129,66 @@ def read_csv_flexible(
     raise UnicodeDecodeError("utf-8", b"", 0, 1, "无法解码 CSV 文件。")
 
 
-__all__ = ["read_csv_flexible"]
+def fix_dataset_label_columns(csv_path: Union[str, Path]) -> Path:
+    """
+    修复类似 dataset_20251125_200753.csv 这种：
+    - 表头最后两列叫 Label / LabelBinary；
+    - 但每行数据实际在“最后两个值”才是真正的 Label / LabelBinary，
+      导致整行错位、列数不一致的问题。
+
+    处理逻辑：
+    - 保留前 N-2 列特征不动；
+    - 丢弃行中多出来的 label 假值；
+    - 用每行最后两个值作为新的 Label / LabelBinary；
+    - 写出一个 *_fixed.csv 文件，返回其路径。
+    """
+    path = Path(csv_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到 CSV 文件: {path}")
+
+    output = path.with_name(path.stem + "_fixed" + path.suffix)
+
+    with path.open("r", encoding="utf-8", newline="") as fin, \
+         output.open("w", encoding="utf-8", newline="") as fout:
+
+        reader = csv.reader(fin)
+        writer = csv.writer(fout)
+
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise ValueError(f"CSV 文件为空: {path}") from None
+
+        if len(header) < 4:
+            raise ValueError(f"CSV 列数太少，无法修复: {len(header)} 列")
+
+        # 原 header 最后两列通常是 "Label", "LabelBinary"，但它们对应的数据其实是 Idle 的数值；
+        # 真正的标签在每行行尾最后两个位置。
+        base_cols = header[:-2]  # 前 N-2 列是真正的特征列
+        new_header = list(base_cols) + ["Label", "LabelBinary"]
+        writer.writerow(new_header)
+
+        line_no = 1  # 已经读过 header，从第 1 行数据开始计数
+        for row in reader:
+            line_no += 1
+            # 跳过空行
+            if not row:
+                continue
+
+            if len(row) < len(base_cols) + 2:
+                raise ValueError(
+                    f"第 {line_no} 行列数不足：期望至少 {len(base_cols) + 2} 列，实际 {len(row)} 列"
+                )
+
+            # 前 N-2 个值作为特征
+            features = row[: len(base_cols)]
+            # 行尾最后两个值才是真正的 Label / LabelBinary
+            label = row[-2]
+            label_bin = row[-1]
+
+            writer.writerow(features + [label, label_bin])
+
+    return output
+
+
+__all__ = ["read_csv_flexible", "fix_dataset_label_columns"]
