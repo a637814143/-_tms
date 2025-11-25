@@ -91,7 +91,7 @@ def read_csv_flexible(
         if encoding is not None:
             attempt_kwargs["encoding"] = encoding
         try:
-            df = pd.read_csv(csv_path, **attempt_kwargs)
+            df = pd.read_csv(csv_path, index_col=False, **attempt_kwargs)
             df.columns = [str(col).strip() for col in df.columns]
         except UnicodeDecodeError as exc:
             tried_encodings.append(encoding or "<default>")
