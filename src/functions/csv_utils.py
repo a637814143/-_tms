@@ -131,16 +131,18 @@ def read_csv_flexible(
 
 def fix_dataset_label_columns(csv_path: Union[str, Path]) -> Path:
     """
-    修复类似 dataset_20251125_200753.csv 这种：
-    - 表头最后两列叫 Label / LabelBinary；
-    - 但每行数据实际在“最后两个值”才是真正的 Label / LabelBinary，
-      导致整行错位、列数不一致的问题。
+    修复类似 dataset_20251125_202623.csv 这种情况：
+    - 表头有 86 列（最后是 Label, LabelBinary）
+    - 每一行有 88 个值
+    - 多出来的两列在第 77、78 列（下标 76、77），
+      导致 Active/Idle/Label 整体错位。
 
-    处理逻辑：
-    - 保留前 N-2 列特征不动；
-    - 丢弃行中多出来的 label 假值；
-    - 用每行最后两个值作为新的 Label / LabelBinary；
-    - 写出一个 *_fixed.csv 文件，返回其路径。
+    修复逻辑：
+    - 保留前 76 列不动（下标 0..75）
+    - 丢弃下标 76、77 这两列多余数据
+    - 把后面的 10 个值（下标 78..87）拼回去
+      => 对齐到表头的 Active Mean ~ LabelBinary
+    - 写出 *_fixed.csv，返回新文件路径。
     """
     path = Path(csv_path)
     if not path.is_file():
@@ -159,34 +161,35 @@ def fix_dataset_label_columns(csv_path: Union[str, Path]) -> Path:
         except StopIteration:
             raise ValueError(f"CSV 文件为空: {path}") from None
 
-        if len(header) < 4:
-            raise ValueError(f"CSV 列数太少，无法修复: {len(header)} 列")
+        num_cols = len(header)
+        if num_cols != 86:
+            raise ValueError(
+                f"当前修复逻辑假定表头有 86 列，实际为 {num_cols} 列，请确认文件是否为预期的数据集。"
+            )
 
-        # 原 header 最后两列通常是 "Label", "LabelBinary"，但它们对应的数据其实是 Idle 的数值；
-        # 真正的标签在每行行尾最后两个位置。
-        base_cols = header[:-2]  # 前 N-2 列是真正的特征列
-        new_header = list(base_cols) + ["Label", "LabelBinary"]
-        writer.writerow(new_header)
+        # 这里我们保持表头不变：Flow ID ... Label, LabelBinary
+        writer.writerow(header)
 
-        line_no = 1  # 已经读过 header，从第 1 行数据开始计数
+        line_no = 1  # 已读过 header
         for row in reader:
             line_no += 1
-            # 跳过空行
             if not row:
                 continue
 
-            if len(row) < len(base_cols) + 2:
+            if len(row) != 88:
                 raise ValueError(
-                    f"第 {line_no} 行列数不足：期望至少 {len(base_cols) + 2} 列，实际 {len(row)} 列"
+                    f"第 {line_no} 行列数为 {len(row)}，而不是预期的 88，"
+                    f"说明文件结构不符合当前修复假设。"
                 )
 
-            # 前 N-2 个值作为特征
-            features = row[: len(base_cols)]
-            # 行尾最后两个值才是真正的 Label / LabelBinary
-            label = row[-2]
-            label_bin = row[-1]
+            # 前 76 列（0..75）是正常特征
+            features_front = row[:76]
+            # 中间的 row[76:78] 是多出来的两列，直接丢弃
+            # 后面的 10 个值 row[78:]：依次对应 Active Mean ~ LabelBinary
+            tail = row[78:]
 
-            writer.writerow(features + [label, label_bin])
+            new_row = features_front + tail  # 长度 = 76 + 10 = 86
+            writer.writerow(new_row)
 
     return output
 
