@@ -846,13 +846,15 @@ def _load_dataset_from_reader(
                 feature_row.append(0.0)
         feature_rows.append(feature_row)
 
-        # --- 修正标签读取逻辑，兼容你现在这种“行尾多出两列 0/1 标签”的情况 ---
+        # --- 修正标签读取逻辑：优先使用行尾二进制标签 ---
+        # 如果这一行的长度比表头多，且最后一个值看起来是 0/1，
+        # 说明我们遇到了像 dataset_20251126_*.csv 这种“行尾多出 LabelBinary”的情况。
         if len(row) > len(header) and row[-1].strip() in ("0", "1"):
-            # 行长度比表头长，并且最后一列看上去是二进制标签 → 用最后一列
+            # 用最后一个值作为标签（实际就是 LabelBinary）
             label_value = row[-1].strip()
             row_labels.append(label_value)
         elif label_index >= 0 and label_index < len(row):
-            # 正常情况（行长度和表头一致），走原来的逻辑
+            # 正常情况：表头里的 "Label" 列就是标签
             label_value = row[label_index].strip()
             row_labels.append(label_value if label_value else None)
         else:
