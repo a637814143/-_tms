@@ -846,7 +846,13 @@ def _load_dataset_from_reader(
                 feature_row.append(0.0)
         feature_rows.append(feature_row)
 
-        if label_index >= 0 and label_index < len(row):
+        # --- 修正标签读取逻辑，兼容你现在这种“行尾多出两列 0/1 标签”的情况 ---
+        if len(row) > len(header) and row[-1].strip() in ("0", "1"):
+            # 行长度比表头长，并且最后一列看上去是二进制标签 → 用最后一列
+            label_value = row[-1].strip()
+            row_labels.append(label_value)
+        elif label_index >= 0 and label_index < len(row):
+            # 正常情况（行长度和表头一致），走原来的逻辑
             label_value = row[label_index].strip()
             row_labels.append(label_value if label_value else None)
         else:
