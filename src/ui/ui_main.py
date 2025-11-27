@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from PyQt5 import QtCore, QtGui, QtWidgets
-import sys, os, platform, subprocess, math, shutil, json, textwrap
+import sys, os, platform, subprocess, math, shutil, json, textwrap, logging
 from pathlib import Path
 import numpy as np
 from typing import Callable, Collection, Dict, List, Optional, Set, Tuple, Union
@@ -24,6 +24,7 @@ from joblib import load as joblib_load
 
 # ---- 业务函数（保持导入路径）----
 from src.configuration import get_path, get_paths, load_config, project_root
+from src.functions.logging_utils import get_logger
 from src.functions.info import get_pcap_features as info
 from src.functions.feature_extractor import (
     extract_features as fe_single,
@@ -1021,6 +1022,8 @@ if callable(_get_app_log_dir):
 else:
     LOGS_DIR = Path(logs_env).expanduser().resolve() if logs_env else Path(default_logs).expanduser().resolve()
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+UI_LOGGER = get_logger("ui")
+UI_LOGGER.setLevel(logging.INFO)
 SETTINGS_DIR = PATHS.get("settings", DATA_BASE / "settings")
 SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_PATH = SETTINGS_DIR / "settings.json"
@@ -2841,6 +2844,10 @@ class Ui_MainWindow(object):
 
     def display_result(self, text, append=True):
         (self.results_text.append if append else self.results_text.setPlainText)(text)
+        try:
+            UI_LOGGER.info(text)
+        except Exception:
+            pass
 
     def _update_batch_controls(self):
         is_batch = (self._mode_map.get(self.mode_combo.currentText(), "auto") == "batch")
@@ -3316,9 +3323,33 @@ class Ui_MainWindow(object):
         out_dir = self._abnormal_out_dir()
         os.makedirs(out_dir, exist_ok=True)
 
-        summary_payload = self._analysis_summary if isinstance(self._analysis_summary, dict) else {}
-        export_payload = summary_payload.get("export_payload") if isinstance(summary_payload.get("export_payload"), dict) else None
-        metrics_payload = summary_payload.get("metrics") if isinstance(summary_payload.get("metrics"), dict) else None
+        prediction_snapshot = (
+            self._latest_prediction_summary
+            if isinstance(self._latest_prediction_summary, dict)
+            else {}
+        )
+        summary_payload = (
+            self._analysis_summary if isinstance(self._analysis_summary, dict) else prediction_snapshot
+        )
+        export_payload = (
+            summary_payload.get("export_payload")
+            if isinstance(summary_payload.get("export_payload"), dict)
+            else None
+        )
+        metrics_payload = (
+            summary_payload.get("metrics")
+            if isinstance(summary_payload.get("metrics"), dict)
+            else None
+        )
+        if metrics_payload is None and isinstance(prediction_snapshot, dict):
+            threshold_hint = prediction_snapshot.get("fusion_threshold")
+            if threshold_hint is not None:
+                metrics_payload = {"threshold": threshold_hint}
+        source_name = (
+            summary_payload.get("source_name")
+            if isinstance(summary_payload, dict)
+            else None
+        )
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         written_any = False
@@ -3361,7 +3392,49 @@ class Ui_MainWindow(object):
                 QtWidgets.QMessageBox.information(None, "没有异常", "当前分析结果中未检测到异常流量。")
                 return
 
-        df = self._last_preview_df
+        elif isinstance(prediction_snapshot, dict) and prediction_snapshot:
+            anomaly_count = int(
+                prediction_snapshot.get("anomaly_count")
+                or prediction_snapshot.get("malicious")
+                or 0
+            )
+            normal_count = prediction_snapshot.get("normal_count")
+            status_text = prediction_snapshot.get("status_text") or (
+                "异常" if anomaly_count > 0 else "正常"
+            )
+            summary_txt = []
+            if source_name:
+                summary_txt.append(f"来源: {source_name}")
+            summary_txt.append(f"分析结论: {status_text}")
+            summary_txt.append(f"异常包数量: {anomaly_count}")
+            if normal_count is not None:
+                summary_txt.append(f"正常包数量: {int(normal_count)}")
+
+            summary_txt_display = "\n".join(summary_txt)
+            if summary_txt_display:
+                self.display_result(f"[INFO] 导出摘要：\n{summary_txt_display}")
+                summary_txt_path = os.path.join(out_dir, f"abnormal_summary_{timestamp}.txt")
+                with open(summary_txt_path, "w", encoding="utf-8") as fh:
+                    fh.write(summary_txt_display)
+                self._add_output(summary_txt_path)
+                written_any = True
+
+        df = None
+        if isinstance(prediction_snapshot, dict):
+            df_candidate = prediction_snapshot.get("dataframe")
+            if isinstance(df_candidate, pd.DataFrame):
+                df = df_candidate.copy()
+            else:
+                csv_candidate = prediction_snapshot.get("output_csv")
+                if isinstance(csv_candidate, str) and os.path.exists(csv_candidate):
+                    try:
+                        df = read_csv_flexible(csv_candidate)
+                    except Exception:
+                        df = None
+
+        if df is None:
+            df = self._last_preview_df
+
         if df is None or (hasattr(df, "empty") and df.empty):
             if written_any:
                 return
@@ -3369,6 +3442,33 @@ class Ui_MainWindow(object):
             return
 
         export_df = None
+        anomaly_indices: List[int] = []
+        anomaly_flags: List[bool] = []
+        if isinstance(prediction_snapshot, dict):
+            idx_values = prediction_snapshot.get("anomaly_indices")
+            if isinstance(idx_values, (list, tuple)):
+                for value in idx_values:
+                    try:
+                        idx_int = int(value)
+                    except Exception:
+                        continue
+                    anomaly_indices.append(idx_int)
+            flag_values = prediction_snapshot.get("fusion_flags") or prediction_snapshot.get("anomaly_flags")
+            if isinstance(flag_values, (list, tuple)):
+                anomaly_flags = [bool(flag) for flag in flag_values]
+
+        if pd is not None and isinstance(df, pd.DataFrame):
+            if anomaly_indices:
+                valid_indices = [idx for idx in anomaly_indices if 0 <= idx < len(df)]
+                if valid_indices:
+                    export_df = df.iloc[valid_indices].copy()
+            if export_df is None and anomaly_flags:
+                try:
+                    mask = pd.Series(anomaly_flags, dtype=bool)
+                    if len(mask) == len(df):
+                        export_df = df[mask.values].copy()
+                except Exception:
+                    export_df = None
 
         def _extract_threshold(source) -> Optional[float]:
             if not isinstance(source, dict):
@@ -3434,7 +3534,14 @@ class Ui_MainWindow(object):
                 QtWidgets.QMessageBox.information(None, "没有异常", "当前数据中未检测到异常行。")
             return
 
-        outp = os.path.join(out_dir, f"abnormal_{timestamp}.csv")
+        source_suffix = ""
+        if source_name:
+            safe_hint = "".join(ch if str(ch).isalnum() else "_" for ch in str(source_name))
+            safe_hint = safe_hint.strip("_")[:32]
+            if safe_hint:
+                source_suffix = f"_{safe_hint}"
+
+        outp = os.path.join(out_dir, f"abnormal{source_suffix}_{timestamp}.csv")
         export_df.to_csv(outp, index=False, encoding="utf-8")
         self._add_output(outp)
         self.display_result(f"[INFO] 已导出异常CSV：{outp}")
