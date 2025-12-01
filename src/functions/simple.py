@@ -192,7 +192,7 @@ def train_unsupervised_on_split(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     """Placeholder that guides the user towards the full training pipeline."""
 
     raise RuntimeError(
-        "当前环境未包含完整的训练依赖，请使用 src.functions.modeling.train_unsupervised_on_split。"
+        "当前版本已移除无监督训练，请改用有监督流程：src.functions.modeling.ModelTrainer.train_from_split。"
     )
 
 
@@ -200,5 +200,4 @@ __all__ = [
     "SimpleModel",
     "load_simple_model",
     "simple_predict",
-    "train_unsupervised_on_split",
 ]

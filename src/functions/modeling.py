@@ -162,7 +162,6 @@ __all__ = [
     "EnsembleVotingClassifier",
     "train_hist_gradient_boosting",
     "train_supervised_on_split",
-    "train_unsupervised_on_split",
     "detect_pcap_with_model",
     "summarize_prediction_labels",
     "compute_risk_components",
@@ -1743,8 +1742,8 @@ def train_supervised_on_split(
 ) -> Dict[str, object]:
     """Train a supervised classifier on labelled split CSVs.
 
-    This mirrors the return structure of :func:`train_unsupervised_on_split` so the
-    UI/CLI can stay unchanged while switching the underlying model family.
+    The return structure matches the legacy unsupervised entry point so the UI/CLI
+    can stay unchanged while switching the underlying model family.
     """
 
     if pd is None:
@@ -1891,23 +1890,6 @@ def train_supervised_on_split(
         "positive_label": "MALICIOUS",
         "positive_class": 1,
     }
-
-
-def train_unsupervised_on_split(
-    input_path: Union[str, Path],
-    results_dir: Optional[Union[str, Path]] = None,
-    models_dir: Optional[Union[str, Path]] = None,
-    **kwargs: Union[int, float, None],
-) -> Dict[str, object]:
-    """Backwards-compatible entry point preserved for the UI/CLI."""
-
-    trainer = ModelTrainer()
-    return trainer.train_from_split(
-        input_path,
-        results_dir=results_dir,
-        models_dir=models_dir,
-        **kwargs,
-    )
 
 
 def _interpret_label_name(label: str) -> Optional[str]:
