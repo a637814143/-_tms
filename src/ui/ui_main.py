@@ -2145,6 +2145,7 @@ class Ui_MainWindow(object):
     def _toggle_online_detection(self) -> None:
         parent_widget = self._parent_widget()
         if pd is None:
+            self.display_result("[WARN] 当前环境未安装 pandas，无法执行在线检测。")
             QtWidgets.QMessageBox.warning(parent_widget, "缺少依赖", "当前环境未安装 pandas，无法执行在线检测。")
             return
 
@@ -2158,6 +2159,7 @@ class Ui_MainWindow(object):
         self._refresh_model_versions()
         pipeline_path = getattr(self, "_selected_pipeline_path", None)
         if not pipeline_path or not os.path.exists(str(pipeline_path)):
+            self.display_result("[WARN] 未找到可用模型，请先在右侧模型下拉框中选择或训练模型。")
             QtWidgets.QMessageBox.warning(parent_widget, "模型未准备", "请先选择或训练一个可用的模型后再开启在线检测。")
             return
 
