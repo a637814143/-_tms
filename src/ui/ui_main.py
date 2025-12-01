@@ -2155,6 +2155,12 @@ class Ui_MainWindow(object):
             self.btn_online_toggle.setEnabled(False)
             return
 
+        self._refresh_model_versions()
+        pipeline_path = getattr(self, "_selected_pipeline_path", None)
+        if not pipeline_path or not os.path.exists(str(pipeline_path)):
+            QtWidgets.QMessageBox.warning(parent_widget, "模型未准备", "请先选择或训练一个可用的模型后再开启在线检测。")
+            return
+
         config = load_config() or {}
         online_cfg = config.get("online_detection") if isinstance(config, dict) else {}
         watch_dir = online_cfg.get("watch_dir") or os.path.join(str(DATA_BASE), "live")
