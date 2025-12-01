@@ -2145,8 +2145,10 @@ class Ui_MainWindow(object):
     def _toggle_online_detection(self) -> None:
         parent_widget = self._parent_widget()
         if pd is None:
-            self.display_result("[WARN] 当前环境未安装 pandas，无法执行在线检测。")
-            QtWidgets.QMessageBox.warning(parent_widget, "缺少依赖", "当前环境未安装 pandas，无法执行在线检测。")
+            warning_msg = "当前环境未安装 pandas，无法执行在线检测。"
+            self.display_result(f"[WARN] {warning_msg}")
+            self.online_status_label.setText("缺少 pandas 依赖")
+            QtWidgets.QMessageBox.warning(parent_widget, "缺少依赖", warning_msg)
             return
 
         worker = getattr(self, "_online_worker", None)
@@ -2159,8 +2161,10 @@ class Ui_MainWindow(object):
         self._refresh_model_versions()
         pipeline_path = getattr(self, "_selected_pipeline_path", None)
         if not pipeline_path or not os.path.exists(str(pipeline_path)):
-            self.display_result("[WARN] 未找到可用模型，请先在右侧模型下拉框中选择或训练模型。")
-            QtWidgets.QMessageBox.warning(parent_widget, "模型未准备", "请先选择或训练一个可用的模型后再开启在线检测。")
+            warning_msg = "未找到可用模型，请先在右侧模型下拉框中选择或训练模型。"
+            self.display_result(f"[WARN] {warning_msg}")
+            self.online_status_label.setText("未选择可用模型")
+            QtWidgets.QMessageBox.warning(parent_widget, "模型未准备", warning_msg)
             return
 
         config = load_config() or {}
@@ -2189,7 +2193,14 @@ class Ui_MainWindow(object):
         self.btn_online_toggle.setText("停止在线检测")
         self.online_status_label.setText(f"监控目录：{watch_dir}")
         worker.start()
-        self.display_result(f"[INFO] 在线检测已启动，监控目录：{watch_dir}")
+        self.display_result(
+            "\n".join(
+                [
+                    f"[INFO] 在线检测已启动，监控目录：{watch_dir}",
+                    f"[INFO] 在线检测结果将保存至：{output_dir}",
+                ]
+            )
+        )
 
     def _on_online_status(self, message: str) -> None:
         if message:
@@ -2199,6 +2210,7 @@ class Ui_MainWindow(object):
         parent_widget = self._parent_widget()
         self.display_result(f"[错误] 在线检测：{message}")
         QtWidgets.QMessageBox.warning(parent_widget, "在线检测错误", message)
+        self.online_status_label.setText(f"检测异常：{message}")
 
     def _on_online_stopped(self) -> None:
         self._online_worker = None
@@ -2438,6 +2450,18 @@ class Ui_MainWindow(object):
                 candidates.append(latest_path)
             pattern_files = sorted(models_dir.glob("iforest_metadata_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
             candidates.extend(pattern_files)
+            extra_metadata = sorted(
+                (
+                    p
+                    for p in models_dir.glob("*.json")
+                    if "metadata" in p.stem.lower()
+                    and p.name not in {"latest_iforest_metadata.json"}
+                    and p not in candidates
+                ),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            candidates.extend(extra_metadata)
         for path in candidates:
             try:
                 with open(path, "r", encoding="utf-8") as fh:
@@ -2446,7 +2470,18 @@ class Ui_MainWindow(object):
                     continue
             except Exception:
                 continue
-            pipeline_path = metadata.get("pipeline_latest") or metadata.get("pipeline_path")
+            pipeline_path = (
+                metadata.get("pipeline_latest")
+                or metadata.get("pipeline_path")
+                or metadata.get("model_path")
+                or metadata.get("model_joblib")
+            )
+            if not pipeline_path:
+                sibling_joblib = path.with_suffix(".joblib")
+                if sibling_joblib.exists():
+                    pipeline_path = str(sibling_joblib)
+            if not pipeline_path:
+                continue
             if pipeline_path and not os.path.isabs(pipeline_path):
                 pipeline_path = str((models_dir / pipeline_path).resolve())
             display_timestamp = metadata.get("timestamp") or path.stem
