@@ -638,9 +638,19 @@ class DataPreprocessor:
     """High level helper that orchestrates dataset cleaning and aggregation."""
 
     def __init__(
-        self, *, feature_columns: Sequence[str] = CSV_COLUMNS, include_label_binary: bool = True
+        self,
+        *,
+        # 只用数值特征 + Label，避免把 Flow ID / IP 这些字符串列写进训练集
+        feature_columns: Sequence[str] = None,
+        include_label_binary: bool = True,
     ):
-        self.feature_columns = list(feature_columns)
+        if feature_columns is None:
+            numeric_cols = numeric_feature_names()
+            # 再额外保留原始 Label 列
+            self.feature_columns = list(numeric_cols) + ["Label"]
+        else:
+            self.feature_columns = list(feature_columns)
+
         self.include_label_binary = include_label_binary
 
     def clean_data(self, frame: "pd.DataFrame") -> "pd.DataFrame":
@@ -710,12 +720,16 @@ class DataPreprocessor:
                     header=False,
                     index=False,
                     encoding="utf-8",
-                )
+            )
 
                 rows = int(aligned.shape[0])
                 if rows:
-                    label_series = aligned[_LABEL_COLUMN].astype(str)
-                    labeled = int(label_series.str.strip().ne("").sum())
+                    if "LabelBinary" in aligned.columns:
+                        # LabelBinary 为 0/1 的行视为“有标签”
+                        labeled = int(aligned["LabelBinary"].isin([0, 1]).sum())
+                    else:
+                        label_series = aligned[_LABEL_COLUMN].astype(str)
+                        labeled = int(label_series.str.strip().ne("").sum())
                 else:
                     labeled = 0
             else:  # pragma: no cover - 仅在缺少 pandas 时运行
