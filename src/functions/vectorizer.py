@@ -635,39 +635,61 @@ def vectorize_jsonl_files(
 
 
 class DataPreprocessor:
-    """High level helper that orchestrates dataset cleaning and aggregation."""
+    """高层封装：把原始特征 CSV 清洗成  数值特征 + Label(+LabelBinary) 的训练数据集。"""
 
     def __init__(
         self,
         *,
-        # 只用数值特征 + Label，避免把 Flow ID / IP 这些字符串列写进训练集
         feature_columns: Sequence[str] = None,
         include_label_binary: bool = True,
     ):
+        # 默认：所有数值特征 + Label
         if feature_columns is None:
             numeric_cols = numeric_feature_names()
-            # 再额外保留原始 Label 列
-            self.feature_columns = list(numeric_cols) + ["Label"]
+            self.feature_columns = list(numeric_cols) + [_LABEL_COLUMN]
         else:
             self.feature_columns = list(feature_columns)
 
         self.include_label_binary = include_label_binary
 
     def clean_data(self, frame: "pd.DataFrame") -> "pd.DataFrame":
+        """只做两件事：
+        1）把需要的数值特征全部转成 float，缺失的补 0；
+        2）保证有 Label 列，按需要生成 LabelBinary。
+        """
         if pd is None:
             raise RuntimeError("缺少 pandas 依赖，无法执行 DataFrame 清洗。")
-        aligned = _align_dataframe(frame)
 
-        # === 关键补丁：为需要的别名列补一份数据 ===
-        # _DUPLICATE_COLUMN_ALIASES 定义了像 ("Fwd Header Length", 1) -> "Fwd Header Length.1" 这样的映射。
-        # 如果别名列缺失但原列存在，就复制一份，避免后续 select_features 时找不到该列。
-        for (base_col, _), alias in _DUPLICATE_COLUMN_ALIASES.items():
-            if alias not in aligned.columns and base_col in aligned.columns:
-                aligned[alias] = aligned[base_col]
+        if frame is None or frame.empty:
+            raise ValueError("输入的 DataFrame 为空，无法进行数据预处理。")
 
+        df = frame.copy()
+
+        # 1. 统一列名：去掉首尾空格，避免 ' Flow Duration ' 这类问题
+        df.columns = [str(col).strip() for col in df.columns]
+
+        # 2. 确保有 Label 列（原始 CICIDS 里就是 Label，有些文件可能有空格/大小写问题）
+        if _LABEL_COLUMN not in df.columns:
+            for cand in (" Label", "label", "LABEL"):
+                if cand in df.columns:
+                    df[_LABEL_COLUMN] = df[cand].astype(str)
+                    break
+            else:
+                # 实在没有就补一列空字符串，后续当成“无标签”
+                df[_LABEL_COLUMN] = ""
+
+        # 3. 为每个数值特征准备一列，并强制转成 float，非法值/缺失值 → 0.0
+        for col in numeric_feature_names():
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+            else:
+                df[col] = 0.0
+
+        # 4. 需要的话，生成二进制标签列：BENIGN -> 0，其它 -> 1
         if self.include_label_binary:
-            aligned = _encode_label_binary(aligned)
-        return aligned
+            df = _encode_label_binary(df)
+
+        return df
 
     def select_features(self, frame: "pd.DataFrame") -> "pd.DataFrame":
         columns = list(self.feature_columns)
@@ -696,6 +718,7 @@ class DataPreprocessor:
         manifest_path = os.path.join(output_dir, f"{base_name}_manifest.csv")
         meta_path = os.path.join(output_dir, f"{base_name}_meta.json")
 
+        # 如果文件名已存在，就在后面加 _1、_2……
         counter = 1
         while os.path.exists(dataset_path):
             base_name = f"dataset_{timestamp}_{counter}"
@@ -707,18 +730,23 @@ class DataPreprocessor:
         header = list(self.feature_columns)
         if self.include_label_binary and "LabelBinary" not in header:
             header.append("LabelBinary")
-        with open(dataset_path, "w", encoding="utf-8", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(header)
 
         manifest_rows: List[Dict[str, object]] = []
         total_rows = 0
         labeled_rows = 0
-        total_files = len(csv_files)
 
+        # 先写表头
+        with open(dataset_path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(header)
+
+        total_files = len(csv_files)
         use_pandas = pd is not None
 
         for index, csv_path in enumerate(csv_files, start=1):
+            if progress_cb:
+                _notify(progress_cb, int((index - 1) / total_files * 100))
+
             if use_pandas:
                 df = read_csv_flexible(csv_path)
                 aligned = self.vectorize(df)
@@ -728,7 +756,7 @@ class DataPreprocessor:
                     header=False,
                     index=False,
                     encoding="utf-8",
-            )
+                )
 
                 rows = int(aligned.shape[0])
                 if rows:
@@ -757,12 +785,14 @@ class DataPreprocessor:
             if total_files:
                 _notify(progress_cb, int(index / total_files * 100))
 
+        # 写 manifest
         with open(manifest_path, "w", encoding="utf-8", newline="") as handle:
             fieldnames = ["source_file", "source_path", "rows", "labeled_rows"]
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(manifest_rows)
 
+        # 写 meta.json
         meta_payload = {
             "type": _DATASET_META_TYPE,
             "created_at": datetime.now().isoformat(timespec="seconds"),
