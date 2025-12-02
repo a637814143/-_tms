@@ -2322,6 +2322,13 @@ class Ui_MainWindow(object):
             self.populate_table_from_df(dataframe)
 
         metadata = prediction.get("metadata") if isinstance(prediction.get("metadata"), dict) else self._selected_metadata
+        metadata_obj = dict(metadata) if isinstance(metadata, dict) else {}
+        if not metadata_obj.get("rule_profile"):
+            rule_profile_candidate = prediction.get("rule_profile")
+            if isinstance(rule_profile_candidate, str) and rule_profile_candidate.strip():
+                metadata_obj["rule_profile"] = rule_profile_candidate
+            else:
+                metadata_obj.setdefault("rule_profile", "baseline")
         ratio = prediction.get("ratio")
         analysis_stub = None
         if ratio is not None:
@@ -2332,17 +2339,95 @@ class Ui_MainWindow(object):
                     "total_count": int(prediction.get("total", 0)),
                 }
             }
-        self.dashboard.update_metrics(analysis_stub, metadata if isinstance(metadata, dict) else None)
+        self.dashboard.update_metrics(analysis_stub, metadata_obj if metadata_obj else None)
 
         snapshot = dict(prediction)
         if isinstance(dataframe, pd.DataFrame):
             snapshot["dataframe"] = dataframe
         snapshot["source_pcap"] = payload.get("pcap_path")
+        if metadata_obj and "metadata" not in snapshot:
+            snapshot["metadata"] = metadata_obj
         self._latest_prediction_summary = snapshot
+
+        def _safe_int(value: object) -> Optional[int]:
+            try:
+                return max(0, int(value))
+            except Exception:
+                return None
+
+        total_count = _safe_int(prediction.get("total")) or 0
+        abnormal_count = (
+            _safe_int(prediction.get("malicious"))
+            or _safe_int(prediction.get("anomaly_count"))
+        )
+
+        if abnormal_count is None:
+            flags = prediction.get("anomaly_flags")
+            if isinstance(flags, (list, tuple)):
+                try:
+                    abnormal_count = int(sum(1 for flag in flags if bool(flag)))
+                except Exception:
+                    abnormal_count = None
+
+        if isinstance(dataframe, pd.DataFrame):
+            if total_count == 0:
+                total_count = len(dataframe)
+            if abnormal_count is None:
+                column_candidates = [
+                    "PredLabel",
+                    "LabelBinary",
+                    "is_anomaly",
+                    "is_malicious",
+                    "prediction_status",
+                    "fusion_decision",
+                ]
+                for column in column_candidates:
+                    if column not in dataframe.columns:
+                        continue
+                    series = dataframe[column]
+                    try:
+                        abnormal_count = int((series.astype(int) != 0).sum())
+                    except Exception:
+                        try:
+                            abnormal_count = int(
+                                series.astype(str).str.strip().str.lower().eq("异常").sum()
+                            )
+                        except Exception:
+                            abnormal_count = None
+                    if abnormal_count is not None:
+                        break
+
+        if abnormal_count is None:
+            abnormal_count = 0
 
         basename = os.path.basename(payload.get("pcap_path") or "")
         self.online_status_label.setText(f"最近完成：{basename}" if basename else "在线检测运行中")
         self.display_result(f"[INFO] 在线检测完成：{payload.get('pcap_path')}")
+
+        rule_profile = metadata_obj.get("rule_profile")
+        row_messages = prediction.get("row_messages") or []
+        malicious_samples: List[str] = []
+        for line in row_messages:
+            text = str(line).strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if "异常" in text or "恶意" in text or "malicious" in lowered or "anomaly" in lowered:
+                malicious_samples.append(text)
+            if len(malicious_samples) >= 3:
+                break
+        if not malicious_samples and row_messages:
+            malicious_samples = [str(line).strip() for line in row_messages if str(line).strip()][:2]
+
+        if total_count > 0:
+            self._show_detection_summary_popup(
+                total=total_count,
+                abnormal=abnormal_count,
+                title="在线检测完成",
+                source_name=basename,
+                rule_profile=rule_profile,
+                malicious_samples=malicious_samples,
+            )
 
     def _on_online_prediction_error(self, message: str) -> None:
         parent_widget = self._parent_widget()
@@ -2884,6 +2969,74 @@ class Ui_MainWindow(object):
         if csv_path:
             return csv_path
         return None
+
+    def _show_detection_summary_popup(
+        self,
+        *,
+        total: int,
+        abnormal: int,
+        title: str = "检测完成",
+        source_name: Optional[str] = None,
+        rule_profile: Optional[str] = None,
+        malicious_samples: Optional[List[str]] = None,
+    ) -> None:
+        """
+        弹出一个简单的结果统计弹窗：
+        total：本次检测总流量条数
+        abnormal：异常条数（或者恶意条数）
+        source_name：当前检测的流量包/数据集名称
+        rule_profile：检测档位（baseline/aggressive）
+        malicious_samples：需要展示的少量恶意样例
+        """
+
+        try:
+            total_count = max(0, int(total))
+        except Exception:
+            total_count = 0
+
+        try:
+            abnormal_count = max(0, int(abnormal))
+        except Exception:
+            abnormal_count = 0
+
+        normal = max(total_count - abnormal_count, 0)
+        parent_widget = self._parent_widget()
+
+        safe_samples: List[str] = []
+        if malicious_samples:
+            for sample in malicious_samples:
+                text = str(sample).strip()
+                if not text:
+                    continue
+                safe_samples.append(text)
+                if len(safe_samples) >= 3:
+                    break
+
+        profile_label = None
+        if isinstance(rule_profile, str) and rule_profile.strip():
+            profile_key = rule_profile.strip().lower()
+            if profile_key == "aggressive":
+                profile_label = "Aggressive（高敏）"
+            elif profile_key == "baseline":
+                profile_label = "Baseline（常规）"
+            else:
+                profile_label = rule_profile.strip()
+
+        lines: List[str] = []
+        if source_name:
+            lines.append(f"流量包：{source_name}")
+        lines.append(f"本次检测共分析流量 {total_count} 条。")
+        lines.append(
+            f"其中判定为异常（恶意） {abnormal_count} 条，判定为正常 {normal} 条。"
+        )
+        if profile_label:
+            lines.append(f"检测模式：{profile_label}")
+        if safe_samples:
+            lines.append("恶意样例（节选）：")
+            lines.extend(f"- {sample}" for sample in safe_samples)
+
+        msg = "\n".join(lines)
+        QtWidgets.QMessageBox.information(parent_widget, title, msg)
 
     def display_result(self, text, append=True):
         (self.results_text.append if append else self.results_text.setPlainText)(text)
@@ -4230,6 +4383,18 @@ class Ui_MainWindow(object):
             except Exception:
                 tb_text = str(breakdown)
             self.display_result(f"[阈值溯源] {tb_text}")
+
+        metrics = res.get("model_metrics") or {}
+        if isinstance(metrics, dict) and metrics:
+            self.display_result("[训练完成] 模型评估指标：")
+            self.display_result(
+                "Accuracy: {0:.4f}, Precision: {1:.4f}, Recall: {2:.4f}, F1: {3:.4f}".format(
+                    float(metrics.get("accuracy", 0.0)),
+                    float(metrics.get("precision", 0.0)),
+                    float(metrics.get("recall", 0.0)),
+                    float(metrics.get("f1", 0.0)),
+                )
+            )
 
         data_quality = res.get("data_quality") or {}
         empty_cols = list(data_quality.get("empty_columns") or [])
@@ -5739,11 +5904,44 @@ class Ui_MainWindow(object):
         snapshot["source_name"] = source_name
         self._latest_prediction_summary = snapshot
 
+        source_label = os.path.basename(source_pcap) if source_pcap else source_name
+        rule_profile = None
+        if isinstance(metadata, dict):
+            rule_profile = metadata.get("rule_profile")
+        if not rule_profile and isinstance(result.get("rule_profile"), str):
+            rule_profile = result.get("rule_profile")
+
+        row_messages = result.get("row_messages") or row_messages
+        malicious_samples: List[str] = []
+        for line in row_messages:
+            text = str(line).strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if "异常" in text or "恶意" in text or "malicious" in lowered or "anomaly" in lowered:
+                malicious_samples.append(text)
+            if len(malicious_samples) >= 3:
+                break
+        if not malicious_samples and row_messages:
+            malicious_samples = [str(line).strip() for line in row_messages if str(line).strip()][:2]
+
         if show_dialog:
-            QtWidgets.QMessageBox.information(
-                parent_widget,
-                "预测完成",
-                "\n".join(result.get("summary") or ["模型预测已完成并写出结果。"]),
+            try:
+                total_count = int(result.get("total", 0) or 0)
+            except Exception:
+                total_count = 0
+            try:
+                abnormal_count = int(result.get("malicious", 0) or 0)
+            except Exception:
+                abnormal_count = 0
+
+            self._show_detection_summary_popup(
+                total=total_count,
+                abnormal=abnormal_count,
+                title="预测完成",
+                source_name=source_label,
+                rule_profile=rule_profile,
+                malicious_samples=malicious_samples,
             )
 
     def _sanitize_prediction_input_frame(self, df: "pd.DataFrame") -> "pd.DataFrame":

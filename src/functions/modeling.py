@@ -12,7 +12,8 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Un
 import numpy as np
 from joblib import dump, load
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.model_selection import train_test_split
 
 from .feature_extractor import extract_pcap_features
 from .vectorizer import (
@@ -1804,11 +1805,42 @@ def train_supervised_on_split(
     X = feature_df.to_numpy(dtype=np.float64, copy=False)
     y_arr = y.to_numpy(dtype=np.int64, copy=False)
 
+    test_size = float(kwargs.pop("test_size", 0.2) or 0.2)
+    random_state = kwargs.pop("random_state", 42)
+
     filtered_params = _filter_estimator_params(HistGradientBoostingClassifier, **kwargs)
     params = DEFAULT_MODEL_PARAMS.copy()
     params.update(filtered_params)
 
+    stratify_labels = y_arr if len(np.unique(y_arr)) > 1 else None
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y_arr,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=stratify_labels,
+    )
+
     clf = HistGradientBoostingClassifier(**params)
+    clf.fit(X_train, y_train)
+
+    y_pred = clf.predict(X_test)
+
+    metrics = {
+        "accuracy": float(accuracy_score(y_test, y_pred)),
+        "precision": float(precision_score(y_test, y_pred, zero_division=0)),
+        "recall": float(recall_score(y_test, y_pred, zero_division=0)),
+        "f1": float(f1_score(y_test, y_pred, zero_division=0)),
+    }
+
+    logger.info(
+        "模型评估指标 accuracy=%.4f precision=%.4f recall=%.4f f1=%.4f",
+        metrics["accuracy"],
+        metrics["precision"],
+        metrics["recall"],
+        metrics["f1"],
+    )
+
     clf.fit(X, y_arr)
 
     label_mapping = {0: "BENIGN", 1: "MALICIOUS"}
@@ -1848,6 +1880,8 @@ def train_supervised_on_split(
         "ensemble_members": 1,
     }
 
+    metadata["model_metrics"] = metrics
+
     metadata_path = models_root / f"iforest_metadata_{stamp_token}.json"
     latest_metadata_path = models_root / "latest_iforest_metadata.json"
     model_metadata_path = model_path.with_suffix(".json")
@@ -1886,7 +1920,7 @@ def train_supervised_on_split(
         "summary": None,
         "metadata": metadata,
         "decision_threshold": None,
-        "model_metrics": None,
+        "model_metrics": metrics,
         "positive_label": "MALICIOUS",
         "positive_class": 1,
     }
