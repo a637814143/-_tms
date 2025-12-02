@@ -4384,6 +4384,18 @@ class Ui_MainWindow(object):
                 tb_text = str(breakdown)
             self.display_result(f"[阈值溯源] {tb_text}")
 
+        metrics = res.get("model_metrics") or {}
+        if isinstance(metrics, dict) and metrics:
+            self.display_result("[训练完成] 模型评估指标：")
+            self.display_result(
+                "Accuracy: {0:.4f}, Precision: {1:.4f}, Recall: {2:.4f}, F1: {3:.4f}".format(
+                    float(metrics.get("accuracy", 0.0)),
+                    float(metrics.get("precision", 0.0)),
+                    float(metrics.get("recall", 0.0)),
+                    float(metrics.get("f1", 0.0)),
+                )
+            )
+
         data_quality = res.get("data_quality") or {}
         empty_cols = list(data_quality.get("empty_columns") or [])
         const_cols = list(data_quality.get("constant_columns") or [])
