@@ -2340,9 +2340,67 @@ class Ui_MainWindow(object):
         snapshot["source_pcap"] = payload.get("pcap_path")
         self._latest_prediction_summary = snapshot
 
+        def _safe_int(value: object) -> Optional[int]:
+            try:
+                return max(0, int(value))
+            except Exception:
+                return None
+
+        total_count = _safe_int(prediction.get("total")) or 0
+        abnormal_count = (
+            _safe_int(prediction.get("malicious"))
+            or _safe_int(prediction.get("anomaly_count"))
+        )
+
+        if abnormal_count is None:
+            flags = prediction.get("anomaly_flags")
+            if isinstance(flags, (list, tuple)):
+                try:
+                    abnormal_count = int(sum(1 for flag in flags if bool(flag)))
+                except Exception:
+                    abnormal_count = None
+
+        if isinstance(dataframe, pd.DataFrame):
+            if total_count == 0:
+                total_count = len(dataframe)
+            if abnormal_count is None:
+                column_candidates = [
+                    "PredLabel",
+                    "LabelBinary",
+                    "is_anomaly",
+                    "is_malicious",
+                    "prediction_status",
+                    "fusion_decision",
+                ]
+                for column in column_candidates:
+                    if column not in dataframe.columns:
+                        continue
+                    series = dataframe[column]
+                    try:
+                        abnormal_count = int((series.astype(int) != 0).sum())
+                    except Exception:
+                        try:
+                            abnormal_count = int(
+                                series.astype(str).str.strip().str.lower().eq("异常").sum()
+                            )
+                        except Exception:
+                            abnormal_count = None
+                    if abnormal_count is not None:
+                        break
+
+        if abnormal_count is None:
+            abnormal_count = 0
+
         basename = os.path.basename(payload.get("pcap_path") or "")
         self.online_status_label.setText(f"最近完成：{basename}" if basename else "在线检测运行中")
         self.display_result(f"[INFO] 在线检测完成：{payload.get('pcap_path')}")
+
+        if total_count > 0:
+            self._show_detection_summary_popup(
+                total=total_count,
+                abnormal=abnormal_count,
+                title="在线检测完成",
+            )
 
     def _on_online_prediction_error(self, message: str) -> None:
         parent_widget = self._parent_widget()
@@ -2884,6 +2942,38 @@ class Ui_MainWindow(object):
         if csv_path:
             return csv_path
         return None
+
+    def _show_detection_summary_popup(
+        self,
+        *,
+        total: int,
+        abnormal: int,
+        title: str = "检测完成",
+    ) -> None:
+        """
+        弹出一个简单的结果统计弹窗：
+        total：本次检测总流量条数
+        abnormal：异常条数（或者恶意条数）
+        """
+
+        try:
+            total_count = max(0, int(total))
+        except Exception:
+            total_count = 0
+
+        try:
+            abnormal_count = max(0, int(abnormal))
+        except Exception:
+            abnormal_count = 0
+
+        normal = max(total_count - abnormal_count, 0)
+        parent_widget = self._parent_widget()
+        msg = (
+            f"本次检测共分析流量 {total_count} 条。\n"
+            f"其中判定为异常（恶意） {abnormal_count} 条，"
+            f"判定为正常 {normal} 条。"
+        )
+        QtWidgets.QMessageBox.information(parent_widget, title, msg)
 
     def display_result(self, text, append=True):
         (self.results_text.append if append else self.results_text.setPlainText)(text)
@@ -5740,10 +5830,19 @@ class Ui_MainWindow(object):
         self._latest_prediction_summary = snapshot
 
         if show_dialog:
-            QtWidgets.QMessageBox.information(
-                parent_widget,
-                "预测完成",
-                "\n".join(result.get("summary") or ["模型预测已完成并写出结果。"]),
+            try:
+                total_count = int(result.get("total", 0) or 0)
+            except Exception:
+                total_count = 0
+            try:
+                abnormal_count = int(result.get("malicious", 0) or 0)
+            except Exception:
+                abnormal_count = 0
+
+            self._show_detection_summary_popup(
+                total=total_count,
+                abnormal=abnormal_count,
+                title="预测完成",
             )
 
     def _sanitize_prediction_input_frame(self, df: "pd.DataFrame") -> "pd.DataFrame":
