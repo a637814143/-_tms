@@ -657,6 +657,14 @@ class DataPreprocessor:
         if pd is None:
             raise RuntimeError("缺少 pandas 依赖，无法执行 DataFrame 清洗。")
         aligned = _align_dataframe(frame)
+
+        # === 关键补丁：为需要的别名列补一份数据 ===
+        # _DUPLICATE_COLUMN_ALIASES 定义了像 ("Fwd Header Length", 1) -> "Fwd Header Length.1" 这样的映射。
+        # 如果别名列缺失但原列存在，就复制一份，避免后续 select_features 时找不到该列。
+        for (base_col, _), alias in _DUPLICATE_COLUMN_ALIASES.items():
+            if alias not in aligned.columns and base_col in aligned.columns:
+                aligned[alias] = aligned[base_col]
+
         if self.include_label_binary:
             aligned = _encode_label_binary(aligned)
         return aligned
