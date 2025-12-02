@@ -2322,6 +2322,13 @@ class Ui_MainWindow(object):
             self.populate_table_from_df(dataframe)
 
         metadata = prediction.get("metadata") if isinstance(prediction.get("metadata"), dict) else self._selected_metadata
+        metadata_obj = dict(metadata) if isinstance(metadata, dict) else {}
+        if not metadata_obj.get("rule_profile"):
+            rule_profile_candidate = prediction.get("rule_profile")
+            if isinstance(rule_profile_candidate, str) and rule_profile_candidate.strip():
+                metadata_obj["rule_profile"] = rule_profile_candidate
+            else:
+                metadata_obj.setdefault("rule_profile", "baseline")
         ratio = prediction.get("ratio")
         analysis_stub = None
         if ratio is not None:
@@ -2332,12 +2339,14 @@ class Ui_MainWindow(object):
                     "total_count": int(prediction.get("total", 0)),
                 }
             }
-        self.dashboard.update_metrics(analysis_stub, metadata if isinstance(metadata, dict) else None)
+        self.dashboard.update_metrics(analysis_stub, metadata_obj if metadata_obj else None)
 
         snapshot = dict(prediction)
         if isinstance(dataframe, pd.DataFrame):
             snapshot["dataframe"] = dataframe
         snapshot["source_pcap"] = payload.get("pcap_path")
+        if metadata_obj and "metadata" not in snapshot:
+            snapshot["metadata"] = metadata_obj
         self._latest_prediction_summary = snapshot
 
         def _safe_int(value: object) -> Optional[int]:
@@ -2395,11 +2404,29 @@ class Ui_MainWindow(object):
         self.online_status_label.setText(f"最近完成：{basename}" if basename else "在线检测运行中")
         self.display_result(f"[INFO] 在线检测完成：{payload.get('pcap_path')}")
 
+        rule_profile = metadata_obj.get("rule_profile")
+        row_messages = prediction.get("row_messages") or []
+        malicious_samples: List[str] = []
+        for line in row_messages:
+            text = str(line).strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if "异常" in text or "恶意" in text or "malicious" in lowered or "anomaly" in lowered:
+                malicious_samples.append(text)
+            if len(malicious_samples) >= 3:
+                break
+        if not malicious_samples and row_messages:
+            malicious_samples = [str(line).strip() for line in row_messages if str(line).strip()][:2]
+
         if total_count > 0:
             self._show_detection_summary_popup(
                 total=total_count,
                 abnormal=abnormal_count,
                 title="在线检测完成",
+                source_name=basename,
+                rule_profile=rule_profile,
+                malicious_samples=malicious_samples,
             )
 
     def _on_online_prediction_error(self, message: str) -> None:
@@ -2949,11 +2976,17 @@ class Ui_MainWindow(object):
         total: int,
         abnormal: int,
         title: str = "检测完成",
+        source_name: Optional[str] = None,
+        rule_profile: Optional[str] = None,
+        malicious_samples: Optional[List[str]] = None,
     ) -> None:
         """
         弹出一个简单的结果统计弹窗：
         total：本次检测总流量条数
         abnormal：异常条数（或者恶意条数）
+        source_name：当前检测的流量包/数据集名称
+        rule_profile：检测档位（baseline/aggressive）
+        malicious_samples：需要展示的少量恶意样例
         """
 
         try:
@@ -2968,11 +3001,41 @@ class Ui_MainWindow(object):
 
         normal = max(total_count - abnormal_count, 0)
         parent_widget = self._parent_widget()
-        msg = (
-            f"本次检测共分析流量 {total_count} 条。\n"
-            f"其中判定为异常（恶意） {abnormal_count} 条，"
-            f"判定为正常 {normal} 条。"
+
+        safe_samples: List[str] = []
+        if malicious_samples:
+            for sample in malicious_samples:
+                text = str(sample).strip()
+                if not text:
+                    continue
+                safe_samples.append(text)
+                if len(safe_samples) >= 3:
+                    break
+
+        profile_label = None
+        if isinstance(rule_profile, str) and rule_profile.strip():
+            profile_key = rule_profile.strip().lower()
+            if profile_key == "aggressive":
+                profile_label = "Aggressive（高敏）"
+            elif profile_key == "baseline":
+                profile_label = "Baseline（常规）"
+            else:
+                profile_label = rule_profile.strip()
+
+        lines: List[str] = []
+        if source_name:
+            lines.append(f"流量包：{source_name}")
+        lines.append(f"本次检测共分析流量 {total_count} 条。")
+        lines.append(
+            f"其中判定为异常（恶意） {abnormal_count} 条，判定为正常 {normal} 条。"
         )
+        if profile_label:
+            lines.append(f"检测模式：{profile_label}")
+        if safe_samples:
+            lines.append("恶意样例（节选）：")
+            lines.extend(f"- {sample}" for sample in safe_samples)
+
+        msg = "\n".join(lines)
         QtWidgets.QMessageBox.information(parent_widget, title, msg)
 
     def display_result(self, text, append=True):
@@ -5829,6 +5892,27 @@ class Ui_MainWindow(object):
         snapshot["source_name"] = source_name
         self._latest_prediction_summary = snapshot
 
+        source_label = os.path.basename(source_pcap) if source_pcap else source_name
+        rule_profile = None
+        if isinstance(metadata, dict):
+            rule_profile = metadata.get("rule_profile")
+        if not rule_profile and isinstance(result.get("rule_profile"), str):
+            rule_profile = result.get("rule_profile")
+
+        row_messages = result.get("row_messages") or row_messages
+        malicious_samples: List[str] = []
+        for line in row_messages:
+            text = str(line).strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            if "异常" in text or "恶意" in text or "malicious" in lowered or "anomaly" in lowered:
+                malicious_samples.append(text)
+            if len(malicious_samples) >= 3:
+                break
+        if not malicious_samples and row_messages:
+            malicious_samples = [str(line).strip() for line in row_messages if str(line).strip()][:2]
+
         if show_dialog:
             try:
                 total_count = int(result.get("total", 0) or 0)
@@ -5843,6 +5927,9 @@ class Ui_MainWindow(object):
                 total=total_count,
                 abnormal=abnormal_count,
                 title="预测完成",
+                source_name=source_label,
+                rule_profile=rule_profile,
+                malicious_samples=malicious_samples,
             )
 
     def _sanitize_prediction_input_frame(self, df: "pd.DataFrame") -> "pd.DataFrame":
