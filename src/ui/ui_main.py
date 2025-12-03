@@ -1950,7 +1950,7 @@ class Ui_MainWindow(object):
         self.model_profile_combo.addItem("CICIDS / PCAP 模型", "cicids")
         self.model_profile_combo.addItem("UNSW CSV 模型", "unsw")
         self.model_profile_combo.setToolTip(
-            "选择用于预测的模型类型（对应 model_cicids.joblib / model_unsw.joblib）"
+            "选择用于预测的模型类型（对应 data/models/cicids 或 data/models/unsw 目录）"
         )
         self.model_profile_combo.setMinimumHeight(32)
         model_profile_row.addWidget(self.model_profile_combo)
@@ -2551,29 +2551,41 @@ class Ui_MainWindow(object):
             return lambda key=key: str(PATHS[key])
         raise AttributeError(name)
 
+    def _default_models_dir(self) -> str:
+        """
+        根据当前 UI 选择的预测模型类型返回模型目录。
+        例如 data/models/cicids 或 data/models/unsw，默认使用 cicids。
+        """
+        base_dir = Path(PATHS["models"])
+        profile = "cicids"
+        combo = getattr(self, "model_profile_combo", None)
+        if combo is not None:
+            try:
+                data = combo.currentData()
+            except Exception:
+                data = None
+            if isinstance(data, str) and data.strip():
+                profile = data.strip().lower()
+
+        models_dir = base_dir / profile
+        models_dir.mkdir(parents=True, exist_ok=True)
+        return str(models_dir)
+
     def _get_selected_model_path(self) -> Tuple[Path, Optional[Path]]:
         """
         根据当前 UI 选择的模型类型（CICIDS / UNSW）返回对应的 model.joblib 和元数据路径。
         如果对应子目录下不存在模型，则回退到旧的 data/models/model.joblib。
         """
 
-        base_models_dir = PATHS["models"]
-
-        profile_key = "cicids"
-        combo = getattr(self, "model_profile_combo", None)
-        if isinstance(combo, QtWidgets.QComboBox):
-            data = combo.currentData()
-            if isinstance(data, str) and data.strip():
-                profile_key = data.strip().lower()
-
-        models_dir = base_models_dir / profile_key
+        models_dir = Path(self._default_models_dir())
 
         pipeline_path = models_dir / "model.joblib"
         metadata_path = models_dir / "latest_iforest_metadata.json"
 
         if not pipeline_path.exists():
-            legacy_model = base_models_dir / "model.joblib"
-            legacy_meta = base_models_dir / "latest_iforest_metadata.json"
+            legacy_root = Path(PATHS["models"])
+            legacy_model = legacy_root / "model.joblib"
+            legacy_meta = legacy_root / "latest_iforest_metadata.json"
             if legacy_model.exists():
                 pipeline_path = legacy_model
                 metadata_path = legacy_meta
@@ -4392,17 +4404,7 @@ class Ui_MainWindow(object):
             if idx >= 0:
                 profile_combo.setCurrentIndex(idx)
 
-        profile = None
-        if isinstance(profile_combo, QtWidgets.QComboBox):
-            data = profile_combo.currentData()
-            if isinstance(data, str):
-                profile = data.lower()
-
-        if profile not in {"cicids", "unsw"}:
-            profile = "cicids"
-
-        base_models_dir = PATHS["models"]
-        mdl_dir = base_models_dir / profile
+        mdl_dir = Path(self._default_models_dir())
 
         res_dir = PATHS["results"]
         os.makedirs(res_dir, exist_ok=True)
