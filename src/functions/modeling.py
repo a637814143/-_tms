@@ -1794,15 +1794,9 @@ def train_supervised_on_split(
     )
 
     # ★ 移到这里：确定模型保存位置
-    profile_key = str(model_profile or "cicids").strip().lower()
-    if profile_key not in {"cicids", "unsw"}:
-        profile_key = "cicids"
-
-    model_filename = f"model_{profile_key}.joblib" if profile_key else "model.joblib"
-
     models_root = Path(models_dir) if models_dir else split_path
     models_root.mkdir(parents=True, exist_ok=True)
-    model_path = models_root / model_filename
+    model_path = models_root / "model.joblib"
 
     # ★ 用全部数据再训练一次，用于真正保存的模型
     clf.fit(X, y_arr)
@@ -1941,10 +1935,13 @@ def train_supervised_on_split(
 
     metadata["model_metrics"] = metrics
 
+    profile_key = str(model_profile or "cicids").strip().lower()
+    if profile_key not in {"cicids", "unsw"}:
+        profile_key = "cicids"
     metadata["model_profile"] = profile_key
 
-    metadata_path = models_root / f"iforest_metadata_{profile_key}_{stamp_token}.json"
-    latest_metadata_path = models_root / f"latest_iforest_metadata_{profile_key}.json"
+    metadata_path = models_root / f"iforest_metadata_{stamp_token}.json"
+    latest_metadata_path = models_root / "latest_iforest_metadata.json"
     model_metadata_path = model_path.with_suffix(".json")
 
     with metadata_path.open("w", encoding="utf-8") as handle:
@@ -1954,11 +1951,12 @@ def train_supervised_on_split(
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
 
     legacy_latest_metadata_path = models_root / "latest_iforest_metadata.json"
-    try:
-        with legacy_latest_metadata_path.open("w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+    if legacy_latest_metadata_path != latest_metadata_path:
+        try:
+            with legacy_latest_metadata_path.open("w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     with model_metadata_path.open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, ensure_ascii=False, indent=2)
