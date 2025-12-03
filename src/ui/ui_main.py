@@ -4399,11 +4399,15 @@ class Ui_MainWindow(object):
         if isinstance(metrics, dict) and metrics:
             self.display_result("[训练完成] 模型评估指标：")
             self.display_result(
-                "Accuracy: {0:.4f}, Precision: {1:.4f}, Recall: {2:.4f}, F1: {3:.4f}".format(
+                (
+                    "Accuracy: {0:.4f}, Precision: {1:.4f}, "
+                    "Recall: {2:.4f}, F1: {3:.4f}, ROC-AUC: {4:.4f}"
+                ).format(
                     float(metrics.get("accuracy", 0.0)),
                     float(metrics.get("precision", 0.0)),
                     float(metrics.get("recall", 0.0)),
                     float(metrics.get("f1", 0.0)),
+                    float(metrics.get("roc_auc", 0.0)),
                 )
             )
 
