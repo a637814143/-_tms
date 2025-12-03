@@ -1717,12 +1717,12 @@ def train_supervised_on_split(
     if matched_label_col != label_col:
         logger.info("检测到标签列 %s ，将替代期望列 %s", matched_label_col, label_col)
 
-    # ★ 新增：检查 & 转成 0/1 数值
-    print("调试标签列:", matched_label_col)
-    print(full_df[matched_label_col].head())
-    print(full_df[matched_label_col].dtype)
-    print(full_df[matched_label_col].value_counts(dropna=False))
+    profile_key = str(model_profile or "cicids").strip().lower()
+    if profile_key not in {"cicids", "unsw"}:
+        profile_key = "cicids"
+    allow_ensemble = profile_key == "cicids"
 
+    # ★ 新增：检查 & 转成 0/1 数值
     full_df[matched_label_col] = full_df[matched_label_col].astype(float).astype(int)
 
     raw_labels = full_df[matched_label_col]
@@ -1802,7 +1802,10 @@ def train_supervised_on_split(
     clf.fit(X, y_arr)
 
     # ★ 集成：加载旧的 ensemble 成员（第一次训练时这里返回空）
-    existing_members, existing_metric = _load_existing_ensemble(model_path)
+    if allow_ensemble:
+        existing_members, existing_metric = _load_existing_ensemble(model_path)
+    else:
+        existing_members, existing_metric = [], None
 
     # 本次训练的样本数，用来计算权重
     sample_count = int(X.shape[0])
@@ -1826,6 +1829,9 @@ def train_supervised_on_split(
     weight_metric = _normalized_weight_metric(requested_metric)
 
     reset_ensemble = bool(reset_ensemble_flag)
+    if not allow_ensemble:
+        reset_ensemble = True
+        max_members = 1
 
     # 保留老成员 + 控制最大成员数
     retained_members = list(existing_members)
@@ -1935,9 +1941,6 @@ def train_supervised_on_split(
 
     metadata["model_metrics"] = metrics
 
-    profile_key = str(model_profile or "cicids").strip().lower()
-    if profile_key not in {"cicids", "unsw"}:
-        profile_key = "cicids"
     metadata["model_profile"] = profile_key
 
     metadata_path = models_root / f"iforest_metadata_{stamp_token}.json"
