@@ -4358,7 +4358,7 @@ class Ui_MainWindow(object):
         items = ["CICIDS / PCAP 模型（80 特征）", "UNSW CSV 模型（39 特征）"]
 
         choice, ok = QtWidgets.QInputDialog.getItem(
-            self,
+            None,
             "选择模型类型",
             "本次训练的数据属于哪一类？\n"
             "CICIDS / PCAP：使用项目内置 80 维特征；\n"
