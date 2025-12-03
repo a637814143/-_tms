@@ -1615,10 +1615,14 @@ def _infer_supervised_feature_columns(df: "pd.DataFrame", label_col: str) -> Lis
 
     # 真实标签列（大小写不敏感）
     drop_cols.add(label_col)
+    normalized_label = _normalise_label_name(label_col)
+
     # 常见标签 / 类别列一律排除
     for name in df.columns:
         norm = _normalise_label_name(name)
-        if norm in {
+        if norm == normalized_label:
+            drop_cols.add(name)
+        elif norm in {
             "label",
             "labelbinary",
             "attack_cat",
