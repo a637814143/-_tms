@@ -12,7 +12,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Un
 import numpy as np
 from joblib import dump, load
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
 
 from .feature_extractor import extract_pcap_features
@@ -1501,163 +1508,12 @@ class ModelTrainer:
         models_dir: Optional[Union[str, Path]] = None,
         **kwargs: Union[int, float, None],
     ) -> Dict[str, object]:
-        dataset_path = _resolve_dataset_path(input_path)
-        models_root = Path(models_dir) if models_dir else dataset_path.parent
-        models_root.mkdir(parents=True, exist_ok=True)
-
-        model_path = models_root / "model.joblib"
-
-        ensemble_meta_options = {
-            key: kwargs.get(key)
-            for key in ("max_ensemble_members", "ensemble_weight_metric", "reset_ensemble")
-            if key in kwargs
-        }
-
-        summary = self.train(dataset_path, model_path, **kwargs)
-
-        timestamp = datetime.now()
-        timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
-        stamp_token = timestamp.strftime("%Y%m%d_%H%M%S")
-
-        numeric_names = numeric_feature_names()
-
-        model_metadata_path = model_path.with_name("metadata.json")
-
-        weight_metric_meta: Optional[str] = None
-        max_members_meta: Optional[int] = None
-        if model_metadata_path.exists():
-            try:
-                with model_metadata_path.open("r", encoding="utf-8") as handle:
-                    base_meta = json.load(handle)
-                if isinstance(base_meta, dict):
-                    raw_weight_metric = base_meta.get("ensemble_weight_metric")
-                    if raw_weight_metric not in (None, ""):
-                        weight_metric_meta = str(raw_weight_metric)
-                    raw_max_members = base_meta.get("ensemble_max_members")
-                    if raw_max_members is not None:
-                        max_members_meta = int(raw_max_members)
-            except Exception:
-                weight_metric_meta = None
-                max_members_meta = None
-
-        metadata: Dict[str, object] = {
-            "schema_version": MODEL_SCHEMA_VERSION,
-            "timestamp": timestamp_str,
-            "pipeline_latest": model_path.name,
-            "pipeline_path": model_path.name,
-            "feature_order": list(numeric_names),
-            "feature_names_in": list(numeric_names),
-            "feature_columns": summary.feature_names,
-            "label_mapping": summary.label_mapping or {},
-            "contamination": kwargs.get("contamination"),
-            "training_anomaly_ratio": kwargs.get("training_anomaly_ratio"),
-            "model_metadata_path": str(model_metadata_path),
-        }
-
-        metadata["score_column"] = "malicious_score"
-        if summary.decision_threshold is not None:
-            metadata["threshold"] = float(summary.decision_threshold)
-            metadata["decision_threshold"] = float(summary.decision_threshold)
-        if summary.positive_label:
-            metadata["positive_label"] = summary.positive_label
-        if summary.positive_class is not None:
-            if isinstance(summary.positive_class, (np.integer, int)):
-                metadata["positive_class"] = int(summary.positive_class)
-            else:
-                metadata["positive_class"] = str(summary.positive_class)
-        if summary.metrics:
-            for key in ("ensemble_members", "ensemble_added", "ensemble_retained", "ensemble_dropped"):
-                value = summary.metrics.get(key)
-                if value is not None:
-                    metadata[key] = int(value)
-        if summary.metrics:
-            metadata["model_metrics"] = summary.metrics
-        if summary.class_weights:
-            metadata["class_weights"] = summary.class_weights
-        if summary.validation_samples is not None:
-            metadata["validation_samples"] = int(summary.validation_samples)
-        if max_members_meta is not None:
-            metadata["ensemble_max_members"] = int(max_members_meta)
-        elif ensemble_meta_options.get("max_ensemble_members") is not None:
-            try:
-                metadata["ensemble_max_members"] = int(ensemble_meta_options["max_ensemble_members"])
-            except (TypeError, ValueError):
-                pass
-        if weight_metric_meta:
-            metadata["ensemble_weight_metric"] = weight_metric_meta
-        elif ensemble_meta_options.get("ensemble_weight_metric") is not None:
-            metadata["ensemble_weight_metric"] = str(ensemble_meta_options["ensemble_weight_metric"])
-        if ensemble_meta_options.get("reset_ensemble"):
-            metadata["ensemble_reset"] = True
-
-        fusion_settings = _resolve_rule_fusion_settings()
-        rule_profile = fusion_settings.get("profile")  # type: ignore[assignment]
-        rule_threshold_value = fusion_settings.get("rule_threshold")  # type: ignore[assignment]
-        fusion_threshold_value = fusion_settings.get("fusion_threshold")  # type: ignore[assignment]
-        fusion_model_weight_value = fusion_settings.get("model_weight")  # type: ignore[assignment]
-        fusion_rule_weight_value = fusion_settings.get("rule_weight")  # type: ignore[assignment]
-        fusion_weights = fusion_settings.get("weights")
-
-        if isinstance(rule_profile, str) and rule_profile:
-            metadata["rule_profile"] = rule_profile
-        if rule_threshold_value is not None:
-            metadata["rule_threshold"] = float(rule_threshold_value)
-        if fusion_threshold_value is not None:
-            metadata["fusion_threshold"] = float(fusion_threshold_value)
-        if fusion_model_weight_value is not None:
-            metadata["fusion_model_weight"] = float(fusion_model_weight_value)
-        if fusion_rule_weight_value is not None:
-            metadata["fusion_rule_weight"] = float(fusion_rule_weight_value)
-        if isinstance(fusion_weights, dict) and fusion_weights:
-            metadata["fusion_weights"] = {
-                "model": float(fusion_weights.get("model", 1.0)),
-                "rules": float(fusion_weights.get("rules", 0.0)),
-            }
-        else:
-            metadata["fusion_weights"] = {"model": 1.0, "rules": 0.0}
-
-        metadata_path = models_root / f"iforest_metadata_{stamp_token}.json"
-        latest_metadata_path = models_root / "latest_iforest_metadata.json"
-
-        with metadata_path.open("w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, ensure_ascii=False, indent=2)
-
-        with latest_metadata_path.open("w", encoding="utf-8") as handle:
-            json.dump(metadata, handle, ensure_ascii=False, indent=2)
-
-        if results_dir:
-            Path(results_dir).mkdir(parents=True, exist_ok=True)
-
-        return {
-            "model_path": str(model_path),
-            "pipeline_path": str(model_path),
-            "pipeline_latest": str(model_path),
-            "metadata_path": str(metadata_path),
-            "metadata_latest": str(latest_metadata_path),
-            "model_metadata_path": str(model_metadata_path),
-            "model_joblib": str(model_path),
-            "results_csv": None,
-            "summary_csv": None,
-            "scaler_path": None,
-            "flows": summary.flow_count,
-            "malicious": 0,
-            "feature_columns": summary.feature_names,
-            "classes": summary.classes,
-            "label_mapping": summary.label_mapping,
-            "dropped_flows": summary.dropped_flows,
-            "timestamp": timestamp_str,
-            "schema_version": MODEL_SCHEMA_VERSION,
-            "summary": summary,
-            "metadata": metadata,
-            "decision_threshold": summary.decision_threshold,
-            "model_metrics": summary.metrics,
-            "positive_label": summary.positive_label,
-            "positive_class": (
-                int(summary.positive_class)
-                if isinstance(summary.positive_class, (np.integer, int))
-                else summary.positive_class
-            ),
-        }
+        return train_supervised_on_split(
+            split_dir=input_path,
+            results_dir=results_dir,
+            models_dir=models_dir,
+            **kwargs,
+        )
 
 
 class ModelPredictor:
@@ -1840,9 +1696,6 @@ def train_supervised_on_split(
         "recall": float(recall_score(y_test, y_pred, zero_division=0)),
         "f1": float(f1_score(y_test, y_pred, zero_division=0)),
     }
-
-    from sklearn.metrics import confusion_matrix
-    import numpy as np
 
     print("y_test 分布:", np.bincount(y_test))
     print("y_pred 分布:", np.bincount(y_pred))
