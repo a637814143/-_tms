@@ -1737,7 +1737,7 @@ def train_supervised_on_split(
     models_dir: Optional[Union[str, Path]] = None,
     *,
     model_tag: str = "latest",
-    label_col: str = "Label",
+    label_col: str = "LabelBinary",  # ★ 默认就用 LabelBinary
     positive_labels: Sequence[str] = ("MALICIOUS", "ATTACK"),
     **kwargs: Union[int, float, None],
 ) -> Dict[str, object]:
@@ -1791,6 +1791,14 @@ def train_supervised_on_split(
     if matched_label_col != label_col:
         logger.info("检测到标签列 %s ，将替代期望列 %s", matched_label_col, label_col)
 
+    # ★ 新增：检查 & 转成 0/1 数值
+    print("调试标签列:", matched_label_col)
+    print(full_df[matched_label_col].head())
+    print(full_df[matched_label_col].dtype)
+    print(full_df[matched_label_col].value_counts(dropna=False))
+
+    full_df[matched_label_col] = full_df[matched_label_col].astype(float).astype(int)
+
     raw_labels = full_df[matched_label_col]
     if raw_labels.dtype == "O":
         positive_set = {str(value).upper() for value in positive_labels}
@@ -1832,6 +1840,13 @@ def train_supervised_on_split(
         "recall": float(recall_score(y_test, y_pred, zero_division=0)),
         "f1": float(f1_score(y_test, y_pred, zero_division=0)),
     }
+
+    from sklearn.metrics import confusion_matrix
+    import numpy as np
+
+    print("y_test 分布:", np.bincount(y_test))
+    print("y_pred 分布:", np.bincount(y_pred))
+    print("混淆矩阵:\n", confusion_matrix(y_test, y_pred))
 
     logger.info(
         "模型评估指标 accuracy=%.4f precision=%.4f recall=%.4f f1=%.4f",
