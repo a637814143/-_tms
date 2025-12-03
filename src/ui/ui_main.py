@@ -5398,12 +5398,58 @@ class Ui_MainWindow(object):
             total_rows = int(len(out_df))
             out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
 
+            # ★★ 如果 CSV 里带有 LabelBinary（0/1 真值），顺便计算评估指标 ★★
+            eval_accuracy = None
+            eval_precision = None
+            eval_recall = None
+            eval_f1 = None
+            try:
+                if "LabelBinary" in out_df.columns:
+                    # 真实标签
+                    y_true = pd.to_numeric(out_df["LabelBinary"], errors="coerce")
+                    # 只保留 0/1 的有效行
+                    valid_mask = y_true.isin([0, 1])
+                    if valid_mask.any():
+                        y_true = y_true[valid_mask].astype(int).to_numpy()
+                        # 预测标签：这里用最终融合后的 is_malicious（0 正常 / 1 异常）
+                        y_pred = out_df.loc[valid_mask, "is_malicious"].astype(int).to_numpy()
+
+                        tp = int(((y_true == 1) & (y_pred == 1)).sum())
+                        tn = int(((y_true == 0) & (y_pred == 0)).sum())
+                        fp = int(((y_true == 0) & (y_pred == 1)).sum())
+                        fn = int(((y_true == 1) & (y_pred == 0)).sum())
+
+                        total_valid = len(y_true)
+                        if total_valid > 0:
+                            eval_accuracy = (tp + tn) / float(total_valid)
+                        if (tp + fp) > 0:
+                            eval_precision = tp / float(tp + fp)
+                        if (tp + fn) > 0:
+                            eval_recall = tp / float(tp + fn)
+                        if eval_precision is not None and eval_recall is not None and (eval_precision + eval_recall) > 0:
+                            eval_f1 = 2.0 * eval_precision * eval_recall / float(eval_precision + eval_recall)
+            except Exception:
+                # 任何异常就不影响预测主流程
+                eval_accuracy = eval_precision = eval_recall = eval_f1 = None
+
             summary_lines = [
                 f"模型预测完成：{source_name}",
                 f"输出行数：{total_rows}",
             ]
             if status_text is not None:
                 summary_lines.append(f"分析结论：{status_text}")
+
+            # ★★ 如果成功算出了指标，就追加到日志里 ★★
+            if eval_accuracy is not None and eval_recall is not None:
+                # “真正准确率”理解为 Accuracy，这里一起把四个指标都打出来
+                summary_lines.append(
+                    "带标签评估：Accuracy={0:.4f}, Precision={1:.4f}, Recall={2:.4f}, F1={3:.4f}".format(
+                        float(eval_accuracy),
+                        float(eval_precision or 0.0),
+                        float(eval_recall),
+                        float(eval_f1 or 0.0),
+                    )
+                )
             ratio: Optional[float] = None
             if anomaly_count is not None:
                 summary_line = f"异常数量：{int(anomaly_count)}"
