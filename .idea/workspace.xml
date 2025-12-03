@@ -6,6 +6,7 @@
   <component name="ChangeListManager">
     <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/modeling.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/modeling.py" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/src/ui/ui_main.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/ui/ui_main.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
@@ -76,7 +77,7 @@
     ]
   }
 }]]></component>
-  <component name="RunManager" selected="Python.新建 文本文档 (3)">
+  <component name="RunManager" selected="Python.ui_main">
     <configuration name="新建 文本文档 (2)" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="pythonProject8" />
       <option name="ENV_FILES" value="" />
@@ -197,9 +198,9 @@
     </list>
     <recent_temporary>
       <list>
+        <item itemvalue="Python.ui_main" />
         <item itemvalue="Python.新建 文本文档 (3)" />
         <item itemvalue="Python.tt" />
-        <item itemvalue="Python.ui_main" />
         <item itemvalue="Python.新建 文本文档 (2)" />
         <item itemvalue="Python.1" />
       </list>
@@ -220,14 +221,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1754543842572</updated>
-    </task>
-    <task id="LOCAL-00088" summary="8888">
-      <option name="closed" value="true" />
-      <created>1763016873423</created>
-      <option name="number" value="00088" />
-      <option name="presentableId" value="LOCAL-00088" />
-      <option name="project" value="LOCAL" />
-      <updated>1763016873423</updated>
     </task>
     <task id="LOCAL-00089" summary="8888">
       <option name="closed" value="true" />
@@ -613,7 +606,15 @@
       <option name="project" value="LOCAL" />
       <updated>1764761273560</updated>
     </task>
-    <option name="localTasksCounter" value="137" />
+    <task id="LOCAL-00137" summary="8888">
+      <option name="closed" value="true" />
+      <created>1764764020804</created>
+      <option name="number" value="00137" />
+      <option name="presentableId" value="LOCAL-00137" />
+      <option name="project" value="LOCAL" />
+      <updated>1764764020804</updated>
+    </task>
+    <option name="localTasksCounter" value="138" />
     <servers />
   </component>
   <component name="UnknownFeatures">

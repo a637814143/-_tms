@@ -1941,6 +1941,23 @@ class Ui_MainWindow(object):
             (self.btn_train, self.btn_full_retrain, self.btn_predict, self.btn_analysis),
         )
 
+        profile_model_group, profile_model_layout = self._create_collapsible_group("预测模型类型", spacing=6)
+        model_profile_row = QtWidgets.QHBoxLayout()
+        model_profile_row.setContentsMargins(0, 0, 0, 0)
+        model_profile_row.setSpacing(6)
+        model_profile_row.addWidget(QtWidgets.QLabel("预测模型类型:"))
+        self.model_profile_combo = QtWidgets.QComboBox()
+        self.model_profile_combo.addItem("CICIDS / PCAP 模型", "cicids")
+        self.model_profile_combo.addItem("UNSW CSV 模型", "unsw")
+        self.model_profile_combo.setToolTip(
+            "选择用于预测的模型类型（对应 model_cicids.joblib / model_unsw.joblib）"
+        )
+        self.model_profile_combo.setMinimumHeight(32)
+        model_profile_row.addWidget(self.model_profile_combo)
+        model_profile_row.addStretch(1)
+        profile_model_layout.addLayout(model_profile_row)
+        self.right_layout.addWidget(profile_model_group)
+
         profile_group, profile_layout = self._create_collapsible_group("规则档位", spacing=6)
         self.rule_profile_combo = QtWidgets.QComboBox()
         self.rule_profile_combo.setMinimumHeight(36)
@@ -2533,6 +2550,29 @@ class Ui_MainWindow(object):
         if key:
             return lambda key=key: str(PATHS[key])
         raise AttributeError(name)
+
+    def _get_selected_model_path(self) -> str:
+        """
+        根据当前 UI 选择的模型类型，返回对应的模型文件路径。
+        """
+
+        base_dir = self._default_models_dir()
+        profile = None
+        combo = getattr(self, "model_profile_combo", None)
+        if isinstance(combo, QtWidgets.QComboBox):
+            profile = combo.currentData()
+
+        if profile == "unsw":
+            filename = "model_unsw.joblib"
+        else:
+            filename = "model_cicids.joblib"
+
+        path = os.path.join(base_dir, filename)
+        if not os.path.exists(path):
+            legacy = os.path.join(base_dir, "model.joblib")
+            if os.path.exists(legacy):
+                return legacy
+        return path
 
     def _refresh_model_versions(self):
         if not hasattr(self, "model_combo"):
@@ -4315,6 +4355,28 @@ class Ui_MainWindow(object):
             self.file_edit.setText(path)
             self._remember_path(path)
 
+        items = ["CICIDS / PCAP 模型（80 特征）", "UNSW CSV 模型（39 特征）"]
+
+        choice, ok = QtWidgets.QInputDialog.getItem(
+            self,
+            "选择模型类型",
+            "本次训练的数据属于哪一类？\n"
+            "CICIDS / PCAP：使用项目内置 80 维特征；\n"
+            "UNSW CSV：使用 UNSW-NB15 的 39 维数值特征。",
+            items,
+            0,
+            False,
+        )
+
+        if not ok:
+            self.display_result("[INFO] 已取消模型训练。")
+            return
+
+        if choice == items[1]:
+            model_profile = "unsw"
+        else:
+            model_profile = "cicids"
+
         res_dir = self._default_results_dir()
         mdl_dir = self._default_models_dir()
         os.makedirs(res_dir, exist_ok=True)
@@ -4333,6 +4395,8 @@ class Ui_MainWindow(object):
         task_kwargs: Dict[str, object] = {}
         if reset:
             task_kwargs["reset_ensemble"] = True
+
+        task_kwargs["model_profile"] = model_profile
 
         train_task = BackgroundTask(
             run_train,
@@ -4770,6 +4834,13 @@ class Ui_MainWindow(object):
         if pd is None:
             raise RuntimeError("pandas 未安装，无法执行预测。")
 
+        def _load_metadata_from_json(path: str) -> dict:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except Exception:
+                return {}
+
         def _status_from_text(value: object) -> Optional[str]:
             if value is None:
                 return None
@@ -4984,7 +5055,32 @@ class Ui_MainWindow(object):
 
             return messages
 
-        bundle = self._resolve_prediction_bundle(df, metadata_override=metadata_override)
+        explicit_bundle: Optional[dict] = None
+        selected_model_path = self._get_selected_model_path()
+        metadata_override = (
+            dict(metadata_override) if isinstance(metadata_override, dict) else metadata_override
+        )
+        if selected_model_path and os.path.exists(selected_model_path):
+            metadata_path = f"{selected_model_path}.json"
+            loaded_metadata = _load_metadata_from_json(metadata_path)
+            metadata_obj = dict(loaded_metadata) if isinstance(loaded_metadata, dict) else {}
+            if isinstance(metadata_override, dict):
+                metadata_obj.update(metadata_override)
+
+            explicit_bundle = {
+                "metadata": metadata_obj,
+                "metadata_path": metadata_path if os.path.exists(metadata_path) else None,
+                "pipeline_path": selected_model_path,
+                "feature_order": metadata_obj.get("feature_columns")
+                or metadata_obj.get("feature_order"),
+                "allowed_extra": self._prediction_allowed_extras(metadata_obj),
+                "extras": [],
+                "source": "profile_selection",
+            }
+
+        bundle = explicit_bundle or self._resolve_prediction_bundle(
+            df, metadata_override=metadata_override
+        )
         if not bundle:
             raise RuntimeError(
                 "未找到与所选特征CSV匹配的模型，请确认已选择训练时对应的特征文件。"
@@ -5005,6 +5101,27 @@ class Ui_MainWindow(object):
             pipeline = joblib_load(pipeline_path)
         except Exception as exc:
             raise RuntimeError(f"模型管线加载失败：{exc}")
+
+        expected_features = None
+        if isinstance(metadata, dict):
+            cols = metadata.get("feature_columns") or metadata.get("feature_order") or []
+            if cols:
+                expected_features = len(cols)
+            else:
+                expected_features = metadata.get("n_features")
+
+        input_numeric_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
+        input_feature_count = len(input_numeric_cols)
+
+        if expected_features is not None and input_feature_count != expected_features:
+            QtWidgets.QMessageBox.warning(
+                self._parent_widget(),
+                "特征数量不匹配",
+                f"当前模型期望 {expected_features} 个数值特征，"
+                f"但输入数据中检测到 {input_feature_count} 个。\n\n"
+                f"请确认使用了正确的模型类型（CICIDS / UNSW）和数据格式。",
+            )
+            return {}
 
         # 记录所选模型，确保后续操作保持一致
         if metadata_path:
