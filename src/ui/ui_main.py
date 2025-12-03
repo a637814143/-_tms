@@ -1035,6 +1035,7 @@ else:
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 UI_LOGGER = get_logger("ui")
 UI_LOGGER.setLevel(logging.INFO)
+logger = UI_LOGGER
 SETTINGS_DIR = PATHS.get("settings", DATA_BASE / "settings")
 SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_PATH = SETTINGS_DIR / "settings.json"
@@ -1947,8 +1948,8 @@ class Ui_MainWindow(object):
         model_profile_row.setSpacing(6)
         model_profile_row.addWidget(QtWidgets.QLabel("预测模型类型:"))
         self.model_profile_combo = QtWidgets.QComboBox()
-        self.model_profile_combo.addItem("CICIDS / PCAP 模型", "cicids")
-        self.model_profile_combo.addItem("UNSW CSV 模型", "unsw")
+        self.model_profile_combo.addItem("CICIDS / PCAP 模型", "cicids_pcap")
+        self.model_profile_combo.addItem("UNSW CSV 模型", "unsw_csv")
         self.model_profile_combo.setToolTip(
             "选择用于预测的模型类型（对应 data/models/cicids 或 data/models/unsw 目录）"
         )
@@ -2565,118 +2566,86 @@ class Ui_MainWindow(object):
             except Exception:
                 data = None
             if isinstance(data, str) and data.strip():
-                profile = data.strip().lower()
+                token = data.strip().lower()
+                if token == "unsw_csv":
+                    profile = "unsw"
+                elif token == "cicids_pcap":
+                    profile = "cicids"
+                else:
+                    profile = token
 
         models_dir = base_dir / profile
         models_dir.mkdir(parents=True, exist_ok=True)
         return str(models_dir)
 
-    def _get_selected_model_path(self) -> Tuple[Path, Optional[Path]]:
+    def _current_model_key(self) -> Optional[str]:
         """
-        根据当前 UI 选择的模型类型（CICIDS / UNSW）返回对应的 model.joblib 和元数据路径。
-        如果对应子目录下不存在模型，则回退到旧的 data/models/model.joblib。
+        根据右侧“预测模型类型”下拉框返回 _model_registry 用的 key。
         """
+        combo = getattr(self, "model_profile_combo", None)
+        if not isinstance(combo, QtWidgets.QComboBox):
+            return None
 
-        models_dir = Path(self._default_models_dir())
+        profile = combo.currentData()
+        if profile == "unsw_csv":
+            return "unsw_csv_latest"
+        return "cicids_pcap_latest"
 
-        pipeline_path = models_dir / "model.joblib"
-        metadata_path = models_dir / "latest_iforest_metadata.json"
+    def _refresh_model_versions(self) -> None:
+        """
+        扫描 models 目录，分别注册 CICIDS / PCAP 模型 和 UNSW CSV 模型。
+        """
+        self._model_registry = {}
 
-        if not pipeline_path.exists():
-            legacy_root = Path(PATHS["models"])
-            legacy_model = legacy_root / "model.joblib"
-            legacy_meta = legacy_root / "latest_iforest_metadata.json"
-            if legacy_model.exists():
-                pipeline_path = legacy_model
-                metadata_path = legacy_meta
+        models_base = PATHS.get("models", DATA_BASE / "models")
+        models_base = Path(models_base)
 
-        if not metadata_path.exists():
-            metadata_path = None
-
-        return pipeline_path, metadata_path
-
-    def _refresh_model_versions(self):
-        if not hasattr(self, "model_combo"):
-            return
-        models_dir = Path(self._default_models_dir())
-        registry: Dict[str, dict] = {}
-        candidates: List[Path] = []
-        if models_dir.exists():
-            latest_path = models_dir / "latest_iforest_metadata.json"
-            if latest_path.exists():
-                candidates.append(latest_path)
-            pattern_files = sorted(models_dir.glob("iforest_metadata_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-            candidates.extend(pattern_files)
-            extra_metadata = sorted(
-                (
-                    p
-                    for p in models_dir.glob("*.json")
-                    if "metadata" in p.stem.lower()
-                    and p.name not in {"latest_iforest_metadata.json"}
-                    and p not in candidates
-                ),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            candidates.extend(extra_metadata)
-        for path in candidates:
+        def _register_model(key: str, model_dir: Path) -> None:
+            pipeline_path = model_dir / "model.joblib"
+            meta_path = model_dir / "latest_iforest_metadata.json"
+            if not (pipeline_path.is_file() and meta_path.is_file()):
+                return
             try:
-                with open(path, "r", encoding="utf-8") as fh:
+                with meta_path.open("r", encoding="utf-8") as fh:
                     metadata = json.load(fh)
-                if not isinstance(metadata, dict):
-                    continue
             except Exception:
-                continue
-            pipeline_path = (
-                metadata.get("pipeline_latest")
-                or metadata.get("pipeline_path")
-                or metadata.get("model_path")
-                or metadata.get("model_joblib")
-            )
-            if not pipeline_path:
-                sibling_joblib = path.with_suffix(".joblib")
-                if sibling_joblib.exists():
-                    pipeline_path = str(sibling_joblib)
-            if not pipeline_path:
-                continue
-            if pipeline_path and not os.path.isabs(pipeline_path):
-                pipeline_path = str((models_dir / pipeline_path).resolve())
-            display_timestamp = metadata.get("timestamp") or path.stem
-            anomaly_ratio = metadata.get("estimated_anomaly_ratio") or metadata.get("training_anomaly_ratio")
-            if anomaly_ratio is not None:
-                try:
-                    display_text = f"{display_timestamp} | 异常占比 {float(anomaly_ratio):.2%}"
-                except Exception:
-                    display_text = str(display_timestamp)
-            else:
-                display_text = str(display_timestamp)
-            registry[str(path)] = {
-                "metadata_path": str(path),
+                metadata = {}
+
+            self._model_registry[key] = {
+                "pipeline": str(pipeline_path),
+                "metadata_path": str(meta_path),
                 "metadata": metadata,
-                "pipeline_path": pipeline_path,
-                "display": display_text,
             }
 
-        self._model_registry = registry
-        current_key = self._selected_model_key
-        self.model_combo.blockSignals(True)
-        self.model_combo.clear()
-        for key, entry in registry.items():
-            self.model_combo.addItem(entry["display"], key)
-        self.model_combo.blockSignals(False)
-
-        if current_key and current_key in registry:
-            idx = self.model_combo.findData(current_key)
-            if idx >= 0:
-                self.model_combo.setCurrentIndex(idx)
-                self._on_model_combo_changed(idx)
-                return
-
-        if self.model_combo.count():
-            self.model_combo.setCurrentIndex(0)
-            self._on_model_combo_changed(0)
+        # 1) CICIDS / PCAP 模型（兼容老路径 + 新的 cicids 子目录）
+        cicids_dir = models_base / "cicids"
+        if cicids_dir.is_dir():
+            _register_model("cicids_pcap_latest", cicids_dir)
         else:
-            self._on_model_combo_changed(-1)
+            _register_model("cicids_pcap_latest", models_base)
+
+        # 2) UNSW CSV 模型
+        unsw_dir = models_base / "unsw"
+        if unsw_dir.is_dir():
+            _register_model("unsw_csv_latest", unsw_dir)
+
+        current_profile = None
+        combo = getattr(self, "model_profile_combo", None)
+        if isinstance(combo, QtWidgets.QComboBox):
+            current_profile = combo.currentData()
+        if current_profile == "unsw_csv" and "unsw_csv_latest" in self._model_registry:
+            self._selected_model_key = "unsw_csv_latest"
+        elif "cicids_pcap_latest" in self._model_registry:
+            self._selected_model_key = "cicids_pcap_latest"
+        else:
+            self._selected_model_key = None
+
+        if self._selected_model_key:
+            entry = self._model_registry.get(self._selected_model_key, {})
+            metadata = entry.get("metadata") if isinstance(entry, dict) else {}
+            self._selected_metadata = metadata if isinstance(metadata, dict) else None
+            self._selected_metadata_path = entry.get("metadata_path")
+            self._selected_pipeline_path = entry.get("pipeline")
 
     def _on_model_combo_changed(self, index: int) -> None:
         if not hasattr(self, "model_combo"):
@@ -4395,12 +4364,14 @@ class Ui_MainWindow(object):
 
         if choice == items[1]:
             model_profile = "unsw"
+            profile_token = "unsw_csv"
         else:
             model_profile = "cicids"
+            profile_token = "cicids_pcap"
 
         profile_combo = getattr(self, "model_profile_combo", None)
         if isinstance(profile_combo, QtWidgets.QComboBox):
-            idx = profile_combo.findData(model_profile)
+            idx = profile_combo.findData(profile_token)
             if idx >= 0:
                 profile_combo.setCurrentIndex(idx)
 
@@ -5083,58 +5054,33 @@ class Ui_MainWindow(object):
 
             return messages
 
-        explicit_bundle: Optional[dict] = None
-        selected_model_path, selected_metadata_path = self._get_selected_model_path()
         metadata_override = (
             dict(metadata_override) if isinstance(metadata_override, dict) else metadata_override
         )
-        if selected_model_path and os.path.exists(selected_model_path):
-            metadata_path_str = (
-                str(selected_metadata_path) if selected_metadata_path else None
-            )
-            loaded_metadata = (
-                _load_metadata_from_json(metadata_path_str) if metadata_path_str else {}
-            )
-            metadata_obj = dict(loaded_metadata) if isinstance(loaded_metadata, dict) else {}
-            if isinstance(metadata_override, dict):
-                metadata_obj.update(metadata_override)
+        parent_widget = self._parent_widget()
 
-            explicit_bundle = {
-                "metadata": metadata_obj,
-                "metadata_path": metadata_path_str
-                if metadata_path_str and os.path.exists(metadata_path_str)
-                else None,
-                "pipeline_path": str(selected_model_path),
-                "feature_order": metadata_obj.get("feature_columns")
-                or metadata_obj.get("feature_order"),
-                "allowed_extra": self._prediction_allowed_extras(metadata_obj),
-                "extras": [],
-                "source": "profile_selection",
-            }
-
-        bundle = explicit_bundle or self._resolve_prediction_bundle(
-            df, metadata_override=metadata_override
-        )
-        if not bundle:
-            raise RuntimeError(
-                "未找到与所选特征CSV匹配的模型，请确认已选择训练时对应的特征文件。"
-            )
-
-        pipeline_path = bundle.get("pipeline_path")
+        model_key = self._current_model_key()
+        bundle = self._model_registry.get(model_key or "", {}) if isinstance(self._model_registry, dict) else {}
+        pipeline_path = bundle.get("pipeline")
+        metadata_path = bundle.get("metadata_path")
         metadata_obj = bundle.get("metadata") or {}
         metadata = dict(metadata_obj) if isinstance(metadata_obj, dict) else {}
-        metadata_path = bundle.get("metadata_path")
-        allowed_extra = set(bundle.get("allowed_extra") or set())
-        extras_detected = list(bundle.get("extras") or [])
-        source = bundle.get("source")
+        if isinstance(metadata_override, dict):
+            metadata.update(metadata_override)
 
-        if not pipeline_path or not os.path.exists(pipeline_path):
-            raise RuntimeError("未找到可用的模型管线，请先训练模型。")
+        if not pipeline_path:
+            QtWidgets.QMessageBox.warning(
+                parent_widget,
+                "预测失败",
+                "未找到与所选特征CSV匹配的模型，请先训练对应的模型。",
+            )
+            return {}
 
         try:
             pipeline = joblib_load(pipeline_path)
         except Exception as exc:
-            raise RuntimeError(f"模型管线加载失败：{exc}")
+            QtWidgets.QMessageBox.critical(parent_widget, "预测失败", f"无法加载模型：{exc}")
+            return {}
 
         expected_features = None
         if isinstance(metadata, dict):
@@ -5149,7 +5095,7 @@ class Ui_MainWindow(object):
 
         if expected_features is not None and input_feature_count < expected_features:
             QtWidgets.QMessageBox.warning(
-                self._parent_widget(),
+                parent_widget,
                 "特征数量不匹配",
                 f"当前模型期望 {expected_features} 个数值特征，"
                 f"但输入数据中只检测到 {input_feature_count} 个。\n"
@@ -5163,28 +5109,60 @@ class Ui_MainWindow(object):
                 expected_features,
             )
 
-        # 记录所选模型，确保后续操作保持一致
-        if metadata_path:
-            self._selected_metadata = metadata
-            self._selected_metadata_path = metadata_path
-            self._selected_pipeline_path = pipeline_path
-            if hasattr(self, "model_combo"):
-                idx = self.model_combo.findData(metadata_path)
-                if idx < 0:
-                    self._refresh_model_versions()
-                    idx = self.model_combo.findData(metadata_path)
-                if idx >= 0:
-                    self.model_combo.blockSignals(True)
-                    self.model_combo.setCurrentIndex(idx)
-                    self.model_combo.blockSignals(False)
-                    self._on_model_combo_changed(idx)
+        self._selected_model_key = model_key
+        self._selected_metadata = metadata
+        self._selected_metadata_path = metadata_path
+        self._selected_pipeline_path = pipeline_path
 
-        feature_df_raw, align_info = _align_input_features(
-            df,
-            metadata,
-            strict=False,
-            allow_extra=allowed_extra.union(extras_detected),
+        profile_combo = getattr(self, "model_profile_combo", None)
+        profile_token = (
+            profile_combo.currentData()
+            if isinstance(profile_combo, QtWidgets.QComboBox)
+            else None
         )
+
+        allowed_extra = set(self._prediction_allowed_extras(metadata))
+        extras_detected: List[str] = []
+        source = "profile_selection"
+        align_info: Dict[str, object] = {}
+
+        if profile_token == "unsw_csv":
+            try:
+                feature_df_raw, align_info = _align_input_features(
+                    df,
+                    metadata,
+                    strict=False,
+                    allow_extra=allowed_extra.union(
+                        {"Label", "label", "attack_cat", "id", "proto", "service", "state"}
+                    ),
+                )
+            except Exception as exc:
+                QtWidgets.QMessageBox.warning(
+                    parent_widget,
+                    "特征对齐失败",
+                    f"特征列与训练时不一致：{exc}",
+                )
+                return {}
+        else:
+            numeric_cols = df.select_dtypes(include=["number", "bool"]).columns
+            if not len(numeric_cols):
+                QtWidgets.QMessageBox.warning(
+                    parent_widget,
+                    "预测失败",
+                    "未在输入数据中找到可用于预测的数值特征。",
+                )
+                return {}
+            numeric_df = df[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+            feature_order = (
+                metadata.get("feature_columns")
+                or metadata.get("feature_order")
+                or list(numeric_df.columns)
+            )
+            feature_df_raw = numeric_df.reindex(columns=feature_order, fill_value=0.0)
+            align_info = {
+                "feature_order": feature_order,
+                "missing_filled": {col for col in feature_order if col not in numeric_df.columns},
+            }
 
         messages: List[str] = []
         if source and source not in {"selected", "override"}:
