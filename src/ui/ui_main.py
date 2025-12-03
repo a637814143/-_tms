@@ -6711,9 +6711,12 @@ class Ui_MainWindow(object):
         start_dir = preferred_pcap_dir if os.path.exists(preferred_pcap_dir) else self._default_split_dir()
         selected_files, _ = QtWidgets.QFileDialog.getOpenFileNames(
             None,
-            "选择 PCAP 流量（可多选）",
+            "选择 PCAP 或 CSV 流量（可多选）",
             start_dir,
-            "PCAP (*.pcap *.pcapng);;所有文件 (*)",
+            "PCAP/CSV (*.pcap *.pcapng *.csv);;"
+            "PCAP (*.pcap *.pcapng);;"
+            "CSV (*.csv);;"
+            "所有文件 (*)",
         )
 
         chosen_path: Optional[str]
@@ -6725,14 +6728,14 @@ class Ui_MainWindow(object):
                 if p
                 and os.path.exists(p)
                 and os.path.isfile(p)
-                and p.lower().endswith((".pcap", ".pcapng"))
+                and p.lower().endswith((".pcap", ".pcapng", ".csv"))
             ]
 
             if not valid_files:
                 QtWidgets.QMessageBox.warning(
                     parent_widget,
                     "无有效文件",
-                    "请选择存在的 PCAP/PCAPNG 文件。",
+                    "请选择存在的 PCAP/PCAPNG/CSV 文件。",
                 )
                 return
 
@@ -6751,15 +6754,36 @@ class Ui_MainWindow(object):
 
             valid_files = deduped_files
 
-            if len(valid_files) > 1:
-                self._remember_path(os.path.dirname(valid_files[0]))
+            pcap_files = [
+                path for path in valid_files if path.lower().endswith((".pcap", ".pcapng"))
+            ]
+            csv_files = [path for path in valid_files if path.lower().endswith(".csv")]
+
+            if pcap_files and csv_files:
+                QtWidgets.QMessageBox.warning(
+                    parent_widget,
+                    "类型不一致",
+                    "请选择同一类型的文件：要么全是 PCAP/PCAPNG，要么选择单个 CSV。",
+                )
+                return
+
+            if len(pcap_files) > 1:
+                self._remember_path(os.path.dirname(pcap_files[0]))
                 self._predict_pcap_batch(
-                    valid_files,
+                    pcap_files,
                     metadata_override=metadata_override,
                 )
                 return
 
-            chosen_path = valid_files[0]
+            if len(csv_files) > 1:
+                QtWidgets.QMessageBox.warning(
+                    parent_widget,
+                    "暂不支持",
+                    "一次仅支持选择单个 CSV 文件进行预测，请重新选择。",
+                )
+                return
+
+            chosen_path = pcap_files[0] if pcap_files else csv_files[0]
         else:
             dir_path = QtWidgets.QFileDialog.getExistingDirectory(
                 None, "选择 PCAP 所在目录", start_dir
