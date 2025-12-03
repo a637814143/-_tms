@@ -34,14 +34,25 @@ from src.functions.feature_extractor import (
 from src.functions.csv_utils import read_csv_flexible
 from src.functions.modeling import (
     META_COLUMNS as TRAIN_META_COLUMNS,
-    ModelTrainer,
+    train_supervised_on_split,
 )
-
-trainer = ModelTrainer()
 
 
 def run_train(split_dir, results_dir, models_dir, **kwargs):
-    return trainer.train_from_split(split_dir, results_dir, models_dir, **kwargs)
+    """
+    UI 点击“训练模型”时走的入口。
+    这里改为使用有监督训练函数 train_supervised_on_split，
+    默认标签列名为 LabelBinary。
+    split_dir 既可以是 split 目录，也可以是你现在这种单个预处理 CSV 路径。
+    """
+    return train_supervised_on_split(
+        split_dir,
+        results_dir=results_dir,
+        models_dir=models_dir,
+        # train_supervised_on_split 里默认 label_col="LabelBinary"
+        # 如果以后你改成别的名字，可以在这里显式传 label_col="新列名"
+        **kwargs,
+    )
 
 try:
     from src.functions import summarize_prediction_labels
