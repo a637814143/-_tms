@@ -5082,87 +5082,43 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.critical(parent_widget, "预测失败", f"无法加载模型：{exc}")
             return {}
 
-        expected_features = None
-        if isinstance(metadata, dict):
-            cols = metadata.get("feature_columns") or metadata.get("feature_order") or []
-            if cols:
-                expected_features = len(cols)
-            else:
-                expected_features = metadata.get("n_features")
-
-        input_numeric_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
-        input_feature_count = len(input_numeric_cols)
-
-        if expected_features is not None and input_feature_count < expected_features:
-            QtWidgets.QMessageBox.warning(
-                parent_widget,
-                "特征数量不匹配",
-                f"当前模型期望 {expected_features} 个数值特征，"
-                f"但输入数据中只检测到 {input_feature_count} 个。\n"
-                "这通常表示选择了错误的模型类型（CICIDS / UNSW）或者数据缺少必要特征。",
-            )
-            return {}
-        elif expected_features is not None and input_feature_count > expected_features:
-            logger.info(
-                "输入数据包含 %d 个数值特征，多于模型期望的 %d 个，多余列将在对齐时被忽略。",
-                input_feature_count,
-                expected_features,
-            )
-
-        self._selected_model_key = model_key
-        self._selected_metadata = metadata
-        self._selected_metadata_path = metadata_path
-        self._selected_pipeline_path = pipeline_path
-
-        profile_combo = getattr(self, "model_profile_combo", None)
-        profile_token = (
-            profile_combo.currentData()
-            if isinstance(profile_combo, QtWidgets.QComboBox)
-            else None
-        )
-
+        feature_order = _feature_order_from_metadata(metadata)
         allowed_extra = set(self._prediction_allowed_extras(metadata))
         extras_detected: List[str] = []
         source = "profile_selection"
         align_info: Dict[str, object] = {}
 
-        if profile_token == "unsw_csv":
-            try:
+        try:
+            if feature_order:
                 feature_df_raw, align_info = _align_input_features(
                     df,
                     metadata,
-                    strict=False,
+                    strict=True,
                     allow_extra=allowed_extra.union(
-                        {"Label", "label", "attack_cat", "id", "proto", "service", "state"}
+                        {"Label", "label", "LabelBinary", "attack_cat", "id"}
                     ),
                 )
-            except Exception as exc:
-                QtWidgets.QMessageBox.warning(
-                    parent_widget,
-                    "特征对齐失败",
-                    f"特征列与训练时不一致：{exc}",
-                )
-                return {}
-        else:
-            numeric_cols = df.select_dtypes(include=["number", "bool"]).columns
-            if not len(numeric_cols):
-                QtWidgets.QMessageBox.warning(
-                    parent_widget,
-                    "预测失败",
-                    "未在输入数据中找到可用于预测的数值特征。",
-                )
-                return {}
-            numeric_df = df[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-            feature_order = (
-                metadata.get("feature_columns")
-                or metadata.get("feature_order")
-                or list(numeric_df.columns)
+            else:
+                numeric_df = df.select_dtypes(include=["number"])
+                if numeric_df.empty:
+                    raise ValueError("输入数据中没有可用的数值特征列。")
+                feature_df_raw = numeric_df
+                align_info = {
+                    "feature_order": list(feature_df_raw.columns),
+                    "missing_filled": set(),
+                }
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(
+                parent_widget,
+                "特征列不匹配",
+                str(exc),
             )
-            feature_df_raw = numeric_df.reindex(columns=feature_order, fill_value=0.0)
-            align_info = {
-                "feature_order": feature_order,
-                "missing_filled": {col for col in feature_order if col not in numeric_df.columns},
-            }
+            return {}
+
+        self._selected_model_key = model_key
+        self._selected_metadata = metadata
+        self._selected_metadata_path = metadata_path
+        self._selected_pipeline_path = pipeline_path
 
         messages: List[str] = []
         if source and source not in {"selected", "override"}:
