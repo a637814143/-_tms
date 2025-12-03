@@ -1587,6 +1587,66 @@ def detect_pcap_with_model(
     return _build_detection_result(model, feature_names, label_mapping, flows, pcap_path)
 
 
+def _infer_supervised_feature_columns(df: "pd.DataFrame", label_col: str) -> List[str]:
+    """
+    根据当前数据自动选择用于有监督训练的特征列：
+    1. 如果检测到是 CICIDS 风格（项目内置 numeric_feature_names 都在） -> 用 numeric_feature_names 顺序
+    2. 否则（如 UNSW-NB15）       -> 用所有数值列，排除标签 / id 等列
+    """
+
+    # 尝试走 CICIDS / 你现有 DP 的特征名方案
+    try:
+        cicids_names = list(numeric_feature_names())
+    except Exception:
+        cicids_names = []
+
+    if cicids_names:
+        present = [name for name in cicids_names if name in df.columns]
+        # 如果大部分内置特征名都能对上，就认为是 CICIDS 风格
+        if len(present) >= max(5, len(cicids_names) // 3):
+            logger.info(
+                "检测到 CICIDS/本项目风格特征，使用 numeric_feature_names() 中的列，共 %d 个。",
+                len(present),
+            )
+            return present
+
+    # 走到这里，多半是 UNSW 或其他外部数据集：按数值列自动选
+    drop_cols = set()
+
+    # 真实标签列（大小写不敏感）
+    drop_cols.add(label_col)
+    # 常见标签 / 类别列一律排除
+    for name in df.columns:
+        norm = _normalise_label_name(name)
+        if norm in {
+            "label",
+            "labelbinary",
+            "attack_cat",
+            "attackcat",
+            "class",
+            "category",
+        }:
+            drop_cols.add(name)
+
+    # id 这种纯索引列一般也不当特征
+    for candidate in ("id", "index", "row_id"):
+        if candidate in df.columns:
+            drop_cols.add(candidate)
+
+    # 只保留数值 / 布尔列
+    numeric_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
+    feature_columns = [c for c in numeric_cols if c not in drop_cols]
+
+    if not feature_columns:
+        raise ValueError("无法从数据中自动识别任何数值特征列，请检查 CSV 中的列类型。")
+
+    logger.info(
+        "检测到通用/UNSW 风格特征，自动从数值列中选择 %d 个特征。",
+        len(feature_columns),
+    )
+    return feature_columns
+
+
 def train_supervised_on_split(
     split_dir: Union[str, Path],
     results_dir: Optional[Union[str, Path]] = None,
@@ -1667,9 +1727,9 @@ def train_supervised_on_split(
     else:
         y = raw_labels.astype(int)
 
-    feature_columns = list(numeric_feature_names())
-    feature_df = full_df.reindex(columns=feature_columns, fill_value=0.0)
-    feature_df = feature_df.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    # ★ 改成自动识别特征列：CICIDS 用 numeric_feature_names，UNSW 用数值列
+    feature_columns = _infer_supervised_feature_columns(full_df, matched_label_col)
+    feature_df = full_df[feature_columns].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
     X = feature_df.to_numpy(dtype=np.float64, copy=False)
     y_arr = y.to_numpy(dtype=np.int64, copy=False)
@@ -1696,24 +1756,24 @@ def train_supervised_on_split(
     # 分类结果
     y_pred = clf.predict(X_test)
 
-    # ★ 计算 ROC-AUC：用“正类（1）的概率”做评分
-    try:
-        if hasattr(clf, "predict_proba"):
-            y_score = clf.predict_proba(X_test)[:, 1]
-        else:
-            # 某些模型没有 predict_proba，就用 decision_function
-            y_score = clf.decision_function(X_test)
-        roc_auc = float(roc_auc_score(y_test, y_score))
-    except Exception:
-        roc_auc = float("nan")
-
     metrics = {
         "accuracy": float(accuracy_score(y_test, y_pred)),
         "precision": float(precision_score(y_test, y_pred, zero_division=0)),
         "recall": float(recall_score(y_test, y_pred, zero_division=0)),
         "f1": float(f1_score(y_test, y_pred, zero_division=0)),
-        "roc_auc": roc_auc,
     }
+
+    # ★ 计算 ROC-AUC（针对测试集）
+    try:
+        # 利用已有的“正类得分”逻辑计算概率 / 分数
+        scores_test, _ = _predict_positive_scores(
+            clf,
+            X_test,
+            label_mapping={0: "BENIGN", 1: "MALICIOUS"},
+        )
+        metrics["roc_auc"] = float(roc_auc_score(y_test, scores_test))
+    except Exception:
+        metrics["roc_auc"] = float("nan")
 
     print("y_test 分布:", np.bincount(y_test))
     print("y_pred 分布:", np.bincount(y_pred))
@@ -1725,7 +1785,7 @@ def train_supervised_on_split(
         metrics["precision"],
         metrics["recall"],
         metrics["f1"],
-        float(metrics.get("roc_auc", float("nan"))),
+        metrics.get("roc_auc", float("nan")),
     )
 
     # ★ 移到这里：确定模型保存位置

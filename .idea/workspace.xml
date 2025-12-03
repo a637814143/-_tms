@@ -75,7 +75,7 @@
     ]
   }
 }</component>
-  <component name="RunManager" selected="Python.ui_main">
+  <component name="RunManager" selected="Python.新建 文本文档 (2)">
     <configuration name="新建 文本文档 (2)" type="PythonConfigurationType" factoryName="Python" temporary="true" nameIsGenerated="true">
       <module name="pythonProject8" />
       <option name="ENV_FILES" value="" />
@@ -195,10 +195,10 @@
     </list>
     <recent_temporary>
       <list>
+        <item itemvalue="Python.新建 文本文档 (2)" />
         <item itemvalue="Python.ui_main" />
         <item itemvalue="Python.1" />
         <item itemvalue="Python.tt" />
-        <item itemvalue="Python.新建 文本文档 (2)" />
         <item itemvalue="Python.main" />
       </list>
     </recent_temporary>
@@ -218,14 +218,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1754543842572</updated>
-    </task>
-    <task id="LOCAL-00084" summary="8888">
-      <option name="closed" value="true" />
-      <created>1763003744686</created>
-      <option name="number" value="00084" />
-      <option name="presentableId" value="LOCAL-00084" />
-      <option name="project" value="LOCAL" />
-      <updated>1763003744686</updated>
     </task>
     <task id="LOCAL-00085" summary="8888">
       <option name="closed" value="true" />
@@ -611,7 +603,15 @@
       <option name="project" value="LOCAL" />
       <updated>1764747736571</updated>
     </task>
-    <option name="localTasksCounter" value="133" />
+    <task id="LOCAL-00133" summary="8888">
+      <option name="closed" value="true" />
+      <created>1764750560170</created>
+      <option name="number" value="00133" />
+      <option name="presentableId" value="LOCAL-00133" />
+      <option name="project" value="LOCAL" />
+      <updated>1764750560170</updated>
+    </task>
+    <option name="localTasksCounter" value="134" />
     <servers />
   </component>
   <component name="UnknownFeatures">
