@@ -1693,13 +1693,26 @@ def train_supervised_on_split(
     clf = HistGradientBoostingClassifier(**params)
     clf.fit(X_train, y_train)
 
+    # 分类结果
     y_pred = clf.predict(X_test)
+
+    # ★ 计算 ROC-AUC：用“正类（1）的概率”做评分
+    try:
+        if hasattr(clf, "predict_proba"):
+            y_score = clf.predict_proba(X_test)[:, 1]
+        else:
+            # 某些模型没有 predict_proba，就用 decision_function
+            y_score = clf.decision_function(X_test)
+        roc_auc = float(roc_auc_score(y_test, y_score))
+    except Exception:
+        roc_auc = float("nan")
 
     metrics = {
         "accuracy": float(accuracy_score(y_test, y_pred)),
         "precision": float(precision_score(y_test, y_pred, zero_division=0)),
         "recall": float(recall_score(y_test, y_pred, zero_division=0)),
         "f1": float(f1_score(y_test, y_pred, zero_division=0)),
+        "roc_auc": roc_auc,
     }
 
     print("y_test 分布:", np.bincount(y_test))
@@ -1707,11 +1720,12 @@ def train_supervised_on_split(
     print("混淆矩阵:\n", confusion_matrix(y_test, y_pred))
 
     logger.info(
-        "模型评估指标 accuracy=%.4f precision=%.4f recall=%.4f f1=%.4f",
+        "模型评估指标 accuracy=%.4f precision=%.4f recall=%.4f f1=%.4f roc_auc=%.4f",
         metrics["accuracy"],
         metrics["precision"],
         metrics["recall"],
         metrics["f1"],
+        float(metrics.get("roc_auc", float("nan"))),
     )
 
     # ★ 移到这里：确定模型保存位置
