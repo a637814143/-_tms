@@ -1603,6 +1603,11 @@ def train_supervised_on_split(
     can stay unchanged while switching the underlying model family.
     """
 
+    # ★ 新增：集成相关的配置（一定要在 _filter_estimator_params 之前 pop 出来）
+    max_members_raw = kwargs.pop("max_ensemble_members", None)
+    ensemble_weight_metric_raw = kwargs.pop("ensemble_weight_metric", None)
+    reset_ensemble_flag = kwargs.pop("reset_ensemble", None)
+
     if pd is None:
         raise RuntimeError("训练流程需要 pandas 依赖，请先安装相关依赖。")
 
@@ -1709,24 +1714,120 @@ def train_supervised_on_split(
         metrics["f1"],
     )
 
-    clf.fit(X, y_arr)
-
-    label_mapping = {0: "BENIGN", 1: "MALICIOUS"}
-
+    # ★ 移到这里：确定模型保存位置
     models_root = Path(models_dir) if models_dir else split_path
     models_root.mkdir(parents=True, exist_ok=True)
     model_path = models_root / "model.joblib"
 
+    # ★ 用全部数据再训练一次，用于真正保存的模型
+    clf.fit(X, y_arr)
+
+    # ★ 集成：加载旧的 ensemble 成员（第一次训练时这里返回空）
+    existing_members, existing_metric = _load_existing_ensemble(model_path)
+
+    # 本次训练的样本数，用来计算权重
+    sample_count = int(X.shape[0])
+    # 用测试集的 F1 作为本次成员的质量指标
+    ensemble_metrics_map = {"train_f1_weighted": float(metrics["f1"])}
+
+    # 解析集成配置
+    try:
+        max_members = (
+            int(max_members_raw) if max_members_raw is not None else DEFAULT_MAX_ENSEMBLE_MEMBERS
+        )
+    except (TypeError, ValueError):
+        max_members = DEFAULT_MAX_ENSEMBLE_MEMBERS
+    max_members = max(1, max_members)
+
+    requested_metric = None
+    if ensemble_weight_metric_raw is not None:
+        requested_metric = str(ensemble_weight_metric_raw)
+    elif existing_metric is not None:
+        requested_metric = str(existing_metric)
+    weight_metric = _normalized_weight_metric(requested_metric)
+
+    reset_ensemble = bool(reset_ensemble_flag)
+
+    # 保留老成员 + 控制最大成员数
+    retained_members = list(existing_members)
+    total_dropped = 0
+
+    if reset_ensemble and retained_members:
+        total_dropped += len(retained_members)
+        retained_members = []
+
+    if max_members <= 1:
+        total_dropped += len(retained_members)
+        retained_members = []
+    else:
+        allowed_previous = max_members - 1
+        if len(retained_members) > allowed_previous:
+            drop_count = len(retained_members) - allowed_previous
+            total_dropped += drop_count
+            retained_members = retained_members[-allowed_previous:]
+
+    trained_at = datetime.now().isoformat(timespec="seconds")
+    member_weight = _compute_member_weight(
+        weight_metric, sample_count, ensemble_metrics_map
+    )
+
+    new_member: Dict[str, Any] = {
+        "estimator": clf,
+        "weight": member_weight,
+        "trained_at": trained_at,
+        "training_samples": sample_count,
+        "metrics": ensemble_metrics_map,
+    }
+    if reset_ensemble:
+        new_member["reset"] = True
+
+    ensemble_members = retained_members + [new_member]
+
+    # 构建真正用于预测的集成模型
+    estimators = [item["estimator"] for item in ensemble_members]
+    weights = [
+        EnsembleVotingClassifier._sanitize_weight(item.get("weight"))
+        for item in ensemble_members
+    ]
+    estimator_metadata: List[Dict[str, Any]] = []
+    for item in ensemble_members:
+        meta = {k: v for k, v in item.items() if k not in {"estimator", "weight"}}
+        estimator_metadata.append(meta)
+
+    ensemble_model = EnsembleVotingClassifier(
+        estimators,
+        voting="soft",
+        weights=weights,
+        metadata=estimator_metadata,
+        weight_metric=weight_metric,
+    )
+
+    ensemble_info = {
+        "members": ensemble_members,
+        "max_members": max_members,
+        "weight_metric": weight_metric,
+        "updated_at": trained_at,
+        "reset": bool(reset_ensemble),
+    }
+
+    # 标签映射跟之前一样
+    label_mapping = {0: "BENIGN", 1: "MALICIOUS"}
+
+    # ★ 保存的是“集成模型”而不是单个 clf
     pipeline_payload = {
-        "model": clf,
+        "model": ensemble_model,
         "feature_names": feature_columns,
         "label_mapping": label_mapping,
+        "ensemble": ensemble_info,
     }
     dump(pipeline_payload, model_path)
 
     timestamp = datetime.now()
     timestamp_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
     stamp_token = timestamp.strftime("%Y%m%d_%H%M%S")
+
+    ensemble_count = len(ensemble_members)
+    retained_count = max(ensemble_count - 1, 0)
 
     metadata: Dict[str, object] = {
         "schema_version": MODEL_SCHEMA_VERSION,
@@ -1745,7 +1846,12 @@ def train_supervised_on_split(
         "positive_label": "MALICIOUS",
         "n_samples": int(X.shape[0]),
         "n_features": int(X.shape[1]),
-        "ensemble_members": 1,
+        "ensemble_members": int(ensemble_count),
+        "ensemble_added": 1,
+        "ensemble_retained": int(retained_count),
+        "ensemble_dropped": int(total_dropped),
+        "ensemble_weight_metric": weight_metric,
+        "ensemble_max_members": int(max_members),
     }
 
     metadata["model_metrics"] = metrics
