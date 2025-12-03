@@ -2551,28 +2551,37 @@ class Ui_MainWindow(object):
             return lambda key=key: str(PATHS[key])
         raise AttributeError(name)
 
-    def _get_selected_model_path(self) -> str:
+    def _get_selected_model_path(self) -> Tuple[Path, Optional[Path]]:
         """
-        根据当前 UI 选择的模型类型，返回对应的模型文件路径。
+        根据当前 UI 选择的模型类型（CICIDS / UNSW）返回对应的 model.joblib 和元数据路径。
+        如果对应子目录下不存在模型，则回退到旧的 data/models/model.joblib。
         """
 
-        base_dir = self._default_models_dir()
-        profile = None
+        base_models_dir = PATHS["models"]
+
+        profile_key = "cicids"
         combo = getattr(self, "model_profile_combo", None)
         if isinstance(combo, QtWidgets.QComboBox):
-            profile = combo.currentData()
+            data = combo.currentData()
+            if isinstance(data, str) and data.strip():
+                profile_key = data.strip().lower()
 
-        if profile == "unsw":
-            filename = "model_unsw.joblib"
-        else:
-            filename = "model_cicids.joblib"
+        models_dir = base_models_dir / profile_key
 
-        path = os.path.join(base_dir, filename)
-        if not os.path.exists(path):
-            legacy = os.path.join(base_dir, "model.joblib")
-            if os.path.exists(legacy):
-                return legacy
-        return path
+        pipeline_path = models_dir / "model.joblib"
+        metadata_path = models_dir / "latest_iforest_metadata.json"
+
+        if not pipeline_path.exists():
+            legacy_model = base_models_dir / "model.joblib"
+            legacy_meta = base_models_dir / "latest_iforest_metadata.json"
+            if legacy_model.exists():
+                pipeline_path = legacy_model
+                metadata_path = legacy_meta
+
+        if not metadata_path.exists():
+            metadata_path = None
+
+        return pipeline_path, metadata_path
 
     def _refresh_model_versions(self):
         if not hasattr(self, "model_combo"):
@@ -4377,8 +4386,25 @@ class Ui_MainWindow(object):
         else:
             model_profile = "cicids"
 
-        res_dir = self._default_results_dir()
-        mdl_dir = self._default_models_dir()
+        profile_combo = getattr(self, "model_profile_combo", None)
+        if isinstance(profile_combo, QtWidgets.QComboBox):
+            idx = profile_combo.findData(model_profile)
+            if idx >= 0:
+                profile_combo.setCurrentIndex(idx)
+
+        profile = None
+        if isinstance(profile_combo, QtWidgets.QComboBox):
+            data = profile_combo.currentData()
+            if isinstance(data, str):
+                profile = data.lower()
+
+        if profile not in {"cicids", "unsw"}:
+            profile = "cicids"
+
+        base_models_dir = PATHS["models"]
+        mdl_dir = base_models_dir / profile
+
+        res_dir = PATHS["results"]
         os.makedirs(res_dir, exist_ok=True)
         os.makedirs(mdl_dir, exist_ok=True)
 
@@ -5056,21 +5082,27 @@ class Ui_MainWindow(object):
             return messages
 
         explicit_bundle: Optional[dict] = None
-        selected_model_path = self._get_selected_model_path()
+        selected_model_path, selected_metadata_path = self._get_selected_model_path()
         metadata_override = (
             dict(metadata_override) if isinstance(metadata_override, dict) else metadata_override
         )
         if selected_model_path and os.path.exists(selected_model_path):
-            metadata_path = f"{selected_model_path}.json"
-            loaded_metadata = _load_metadata_from_json(metadata_path)
+            metadata_path_str = (
+                str(selected_metadata_path) if selected_metadata_path else None
+            )
+            loaded_metadata = (
+                _load_metadata_from_json(metadata_path_str) if metadata_path_str else {}
+            )
             metadata_obj = dict(loaded_metadata) if isinstance(loaded_metadata, dict) else {}
             if isinstance(metadata_override, dict):
                 metadata_obj.update(metadata_override)
 
             explicit_bundle = {
                 "metadata": metadata_obj,
-                "metadata_path": metadata_path if os.path.exists(metadata_path) else None,
-                "pipeline_path": selected_model_path,
+                "metadata_path": metadata_path_str
+                if metadata_path_str and os.path.exists(metadata_path_str)
+                else None,
+                "pipeline_path": str(selected_model_path),
                 "feature_order": metadata_obj.get("feature_columns")
                 or metadata_obj.get("feature_order"),
                 "allowed_extra": self._prediction_allowed_extras(metadata_obj),
@@ -5113,15 +5145,21 @@ class Ui_MainWindow(object):
         input_numeric_cols = df.select_dtypes(include=["number", "bool"]).columns.tolist()
         input_feature_count = len(input_numeric_cols)
 
-        if expected_features is not None and input_feature_count != expected_features:
+        if expected_features is not None and input_feature_count < expected_features:
             QtWidgets.QMessageBox.warning(
                 self._parent_widget(),
                 "特征数量不匹配",
                 f"当前模型期望 {expected_features} 个数值特征，"
-                f"但输入数据中检测到 {input_feature_count} 个。\n\n"
-                f"请确认使用了正确的模型类型（CICIDS / UNSW）和数据格式。",
+                f"但输入数据中只检测到 {input_feature_count} 个。\n"
+                "这通常表示选择了错误的模型类型（CICIDS / UNSW）或者数据缺少必要特征。",
             )
             return {}
+        elif expected_features is not None and input_feature_count > expected_features:
+            logger.info(
+                "输入数据包含 %d 个数值特征，多于模型期望的 %d 个，多余列将在对齐时被忽略。",
+                input_feature_count,
+                expected_features,
+            )
 
         # 记录所选模型，确保后续操作保持一致
         if metadata_path:
