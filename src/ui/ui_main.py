@@ -2624,9 +2624,7 @@ class Ui_MainWindow(object):
         models_dir = self._active_models_dir()
         models_dir.mkdir(parents=True, exist_ok=True)
 
-        def _register_model(key: str, model_dir: Path) -> None:
-            pipeline_path = model_dir / "model.joblib"
-            meta_path = model_dir / "latest_iforest_metadata.json"
+        def _register_model(key: str, pipeline_path: Path, meta_path: Path) -> None:
             if not (pipeline_path.is_file() and meta_path.is_file()):
                 return
             try:
@@ -2643,7 +2641,21 @@ class Ui_MainWindow(object):
 
         profile_key = self._current_model_key() or "cicids_pcap_latest"
 
-        _register_model(profile_key, models_dir)
+        profile_token = "unsw" if profile_key.startswith("unsw") else "cicids"
+        pipeline_candidates = [
+            models_dir / "model.joblib",
+            models_dir / f"model_{profile_token}.joblib",
+        ]
+        meta_candidates = [
+            models_dir / "latest_iforest_metadata.json",
+            models_dir / f"latest_iforest_metadata_{profile_token}.json",
+        ]
+
+        pipeline_path = next((path for path in pipeline_candidates if path.is_file()), None)
+        meta_path = next((path for path in meta_candidates if path.is_file()), None)
+
+        if pipeline_path and meta_path:
+            _register_model(profile_key, pipeline_path, meta_path)
 
         if isinstance(getattr(self, "model_combo", None), QtWidgets.QComboBox):
             self.model_combo.blockSignals(True)
@@ -2849,6 +2861,19 @@ class Ui_MainWindow(object):
             )
 
         seen_paths: Set[str] = set()
+
+        profile_token = models_dir.name.lower()
+        specific_latest_meta = models_dir / f"latest_iforest_metadata_{profile_token}.json"
+        if specific_latest_meta.exists():
+            resolved = str(specific_latest_meta.resolve())
+            if resolved not in seen_paths:
+                try:
+                    with open(specific_latest_meta, "r", encoding="utf-8") as fh:
+                        metadata = json.load(fh)
+                except Exception:
+                    metadata = None
+                _register_candidate(metadata, resolved, None, 2, "latest_profile")
+                seen_paths.add(resolved)
 
         if isinstance(metadata_override, dict):
             override_path = metadata_override.get("metadata_path")
@@ -5086,11 +5111,46 @@ class Ui_MainWindow(object):
         if isinstance(metadata_override, dict):
             metadata.update(metadata_override)
 
-        if not pipeline_path:
+        model_type_text = ""
+        profile_label = "CICIDS / PCAP 模型"
+        combo = getattr(self, "model_profile_combo", None)
+        if isinstance(combo, QtWidgets.QComboBox):
+            try:
+                model_type_text = combo.currentText().strip()
+                if model_type_text:
+                    profile_label = model_type_text
+            except Exception:
+                model_type_text = ""
+
+        profile_token = "unsw" if "unsw" in model_type_text.lower() else "cicids"
+        expected_feature_count = 39 if profile_token == "unsw" else 80
+        models_base = Path(PATHS["models"])
+        profile_dir = models_base / profile_token
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        preferred_model_path = profile_dir / f"model_{profile_token}.joblib"
+        preferred_meta_path = profile_dir / f"latest_iforest_metadata_{profile_token}.json"
+
+        if preferred_model_path.exists():
+            pipeline_path = str(preferred_model_path)
+        if preferred_meta_path.exists():
+            try:
+                with preferred_meta_path.open("r", encoding="utf-8") as fh:
+                    metadata_from_disk = json.load(fh)
+            except Exception:
+                metadata_from_disk = {}
+            if isinstance(metadata_from_disk, dict):
+                metadata.update(metadata_from_disk)
+                metadata_path = str(preferred_meta_path)
+
+        self.display_result(f"[INFO] 当前加载模型类型：{profile_label}")
+        if pipeline_path:
+            self.display_result(f"[INFO] 模型文件：{os.path.basename(pipeline_path)}")
+
+        if not pipeline_path or not os.path.exists(pipeline_path):
             QtWidgets.QMessageBox.warning(
                 parent_widget,
                 "预测失败",
-                "未找到与所选特征CSV匹配的模型，请先训练对应的模型。",
+                f"未找到与所选特征 CSV 匹配的模型：{preferred_model_path}\n请先训练该类型模型。",
             )
             return {}
 
@@ -5132,6 +5192,18 @@ class Ui_MainWindow(object):
                 str(exc),
             )
             return {}
+
+        if expected_feature_count is not None:
+            feature_count = feature_df_raw.shape[1]
+            self.display_result(f"[INFO] 输入特征数量：{feature_count}")
+            if feature_count != expected_feature_count:
+                QtWidgets.QMessageBox.warning(
+                    parent_widget,
+                    "特征数量不匹配",
+                    f"当前模型期望 {expected_feature_count} 个数值特征，但输入数据中检测到 {feature_count} 个。\n"
+                    "请确认使用了正确的模型类型（CICIDS / UNSW）和数据格式。",
+                )
+                return {}
 
         self._selected_model_key = model_key
         self._selected_metadata = metadata
