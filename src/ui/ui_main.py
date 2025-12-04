@@ -2578,6 +2578,30 @@ class Ui_MainWindow(object):
         models_dir.mkdir(parents=True, exist_ok=True)
         return str(models_dir)
 
+    def _active_models_dir(self) -> Path:
+        """
+        根据右侧“预测模型类型”下拉框返回当前使用的模型目录。
+        CICIDS / PCAP -> data/models/cicids
+        UNSW CSV     -> data/models/unsw
+        """
+        base = Path(PATHS["models"])
+        profile = None
+
+        combo = getattr(self, "model_profile_combo", None)
+
+        if isinstance(combo, QtWidgets.QComboBox):
+            data = combo.currentData()
+            if isinstance(data, str):
+                profile = data.strip().lower()
+
+        if profile in ("unsw", "unsw_csv", "unsw-model"):
+            return base / "unsw"
+        elif profile in ("cicids", "cicids_pcap", "pcap-model"):
+            return base / "cicids"
+
+        # 兜底：还是用老的 models 根目录
+        return base
+
     def _current_model_key(self) -> Optional[str]:
         """
         根据右侧“预测模型类型”下拉框返回 _model_registry 用的 key。
@@ -2593,12 +2617,12 @@ class Ui_MainWindow(object):
 
     def _refresh_model_versions(self) -> None:
         """
-        扫描 models 目录，分别注册 CICIDS / PCAP 模型 和 UNSW CSV 模型。
+        扫描当前选定模型类型对应的目录，注册可用模型版本。
         """
         self._model_registry = {}
 
-        models_base = PATHS.get("models", DATA_BASE / "models")
-        models_base = Path(models_base)
+        models_dir = self._active_models_dir()
+        models_dir.mkdir(parents=True, exist_ok=True)
 
         def _register_model(key: str, model_dir: Path) -> None:
             pipeline_path = model_dir / "model.joblib"
@@ -2617,26 +2641,20 @@ class Ui_MainWindow(object):
                 "metadata": metadata,
             }
 
-        # 1) CICIDS / PCAP 模型（兼容老路径 + 新的 cicids 子目录）
-        cicids_dir = models_base / "cicids"
-        if cicids_dir.is_dir():
-            _register_model("cicids_pcap_latest", cicids_dir)
-        else:
-            _register_model("cicids_pcap_latest", models_base)
+        profile_key = self._current_model_key() or "cicids_pcap_latest"
 
-        # 2) UNSW CSV 模型
-        unsw_dir = models_base / "unsw"
-        if unsw_dir.is_dir():
-            _register_model("unsw_csv_latest", unsw_dir)
+        _register_model(profile_key, models_dir)
 
-        current_profile = None
-        combo = getattr(self, "model_profile_combo", None)
-        if isinstance(combo, QtWidgets.QComboBox):
-            current_profile = combo.currentData()
-        if current_profile == "unsw_csv" and "unsw_csv_latest" in self._model_registry:
-            self._selected_model_key = "unsw_csv_latest"
-        elif "cicids_pcap_latest" in self._model_registry:
-            self._selected_model_key = "cicids_pcap_latest"
+        if isinstance(getattr(self, "model_combo", None), QtWidgets.QComboBox):
+            self.model_combo.blockSignals(True)
+            self.model_combo.clear()
+            if profile_key in self._model_registry:
+                self.model_combo.addItem("最新模型", profile_key)
+                self.model_combo.setCurrentIndex(0)
+            self.model_combo.blockSignals(False)
+
+        if profile_key in self._model_registry:
+            self._selected_model_key = profile_key
         else:
             self._selected_model_key = None
 
@@ -2782,7 +2800,7 @@ class Ui_MainWindow(object):
             return None
 
         column_set = {col for col in df_columns}
-        models_dir = Path(self._default_models_dir())
+        models_dir = self._active_models_dir()
 
         candidates: List[dict] = []
 
