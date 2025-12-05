@@ -1141,7 +1141,9 @@ def _align_input_features(
             continue
         if column_norm.startswith("__") or column_norm.lower().startswith("unnamed:"):
             continue
-        extra_columns.append(column_norm)
+        # 在非严格模式下，只对齐模型所需特征，其他列直接忽略并且不提示
+        if strict:
+            extra_columns.append(column_norm)
     info["missing_filled"] = missing_columns
     info["extra_columns"] = extra_columns
     info["feature_order"] = feature_order
@@ -5201,7 +5203,7 @@ class Ui_MainWindow(object):
                 feature_df_raw, align_info = _align_input_features(
                     df,
                     metadata,
-                    strict=True,
+                    strict=False,
                     allow_extra=allowed_extra.union(
                         {"Label", "label", "LabelBinary", "attack_cat", "id"}
                     ),
@@ -5244,6 +5246,7 @@ class Ui_MainWindow(object):
         if source and source not in {"selected", "override"}:
             messages.append("已根据特征列自动匹配模型版本。")
         messages.append(f"使用模型管线: {os.path.basename(pipeline_path)}")
+        extras_detected = align_info.get("extra_columns") or []
         if extras_detected:
             sample = ", ".join(sorted(extras_detected)[:8])
             more = " ..." if len(extras_detected) > 8 else ""
