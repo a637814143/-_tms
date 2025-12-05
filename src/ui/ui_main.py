@@ -2652,7 +2652,18 @@ class Ui_MainWindow(object):
         ]
 
         pipeline_path = next((path for path in pipeline_candidates if path.is_file()), None)
+
+        # 一些模型目录会在 metadata 文件名中追加时间戳，例如
+        # latest_iforest_metadata_20251203_221437.json。为兼容这类命名，
+        # 这里在没有找到固定文件名时按修改时间回退查找匹配模式。
         meta_path = next((path for path in meta_candidates if path.is_file()), None)
+        if meta_path is None:
+            globbed = sorted(
+                models_dir.glob("latest_iforest_metadata*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            meta_path = globbed[0] if globbed else None
 
         if pipeline_path and meta_path:
             _register_model(profile_key, pipeline_path, meta_path)
@@ -5128,10 +5139,13 @@ class Ui_MainWindow(object):
         profile_dir = models_base / profile_token
         profile_dir.mkdir(parents=True, exist_ok=True)
         preferred_model_path = profile_dir / f"model_{profile_token}.joblib"
+        fallback_model_path = profile_dir / "model.joblib"
         preferred_meta_path = profile_dir / f"latest_iforest_metadata_{profile_token}.json"
 
         if preferred_model_path.exists():
             pipeline_path = str(preferred_model_path)
+        elif fallback_model_path.exists():
+            pipeline_path = str(fallback_model_path)
         if preferred_meta_path.exists():
             try:
                 with preferred_meta_path.open("r", encoding="utf-8") as fh:
@@ -5141,6 +5155,22 @@ class Ui_MainWindow(object):
             if isinstance(metadata_from_disk, dict):
                 metadata.update(metadata_from_disk)
                 metadata_path = str(preferred_meta_path)
+        elif metadata_path is None:
+            # 兼容带时间戳的 metadata 文件名（例如 latest_iforest_metadata_*.json）。
+            globbed = sorted(
+                profile_dir.glob("latest_iforest_metadata*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if globbed:
+                try:
+                    with globbed[0].open("r", encoding="utf-8") as fh:
+                        metadata_from_disk = json.load(fh)
+                except Exception:
+                    metadata_from_disk = {}
+                if isinstance(metadata_from_disk, dict):
+                    metadata.update(metadata_from_disk)
+                    metadata_path = str(globbed[0])
 
         self.display_result(f"[INFO] 当前加载模型类型：{profile_label}")
         if pipeline_path:
@@ -5171,7 +5201,7 @@ class Ui_MainWindow(object):
                 feature_df_raw, align_info = _align_input_features(
                     df,
                     metadata,
-                    strict=True,
+                    strict=False,
                     allow_extra=allowed_extra.union(
                         {"Label", "label", "LabelBinary", "attack_cat", "id"}
                     ),
@@ -5214,6 +5244,7 @@ class Ui_MainWindow(object):
         if source and source not in {"selected", "override"}:
             messages.append("已根据特征列自动匹配模型版本。")
         messages.append(f"使用模型管线: {os.path.basename(pipeline_path)}")
+        extras_detected = align_info.get("extra_columns") or []
         if extras_detected:
             sample = ", ".join(sorted(extras_detected)[:8])
             more = " ..." if len(extras_detected) > 8 else ""
