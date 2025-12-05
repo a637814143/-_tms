@@ -5201,7 +5201,7 @@ class Ui_MainWindow(object):
                 feature_df_raw, align_info = _align_input_features(
                     df,
                     metadata,
-                    strict=True,
+                    strict=False,
                     allow_extra=allowed_extra.union(
                         {"Label", "label", "LabelBinary", "attack_cat", "id"}
                     ),
@@ -5244,6 +5244,7 @@ class Ui_MainWindow(object):
         if source and source not in {"selected", "override"}:
             messages.append("已根据特征列自动匹配模型版本。")
         messages.append(f"使用模型管线: {os.path.basename(pipeline_path)}")
+        extras_detected = align_info.get("extra_columns") or []
         if extras_detected:
             sample = ", ".join(sorted(extras_detected)[:8])
             more = " ..." if len(extras_detected) > 8 else ""
