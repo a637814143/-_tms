@@ -1141,7 +1141,9 @@ def _align_input_features(
             continue
         if column_norm.startswith("__") or column_norm.lower().startswith("unnamed:"):
             continue
-        extra_columns.append(column_norm)
+        # 在非严格模式下，只对齐模型所需特征，其他列直接忽略并且不提示
+        if strict:
+            extra_columns.append(column_norm)
     info["missing_filled"] = missing_columns
     info["extra_columns"] = extra_columns
     info["feature_order"] = feature_order
