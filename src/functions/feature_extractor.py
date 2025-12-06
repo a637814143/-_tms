@@ -116,12 +116,24 @@ def extract_pcap_features(
     progress_callback = progress_callback or (lambda *_: None)
 
     try:
-        flows = extract_flow_features(pcap_path)
+        packet_stats: Dict[str, int] = {}
+        flows = extract_flow_features(pcap_path, stats=packet_stats)
+        warnings: List[str] = []
+
+        if packet_stats.get("parsed_packets", 0) == 0:
+            warnings.append("未能从 PCAP 中解析出任何数据包，文件可能为空或格式不兼容。")
+        elif packet_stats.get("dropped_packets", 0):
+            warnings.append(
+                f"有 {packet_stats['dropped_packets']} 个数据包在解析时被跳过，预测可靠性可能受影响。"
+            )
+
         progress_callback(100)
         return {
             "success": True,
             "path": str(pcap_path),
             "flows": flows,
+            "packet_stats": packet_stats,
+            "warnings": warnings,
         }
     except Exception as exc:  # pragma: no cover - defensive by design
         progress_callback(100)

@@ -628,6 +628,9 @@ class DetectionResult:
     fusion_threshold: Optional[float] = None
     fusion_weights: Optional[Dict[str, float]] = None
     rule_profile: Optional[str] = None
+    feature_coverage: Optional[Dict[str, object]] = None
+    extraction_warnings: Optional[List[str]] = None
+    packet_stats: Optional[Dict[str, int]] = None
 
 
 DEFAULT_MODEL_PARAMS: Dict[str, Union[int, float, None]] = {
@@ -1192,13 +1195,23 @@ def _build_detection_result(
     vectorized: Optional[VectorizationResult] = None,
     predictions: Optional[Sequence[object]] = None,
     scores: Optional[Sequence[float]] = None,
+    extraction_warnings: Optional[List[str]] = None,
+    packet_stats: Optional[Dict[str, int]] = None,
 ) -> DetectionResult:
     if vectorized is None:
         vectorized = vectorize_flows(
             flows, feature_names=feature_names, include_labels=False
         )
 
+    feature_coverage: Optional[Dict[str, object]] = None
     if vectorized.flow_count == 0:
+        if feature_names:
+            feature_coverage = {
+                "feature_count": len(feature_names),
+                "average_coverage_ratio": 0.0,
+                "missing_feature_counts": [],
+                "available_feature_counts": [],
+            }
         return DetectionResult(
             path=Path(path),
             success=True,
@@ -1208,6 +1221,9 @@ def _build_detection_result(
             scores=[],
             flows=[],
             prediction_labels=[],
+            feature_coverage=feature_coverage,
+            extraction_warnings=extraction_warnings,
+            packet_stats=packet_stats,
         )
 
     X = vectorized.matrix
@@ -1433,6 +1449,13 @@ def _build_detection_result(
         fusion_weight_model = float(fusion_model_weight_base) / total_weight
         fusion_weight_rules = float(fusion_rule_weight_base) / total_weight
 
+    feature_coverage = {
+        "feature_count": vectorized.feature_count,
+        "average_coverage_ratio": vectorized.coverage_ratio,
+        "missing_feature_counts": vectorized.missing_feature_counts,
+        "available_feature_counts": vectorized.available_feature_counts,
+    }
+
     return DetectionResult(
         path=Path(path),
         success=True,
@@ -1457,6 +1480,9 @@ def _build_detection_result(
             "rules": fusion_weight_rules,
         },
         rule_profile=rule_profile,
+        feature_coverage=feature_coverage,
+        extraction_warnings=extraction_warnings,
+        packet_stats=packet_stats,
     )
 
 
@@ -1584,7 +1610,15 @@ def detect_pcap_with_model(
         )
 
     flows = [dict(flow) for flow in result.get("flows", [])]
-    return _build_detection_result(model, feature_names, label_mapping, flows, pcap_path)
+    return _build_detection_result(
+        model,
+        feature_names,
+        label_mapping,
+        flows,
+        pcap_path,
+        extraction_warnings=result.get("warnings"),
+        packet_stats=result.get("packet_stats"),
+    )
 
 
 def _infer_supervised_feature_columns(df: "pd.DataFrame", label_col: str) -> List[str]:
