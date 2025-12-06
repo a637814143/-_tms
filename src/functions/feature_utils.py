@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
+import logging
 import socket
 import statistics
 
@@ -318,19 +319,31 @@ PCAPNG_HEADER_MAGIC = b"\x0a\x0d\x0d\x0a"
 
 
 def _try_read_pcap(path: Path) -> Iterator[Tuple[float, bytes]]:
+    """Yield raw packets from a pcap/pcapng file with basic resilience."""
+
     with path.open("rb") as fh:
         header = fh.read(4)
         fh.seek(0)
 
-        if header in PCAP_HEADER_MAGIC:
-            reader: Iterator[Tuple[float, bytes]] = dpkt.pcap.Reader(fh)
-        elif header == PCAPNG_HEADER_MAGIC:
-            reader = dpkt.pcapng.Reader(fh)
-        else:  # pragma: no cover - defensive branch for unknown formats
-            raise ValueError("Unsupported PCAP header signature; expected PCAP or PCAPNG data")
+        try:
+            if header in PCAP_HEADER_MAGIC:
+                reader: Iterator[Tuple[float, bytes]] = dpkt.pcap.Reader(fh)
+            elif header == PCAPNG_HEADER_MAGIC:
+                reader = dpkt.pcapng.Reader(fh)
+            else:  # pragma: no cover - defensive branch for unknown formats
+                raise ValueError("Unsupported PCAP header signature; expected PCAP or PCAPNG data")
+        except (ValueError, dpkt.NeedData, OSError) as exc:
+            raise ValueError(f"无法解析 PCAP 文件（{path}）：{exc}") from exc
 
-        for timestamp, buf in reader:
-            yield timestamp, buf
+        dropped_packets = 0
+        try:
+            for timestamp, buf in reader:
+                yield timestamp, buf
+        except (dpkt.NeedData, EOFError, ValueError) as exc:
+            logging.warning("PCAP %s 读取中断，可能文件被截断：%s", path, exc)
+            dropped_packets += 1
+        if dropped_packets:
+            logging.info("PCAP %s 有 %d 个包被跳过", path, dropped_packets)
 
 
 def _packet_from_buf(timestamp: float, buf: bytes) -> Optional[PacketInfo]:
@@ -403,13 +416,26 @@ def _packet_from_buf(timestamp: float, buf: bytes) -> Optional[PacketInfo]:
     )
 
 
-def iterate_packets(path: Path) -> Iterator[PacketInfo]:
+def iterate_packets(path: Path, stats: Optional[Dict[str, int]] = None) -> Iterator[PacketInfo]:
     """Iterate packets from a pcap file as :class:`PacketInfo` objects."""
 
+    counters = stats if stats is not None else {}
+    counters.setdefault("parsed_packets", 0)
+    counters.setdefault("dropped_packets", 0)
+
     for timestamp, buf in _try_read_pcap(path):
-        packet = _packet_from_buf(timestamp, buf)
-        if packet is not None:
-            yield packet
+        try:
+            packet = _packet_from_buf(timestamp, buf)
+        except Exception:  # pragma: no cover - defensive fallback
+            counters["dropped_packets"] += 1
+            continue
+
+        if packet is None:
+            counters["dropped_packets"] += 1
+            continue
+
+        counters["parsed_packets"] += 1
+        yield packet
 
 
 def build_flows(packets: Iterable[PacketInfo]) -> Dict[str, FlowAccumulator]:
@@ -620,8 +646,15 @@ def flow_to_feature_dict(flow: FlowAccumulator) -> Dict[str, object]:
     }
 
 
-def extract_flow_features(pcap_path: Path) -> List[Dict[str, object]]:
+def extract_flow_features(
+    pcap_path: Path, *, stats: Optional[Dict[str, int]] = None
+) -> List[Dict[str, object]]:
     """Read a PCAP file and return flow features for each bidirectional stream."""
 
-    flows = build_flows(iterate_packets(pcap_path))
+    packet_stats: Dict[str, int] = {"parsed_packets": 0, "dropped_packets": 0}
+    flows = build_flows(iterate_packets(pcap_path, packet_stats))
+
+    if stats is not None:
+        stats.update(packet_stats)
+
     return [flow_to_feature_dict(flow) for flow in flows.values()]

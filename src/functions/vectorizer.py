@@ -389,6 +389,9 @@ class VectorizationResult:
     matrix: np.ndarray
     labels: Optional[np.ndarray]
     feature_names: List[str]
+    missing_feature_counts: List[int]
+    available_feature_counts: List[int]
+    coverage_ratio: float
 
     @property
     def flow_count(self) -> int:
@@ -508,14 +511,25 @@ def vectorize_flows(
     matrix = np.zeros((len(flow_list), len(feature_keys)), dtype=dtype)
     label_values: List[int] = []
     has_missing_labels = not include_labels
+    missing_feature_counts: List[int] = []
+    available_feature_counts: List[int] = []
 
     for row_index, flow in enumerate(flow_list):
+        missing_count = 0
+        available_count = 0
         for col_index, key in enumerate(feature_keys):
             value = flow.get(key, 0.0)
+            present = key in flow and flow.get(key) is not None
             try:
                 matrix[row_index, col_index] = float(value)
             except (TypeError, ValueError):
                 matrix[row_index, col_index] = 0.0
+                present = False
+
+            if present:
+                available_count += 1
+            else:
+                missing_count += 1
 
         if include_labels:
             label = flow.get("Label")
@@ -531,6 +545,9 @@ def vectorize_flows(
                 except (TypeError, ValueError):
                     has_missing_labels = True
 
+        missing_feature_counts.append(missing_count)
+        available_feature_counts.append(available_count)
+
     labels: Optional[np.ndarray]
     if has_missing_labels:
         labels = None
@@ -539,7 +556,19 @@ def vectorize_flows(
         if labels.size != matrix.shape[0]:
             labels = None
 
-    return VectorizationResult(matrix=matrix, labels=labels, feature_names=list(feature_keys))
+    coverage_ratio = 0.0
+    if feature_keys:
+        coverage_values = [count / len(feature_keys) for count in available_feature_counts]
+        coverage_ratio = float(np.mean(coverage_values)) if coverage_values else 0.0
+
+    return VectorizationResult(
+        matrix=matrix,
+        labels=labels,
+        feature_names=list(feature_keys),
+        missing_feature_counts=missing_feature_counts,
+        available_feature_counts=available_feature_counts,
+        coverage_ratio=coverage_ratio,
+    )
 
 
 def _create_progress_bar(desc: str, unit: str, show: bool):
