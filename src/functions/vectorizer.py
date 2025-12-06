@@ -157,6 +157,12 @@ _COLUMN_ALIASES: Dict[str, str] = {
     "dbytes": "Total Length of Bwd Packets",
 }
 
+# 反向映射：方便在模型特征是 UNSW 列名（如 dur/sbytes）时，
+# 让流量特征中的 CICIDS 列（Flow Duration 等）自动填充对应的别名。
+_REVERSE_COLUMN_ALIASES: Dict[str, List[str]] = {}
+for alias, canonical in _COLUMN_ALIASES.items():
+    _REVERSE_COLUMN_ALIASES.setdefault(canonical, []).append(alias)
+
 ProgressCallback = Optional[Callable[[int], None]]
 FeatureSource = Union[str, Sequence[str]]
 _DATASET_META_TYPE = "merged_feature_dataset"
@@ -194,6 +200,54 @@ def available_feature_keys(flows: Iterable[Dict[str, object]]) -> List[str]:
                 continue
             keys.add(str(key))
     return sorted(keys)
+
+
+def augment_flows_with_aliases(
+    flows: Iterable[Dict[str, object]], feature_names: Optional[Sequence[str]] = None
+) -> List[Dict[str, object]]:
+    """为流量特征补充已知的 UNSW/CIC 列别名，提升重叠率。
+
+    - 如果模型特征是 UNSW 列名（dur/sbytes 等），而流量只带 CICIDS 列
+      （Flow Duration/Total Length of Fwd Packets），则把值复制到模型期待的列名。
+    - 反向同理：有 CIC 列时补充常见 UNSW 别名，方便统计 available_feature_keys。
+    """
+
+    if feature_names is None:
+        feature_names = []
+
+    normalised_target = {name: _normalise_header_name(name) for name in feature_names}
+
+    augmented: List[Dict[str, object]] = []
+    for flow in flows:
+        expanded = dict(flow)
+        normalised_flow = {_normalise_header_name(key): key for key in flow}
+
+        # 模型特征 -> CIC 列
+        for original_name, normalised_name in normalised_target.items():
+            canonical = _COLUMN_ALIASES.get(normalised_name)
+            if canonical is None or original_name in expanded:
+                continue
+
+            canonical_norm = _normalise_header_name(canonical)
+            source_key = normalised_flow.get(canonical_norm)
+            if source_key is not None and source_key in flow:
+                expanded[original_name] = flow[source_key]
+
+        # CIC 列 -> UNSW 别名
+        for canonical, alias_list in _REVERSE_COLUMN_ALIASES.items():
+            canonical_norm = _normalise_header_name(canonical)
+            source_key = normalised_flow.get(canonical_norm)
+            if source_key is None or source_key not in flow:
+                continue
+
+            for alias in alias_list:
+                if alias in expanded:
+                    continue
+                expanded[alias] = flow[source_key]
+
+        augmented.append(expanded)
+
+    return augmented
 
 
 def common_feature_subset(
