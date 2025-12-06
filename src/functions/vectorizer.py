@@ -135,6 +135,28 @@ CSV_READ_ENCODINGS: Sequence[str] = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
 _CSV_READ_ENCODINGS = CSV_READ_ENCODINGS
 _OPTIONAL_COLUMNS = {"LabelBinary"}
 
+# 兼容 UNSW 风格的表头：使用归一化后的键做映射，避免列名不符导致的数据丢失。
+_COLUMN_ALIASES: Dict[str, str] = {
+    "srcip": "Source IP",
+    "saddr": "Source IP",
+    "dstip": "Destination IP",
+    "daddr": "Destination IP",
+    "sport": "Source Port",
+    "srcport": "Source Port",
+    "spt": "Source Port",
+    "dsport": "Destination Port",
+    "dport": "Destination Port",
+    "proto": "Protocol",
+    "protocol": "Protocol",
+    "dur": "Flow Duration",
+    "duration": "Flow Duration",
+    "flowduration": "Flow Duration",
+    "spkts": "Total Fwd Packets",
+    "dpkts": "Total Backward Packets",
+    "sbytes": "Total Length of Fwd Packets",
+    "dbytes": "Total Length of Bwd Packets",
+}
+
 ProgressCallback = Optional[Callable[[int], None]]
 FeatureSource = Union[str, Sequence[str]]
 _DATASET_META_TYPE = "merged_feature_dataset"
@@ -143,6 +165,44 @@ _DATASET_META_TYPE = "merged_feature_dataset"
 _DUPLICATE_COLUMN_ALIASES: Dict[Tuple[str, int], str] = {
     ("Fwd Header Length", 1): "Fwd Header Length.1",
 }
+
+
+def _normalise_header_name(name: str) -> str:
+    """归一化列名：小写、去除空格/下划线/连字符，便于宽松匹配。"""
+
+    lowered = name.strip().lower()
+    return "".join(ch for ch in lowered if ch.isalnum())
+
+
+def _apply_header_aliases(columns: Sequence[str]) -> List[str]:
+    """将常见 UNSW 风格表头映射到内部统一名称。"""
+
+    resolved: List[str] = []
+    for name in columns:
+        normalised = _normalise_header_name(str(name))
+        resolved.append(_COLUMN_ALIASES.get(normalised, str(name).strip()))
+    return resolved
+
+
+def available_feature_keys(flows: Iterable[Dict[str, object]]) -> List[str]:
+    """Collect the union of feature keys that are present in flow dictionaries."""
+
+    keys: set[str] = set()
+    for flow in flows:
+        for key, value in flow.items():
+            if value is None:
+                continue
+            keys.add(str(key))
+    return sorted(keys)
+
+
+def common_feature_subset(
+    model_features: Sequence[str], available_features: Sequence[str]
+) -> List[str]:
+    """根据模型特征和当前可用特征求交集，保持模型特征顺序。"""
+
+    available = set(available_features)
+    return [name for name in model_features if name in available]
 
 
 def _notify(cb: ProgressCallback, value: int) -> None:
@@ -190,6 +250,7 @@ def _resolve_feature_sources(feature_dir: FeatureSource) -> Tuple[List[str], Opt
 def _align_dataframe(frame: "pd.DataFrame") -> "pd.DataFrame":
     header = list(CSV_COLUMNS)
     df = frame.copy()
+    df.columns = _apply_header_aliases(df.columns)
 
     for column in header:
         if column not in df.columns:
@@ -694,8 +755,8 @@ class DataPreprocessor:
 
         df = frame.copy()
 
-        # 1. 统一列名：去掉首尾空格，避免 ' Flow Duration ' 这类问题
-        df.columns = [str(col).strip() for col in df.columns]
+        # 1. 统一列名：去掉首尾空格，并套用别名，避免 ' Flow Duration ' 以及 UNSW 风格的缩写问题
+        df.columns = _apply_header_aliases([str(col).strip() for col in df.columns])
 
         # 2. 确保有 Label 列（原始 CICIDS 里就是 Label，有些文件可能有空格/大小写问题）
         if _LABEL_COLUMN not in df.columns:
