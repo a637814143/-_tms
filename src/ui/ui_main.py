@@ -5256,8 +5256,8 @@ class Ui_MainWindow(object):
             missing_list = list(missing_after_align)
             sample_missing = ", ".join(missing_list[:8])
             more_missing = " ..." if len(missing_list) > 8 else ""
-            raise RuntimeError(
-                "检测到特征 CSV 缺少模型所需列，请确认选择的特征文件正确。\n缺少列: "
+            messages.append(
+                "已为缺失的模型特征填充默认值，仍可继续预测。缺失列: "
                 f"{sample_missing}{more_missing}"
             )
         schema_version = align_info.get("schema_version")
