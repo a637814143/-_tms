@@ -25,6 +25,8 @@ from sklearn.model_selection import train_test_split
 from .feature_extractor import extract_pcap_features
 from .vectorizer import (
     VectorizationResult,
+    available_feature_keys,
+    common_feature_subset,
     load_vectorized_dataset,
     numeric_feature_names,
     vectorize_flows,
@@ -39,6 +41,7 @@ except Exception:  # pragma: no cover - 预测模块可在无 pandas 环境运�
 
 
 logger = get_logger(__name__)
+_LOW_COVERAGE_THRESHOLD = 0.2
 
 try:  # 规则引擎不是硬依赖
     from .risk_rules import (  # type: ignore
@@ -1197,6 +1200,7 @@ def _build_detection_result(
     scores: Optional[Sequence[float]] = None,
     extraction_warnings: Optional[List[str]] = None,
     packet_stats: Optional[Dict[str, int]] = None,
+    overlap_features: Optional[List[str]] = None,
 ) -> DetectionResult:
     if vectorized is None:
         vectorized = vectorize_flows(
@@ -1456,6 +1460,16 @@ def _build_detection_result(
         "available_feature_counts": vectorized.available_feature_counts,
     }
 
+    if overlap_features is not None:
+        feature_coverage["overlap_feature_count"] = len(overlap_features)
+        feature_coverage["overlap_features"] = list(overlap_features)
+
+    warnings = list(extraction_warnings or [])
+    if vectorized.coverage_ratio < _LOW_COVERAGE_THRESHOLD:
+        warnings.append(
+            "特征覆盖率过低（<20%），输入大部分为补零列，预测结果可能不可靠。"
+        )
+
     return DetectionResult(
         path=Path(path),
         success=True,
@@ -1481,7 +1495,7 @@ def _build_detection_result(
         },
         rule_profile=rule_profile,
         feature_coverage=feature_coverage,
-        extraction_warnings=extraction_warnings,
+        extraction_warnings=warnings,
         packet_stats=packet_stats,
     )
 
@@ -1610,14 +1624,38 @@ def detect_pcap_with_model(
         )
 
     flows = [dict(flow) for flow in result.get("flows", [])]
+    available = available_feature_keys(flows)
+    overlap = common_feature_subset(feature_names, available)
+
+    overlap_ratio = float(len(overlap)) / len(feature_names) if feature_names else 0.0
+    extraction_warnings = list(result.get("warnings") or [])
+    if feature_names and not overlap:
+        extraction_warnings.append(
+            "模型特征与当前 PCAP 提取的特征没有重叠，预测结果不可信，请检查训练/提取特征是否一致。"
+        )
+    elif overlap_ratio < _LOW_COVERAGE_THRESHOLD:
+        extraction_warnings.append(
+            f"模型特征仅有 {len(overlap)} 个与当前流量重叠（{overlap_ratio*100:.1f}%），预测可靠性较低。"
+        )
+
+    vectorized = vectorize_flows(
+        flows, feature_names=feature_names, include_labels=False
+    )
+
+    if vectorized.coverage_ratio < _LOW_COVERAGE_THRESHOLD and not extraction_warnings:
+        extraction_warnings.append(
+            f"特征覆盖率仅 {vectorized.coverage_ratio*100:.1f}% ，输入列大多为补零。"
+        )
     return _build_detection_result(
         model,
         feature_names,
         label_mapping,
         flows,
         pcap_path,
-        extraction_warnings=result.get("warnings"),
+        vectorized=vectorized,
+        extraction_warnings=extraction_warnings,
         packet_stats=result.get("packet_stats"),
+        overlap_features=overlap,
     )
 
 

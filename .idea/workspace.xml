@@ -6,7 +6,7 @@
   <component name="ChangeListManager">
     <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/src/functions/vectorizer.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/vectorizer.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/src/functions/modeling.py" beforeDir="false" afterPath="$PROJECT_DIR$/src/functions/modeling.py" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -220,22 +220,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1754543842572</updated>
-    </task>
-    <task id="LOCAL-00100" summary="8888">
-      <option name="closed" value="true" />
-      <created>1763037388388</created>
-      <option name="number" value="00100" />
-      <option name="presentableId" value="LOCAL-00100" />
-      <option name="project" value="LOCAL" />
-      <updated>1763037388388</updated>
-    </task>
-    <task id="LOCAL-00101" summary="8888">
-      <option name="closed" value="true" />
-      <created>1763439094544</created>
-      <option name="number" value="00101" />
-      <option name="presentableId" value="LOCAL-00101" />
-      <option name="project" value="LOCAL" />
-      <updated>1763439094544</updated>
     </task>
     <task id="LOCAL-00102" summary="8888">
       <option name="closed" value="true" />
@@ -613,7 +597,23 @@
       <option name="project" value="LOCAL" />
       <updated>1764926711887</updated>
     </task>
-    <option name="localTasksCounter" value="149" />
+    <task id="LOCAL-00149" summary="8888">
+      <option name="closed" value="true" />
+      <created>1764997286625</created>
+      <option name="number" value="00149" />
+      <option name="presentableId" value="LOCAL-00149" />
+      <option name="project" value="LOCAL" />
+      <updated>1764997286626</updated>
+    </task>
+    <task id="LOCAL-00150" summary="8888">
+      <option name="closed" value="true" />
+      <created>1764997299946</created>
+      <option name="number" value="00150" />
+      <option name="presentableId" value="LOCAL-00150" />
+      <option name="project" value="LOCAL" />
+      <updated>1764997299946</updated>
+    </task>
+    <option name="localTasksCounter" value="151" />
     <servers />
   </component>
   <component name="UnknownFeatures">
