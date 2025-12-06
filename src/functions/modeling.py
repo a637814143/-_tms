@@ -25,6 +25,7 @@ from sklearn.model_selection import train_test_split
 from .feature_extractor import extract_pcap_features
 from .vectorizer import (
     VectorizationResult,
+    augment_flows_with_aliases,
     available_feature_keys,
     common_feature_subset,
     load_vectorized_dataset,
@@ -1576,7 +1577,7 @@ class ModelPredictor:
         return predictions, np.asarray(scores, dtype=np.float64)
 
     def predict_flows(self, flows: Iterable[Dict[str, object]], *, path: Union[str, Path] = "memory") -> DetectionResult:
-        flow_list = [dict(flow) for flow in flows]
+        flow_list = augment_flows_with_aliases([dict(flow) for flow in flows], self.feature_names)
         vectorized = vectorize_flows(
             flow_list, feature_names=self.feature_names, include_labels=False
         )
@@ -1623,7 +1624,9 @@ def detect_pcap_with_model(
             prediction_labels=None,
         )
 
-    flows = [dict(flow) for flow in result.get("flows", [])]
+    flows = augment_flows_with_aliases(
+        [dict(flow) for flow in result.get("flows", [])], feature_names
+    )
     available = available_feature_keys(flows)
     overlap = common_feature_subset(feature_names, available)
 
