@@ -6,7 +6,7 @@ from src.functions.modeling import _infer_supervised_feature_columns
 
 
 def test_feature_inference_and_matrix_shape():
-    data_path = Path(__file__).parent / "data" / "sample_training.csv"
+    data_path = Path(__file__).parent / "data" / "sample_training_small.csv"
     df = pd.read_csv(data_path)
 
     feature_columns = _infer_supervised_feature_columns(df.copy(), "LabelBinary")
