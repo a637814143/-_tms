@@ -5,7 +5,8 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="65b73b3c-b62c-494f-840c-79eb6007ee65" name="Changes" comment="8888">
-      <change beforePath="$PROJECT_DIR$/requirements.txt" beforeDir="false" afterPath="$PROJECT_DIR$/requirements.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.gitignore" beforeDir="false" afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -219,22 +220,6 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1754543842572</updated>
-    </task>
-    <task id="LOCAL-00112" summary="8888">
-      <option name="closed" value="true" />
-      <created>1764071075036</created>
-      <option name="number" value="00112" />
-      <option name="presentableId" value="LOCAL-00112" />
-      <option name="project" value="LOCAL" />
-      <updated>1764071075037</updated>
-    </task>
-    <task id="LOCAL-00113" summary="8888">
-      <option name="closed" value="true" />
-      <created>1764072287396</created>
-      <option name="number" value="00113" />
-      <option name="presentableId" value="LOCAL-00113" />
-      <option name="project" value="LOCAL" />
-      <updated>1764072287396</updated>
     </task>
     <task id="LOCAL-00114" summary="8888">
       <option name="closed" value="true" />
@@ -612,7 +597,23 @@
       <option name="project" value="LOCAL" />
       <updated>1765273461574</updated>
     </task>
-    <option name="localTasksCounter" value="161" />
+    <task id="LOCAL-00161" summary="8888">
+      <option name="closed" value="true" />
+      <created>1765273962983</created>
+      <option name="number" value="00161" />
+      <option name="presentableId" value="LOCAL-00161" />
+      <option name="project" value="LOCAL" />
+      <updated>1765273962983</updated>
+    </task>
+    <task id="LOCAL-00162" summary="8888">
+      <option name="closed" value="true" />
+      <created>1765274113257</created>
+      <option name="number" value="00162" />
+      <option name="presentableId" value="LOCAL-00162" />
+      <option name="project" value="LOCAL" />
+      <updated>1765274113257</updated>
+    </task>
+    <option name="localTasksCounter" value="163" />
     <servers />
   </component>
   <component name="UnknownFeatures">
