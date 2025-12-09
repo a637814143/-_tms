@@ -1,6 +1,20 @@
+# 核心依赖
+numpy
 pandas
 scikit-learn
 matplotlib
 seaborn
-tkinter
+
+# UI & 配置
+PyQt5
+pyyaml
+joblib
+
+# 流量特征提取相关
+dpkt
+
+# 体验类（可选，但推荐）
+tqdm
+
+# 测试 / 开发（可选）
 pytest

@@ -4,7 +4,7 @@ paths:
   csv_info_dir: data/CSV/info
   csv_feature_dir: data/CSV/feature
   csv_preprocess_dir: data/CSV/DP
-  models_dir: "D:/pythonProject8/data/models"
+  models_dir: data/models
   results_dir: data/results
   logs_dir: data/logs
 plugins:
@@ -18,9 +18,6 @@ ui:
   default_model_tag: latest
 training:
   fusion_alpha: 0.5
-  enable_semi_supervised: true
-  max_active_learning_samples: 200
-  pseudo_label_confidence: 0.9
 online_detection:
   watch_dir: data/live
   output_dir: data/live_results

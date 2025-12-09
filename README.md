@@ -62,7 +62,7 @@ README.md
 ## 配置说明
 `config/default.yaml` 关键字段：
 - **paths**：数据、模型、结果、日志等默认目录（如 `paths.data_dir`、`paths.models_dir`）。
-- **training**：训练比例/迭代等参数（如 `fusion_alpha`、`max_active_learning_samples`）。
+- **training**：有监督训练与模型/规则融合的核心参数（如 `fusion_alpha`）。
 - **rules**：规则 profile、阈值与模型/规则融合权重（`rules.active_profile`、`rules.fusion.model_weight/rule_weight/decision_threshold`）。
 - **ui/online_detection**：界面与在线检测轮询配置。
 
