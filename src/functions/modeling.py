@@ -176,7 +176,6 @@ __all__ = [
     "train_supervised_on_split",
     "detect_pcap_with_model",
     "summarize_prediction_labels",
-    "compute_risk_components",
 ]
 
 
@@ -2138,30 +2137,3 @@ def summarize_prediction_labels(
         status_text = None
 
     return normalized_labels, anomaly_count, normal_count, status_text
-
-
-def compute_risk_components(
-    scores: Iterable[float],
-    vote_ratio: Iterable[float],
-    threshold: float,
-    vote_threshold: float,
-    score_std: float,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Combine anomaly scores and vote ratios into a composite risk estimate."""
-
-    scores_arr = np.asarray(list(scores), dtype=np.float64)
-    votes_arr = np.asarray(list(vote_ratio), dtype=np.float64)
-
-    if scores_arr.shape != votes_arr.shape:
-        raise ValueError("Scores and vote ratios must have the same shape")
-
-    scale = float(score_std) if score_std not in (None, 0) else 1.0
-
-    score_component = (scores_arr - float(threshold)) / scale
-    score_component = np.clip(score_component, 0.0, None)
-
-    vote_component = votes_arr - float(vote_threshold)
-    vote_component = np.clip(vote_component, 0.0, None)
-
-    risk_score = 0.6 * score_component + 0.4 * vote_component
-    return risk_score, score_component, vote_component
