@@ -1,71 +1,81 @@
 # 流量分析平台
 
-## 项目概述
+## 项目简介
+基于机器学习 + 规则引擎的网络流量恶意检测平台，支持命令行与 PyQt5 图形界面两种入口。
 
-这是一个基于Python开发的流量分析平台，支持流量数据的导入、预处理、特征提取、机器学习建模、评估与可视化。平台采用模块化设计，既可图形界面操作，也支持命令行。
+## 主要功能
+- 流量特征提取（PCAP → CSV）。
+- 有监督模型训练（HistGradientBoosting 等集成）。
+- 模型 + 风险规则融合检测与告警。
+- 在线/批量检测流程与结果汇总。
+- PyQt5 可视化界面（训练、预测、结果浏览）。
 
 ## 项目结构
-
 ```
-pythonProject8/
-├── README.md                          # 项目说明文档（功能简介、使用方式、数据来源等）
-├── requirements.txt                   # 项目依赖列表（如 pandas, scikit-learn, matplotlib 等）
-├── run.py                             # 程序主入口（启动图形界面或 CLI）
-├── src/                               # 源代码目录
-│   ├── __init__.py                    # 包声明
-│   ├── main.py                        # 控制主逻辑（整合模型、界面、流程调度）
-│   ├── learn.py                       # 封装机器学习训练与预测流程（如 fit → predict）
-│   ├── 功能/                           # 主要功能模块
-│   │   ├── __init__.py
-│   │   ├── preprocessor.py            # 数据预处理模块（缺失值、编码、标准化等）
-│   │   ├── extractor.py               # 特征提取模块（从 pcap 提取流量特征）
-│   │   ├── evaluator.py               # 模型评估模块（准确率、F1、AUC、对比等）
-│   │   └── utils.py                   # 公共工具函数（日志、文件加载等）
-│   └── 可视化/                         # 界面与图表展示模块
-│       ├── __init__.py
-│       ├── ui.py                      # 图形界面主程序（Tkinter）
-│       └── chart.py                   # 图表绘制（性能对比、热力图、柱状图等）
-├── data/                              # 数据目录（放入.pcap/.csv 或转换后数据）
-│   ├── example.pcapng
-│   └── cleaned.csv
-├── models/                            # 模型存储目录（如 joblib 格式的模型）
-│   ├── rf_model.pkl
-│   └── iforest_model.pkl
-├── results/                           # 实验结果目录（日志、图表、报告）
-│   ├── output.log
-│   └── comparison.png
-├── .venv/                             # Python虚拟环境
-└── .idea/                             # IDE 配置文件夹
+scripts/
+  ROOT.py                       # 项目根路径引用
+  run_fix_dataset_label_columns.py # 修复错位标签数据集的小工具
+  train_experiment_baseline.py  # 一键跑基线训练并导出指标
+  train_experiment_rule_weight.py # 扫描不同模型/规则权重组合
+src/
+  functions/                    # 特征、建模、规则融合、导出等核心函数
+  services/                     # CLI/服务化入口（提取、训练、预测、分析）
+  ui/                           # PyQt5 界面
+config/
+  default.yaml                  # 训练、路径、规则等默认配置
+requirements.txt                # 运行依赖
+README.md
 ```
 
-## 主要模块说明
+## 环境与依赖安装
+- 推荐 Python 3.10+。
+- 安装依赖：`pip install -r requirements.txt`。
+- 如需处理 PCAP，请确保具备 Scapy/tshark 的读取权限（某些环境需要管理员/根权限）。
 
-- **requirements.txt**：项目依赖包列表，便于环境搭建。
-- **run.py**：程序主入口，可选择启动图形界面或命令行分析。
-- **src/main.py**：主逻辑调度，负责各模块的调用与流程控制。
-- **src/learn.py**：机器学习训练与预测流程的封装。
-- **src/功能/preprocessor.py**：数据清洗、缺失值处理、特征标准化等。
-- **src/功能/extractor.py**：从原始流量文件（如pcap）中提取特征。
-- **src/功能/evaluator.py**：模型评估与对比分析。
-- **src/功能/utils.py**：通用工具函数，如日志、文件加载等。
-- **src/可视化/ui.py**：基于Tkinter的图形界面主程序。
-- **src/可视化/chart.py**：各类图表绘制与展示。
-- **data/**：存放原始数据和处理后数据。
-- **models/**：存放训练好的模型文件。
-- **results/**：存放实验日志、图表和分析报告。
+## 快速开始
+### 命令行流程
+1. 准备 PCAP/CSV 数据。
+2. 提取特征（示例使用 pipeline_service 的 extract）：
+   ```bash
+   python -m src.services.pipeline_service extract data/pcap_dir data/CSV/feature --workers 4
+   ```
+3. 训练模型：
+   ```bash
+   python scripts/train_experiment_baseline.py --train-csv data/CSV/feature --output-dir data/results/baseline
+   ```
+4. 使用已训练管线预测并生成结果 CSV：
+   ```bash
+   python -m src.services.pipeline_service predict \
+     data/results/baseline/model.joblib data/CSV/feature/test.csv \
+     --output data/results/predict.csv
+   ```
 
-## 使用方法
+### GUI 流程
+1. 启动界面：`python scripts/ROOT.py` 或 `python -m src.ui.ui_main`。
+2. 按界面步骤：选择数据 → 提取/加载特征 → 训练模型 → 载入模型做检测 → 查看/导出结果。
 
-1. 安装依赖：`pip install -r requirements.txt`
-2. 运行主程序：`python run.py`
-3. 按照界面或命令行提示操作。
+## 实验脚本说明
+- **train_experiment_baseline.py**：读取配置与训练集，调用 `train_supervised_on_split` 训练基线模型，输出模型、元数据与 `baseline_metrics.csv`。
+- **train_experiment_rule_weight.py**：基于同一模型扫描不同 `(model_weight, rule_weight)` 组合，使用融合逻辑计算精度/召回/F1/AUC，汇总到 `rule_weight_metrics.csv`。
+- **run_fix_dataset_label_columns.py**：修复表头 86 列但行数据 88 列的错位标签 CSV，可对单个文件或目录批量处理，并写出 `_fixed` 版本。
+
+## 配置说明
+`config/default.yaml` 关键字段：
+- **paths**：数据、模型、结果、日志等默认目录（如 `paths.data_dir`、`paths.models_dir`）。
+- **training**：训练比例/迭代等参数（如 `fusion_alpha`、`max_active_learning_samples`）。
+- **rules**：规则 profile、阈值与模型/规则融合权重（`rules.active_profile`、`rules.fusion.model_weight/rule_weight/decision_threshold`）。
+- **ui/online_detection**：界面与在线检测轮询配置。
 
 ## 数据格式说明
-- 支持.pcap/.csv等格式，建议先用extractor模块提取特征。
+- 训练 CSV 至少包含若干数值特征列与 `LabelBinary` 标签列（0 表示良性，1 表示恶意）。
+- 特征列可为通用数值型字段，训练流程会自动筛选数值特征并忽略 `Label/LabelBinary/Attack_cat` 等标签列。
+- 预测结果包含 `prediction_status`/`malicious_score` 等列，可配合规则得分进行融合分析。
 
-## 版本信息
-- 当前版本：v1.0.0
-- 最后更新：2025年1月
+## 示例结果与截图
+- 可在后续实验中补充训练曲线、规则权重对比图、GUI 截图，直接将生成的 PNG 放在 `results/` 或文档中引用。
 
----
-© 2025 by AI Project. All rights reserved. 
+## 后续工作 / 限制说明
+- 丰富特征提取 CLI，支持更多 PCAP 预处理选项。
+- 增强规则配置可视化与可编辑性，便于快速实验不同策略。
+- 扩展自动化测试覆盖更多真实数据流转场景（特征提取→训练→预测）。
+- 考虑加入模型版本管理与在线推理 API，以便部署到生产环境。
