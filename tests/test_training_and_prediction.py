@@ -9,7 +9,7 @@ from src.functions.modeling import train_supervised_on_split
 
 
 def test_train_and_predict_roundtrip(tmp_path):
-    data_path = Path(__file__).parent / "data" / "sample_training.csv"
+    data_path = Path(__file__).parent / "data" / "sample_training_small.csv"
     split_dir = tmp_path / "split"
     split_dir.mkdir()
     shutil.copy2(data_path, split_dir / data_path.name)
