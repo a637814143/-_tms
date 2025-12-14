@@ -1,4 +1,15 @@
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
-git commit -m "Add sample_training.csv for tests"
+*.pyc
+
+# IDE / OS
+.idea/
+.DS_Store
+
+# Environments
+.venv/
+
+# Misc
+*.log
