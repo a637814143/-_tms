@@ -25,12 +25,26 @@ def _load_module(module_path: str, friendly_name: Optional[str] = None) -> Modul
     return importlib.import_module(module_path)
 
 
+def _load_scapy() -> Optional[Any]:
+    try:
+        import scapy.all as scapy  # type: ignore
+        return scapy
+    except Exception:
+        return None
+
+
 pd: Any = _load_module("pandas", friendly_name="pandas")
-_scapy: Any = _load_module("scapy.all", friendly_name="scapy")
-IP = _scapy.IP
-TCP = _scapy.TCP
-UDP = _scapy.UDP
-PcapReader = _scapy.PcapReader
+_scapy: Any = _load_scapy()
+if _scapy is not None:
+    IP = _scapy.IP
+    TCP = _scapy.TCP
+    UDP = _scapy.UDP
+    PcapReader = _scapy.PcapReader
+else:  # pragma: no cover - optional dependency guard
+    IP = None
+    TCP = None
+    UDP = None
+    PcapReader = None
 
 FlowKey = Tuple[str, str, int, int, str]
 
@@ -405,6 +419,9 @@ def get_pcap_features(
     packet_limit: Optional[int] = None,
 ) -> pd.DataFrame:
     """提取一个或多个 PCAP 文件的流量统计信息，兼容 GUI 所需的参数。"""
+
+    if _scapy is None or IP is None or TCP is None or UDP is None or PcapReader is None:
+        raise RuntimeError("缺少依赖 scapy，请先执行：pip install scapy>=2.5")
 
     if not path and not files:
         raise ValueError("必须提供有效的文件路径或文件列表")
