@@ -184,15 +184,26 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
         return fused_scores, fused_flags, rules_triggered
 
 try:  # Optional metrics helpers
-    from sklearn.metrics import accuracy_score, recall_score
+    from sklearn.metrics import (
+        accuracy_score,
+        precision_score,
+        recall_score,
+        f1_score,
+        confusion_matrix,
+        roc_auc_score,
+    )
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
     accuracy_score = None  # type: ignore[assignment]
+    precision_score = None  # type: ignore[assignment]
     recall_score = None  # type: ignore[assignment]
+    f1_score = None  # type: ignore[assignment]
+    confusion_matrix = None  # type: ignore[assignment]
+    roc_auc_score = None  # type: ignore[assignment]
 
 logger = get_logger(__name__)
 
 
-METRIC_LABEL_CANDIDATES = ["Label", "label", "class", "ground_truth"]
+METRIC_LABEL_CANDIDATES = ["LabelBinary", "Label", "label", "class", "ground_truth"]
 
 
 def compute_detection_metrics(
@@ -200,20 +211,25 @@ def compute_detection_metrics(
     *,
     label_col: str = "Label",
     pred_col: str = "prediction_status",
+    score_col: Optional[str] = None,
 ):
-    """计算二分类检测的准确率与召回率。
+    """计算二分类检测的准确率、召回率、精度、F1、AUC 与混淆矩阵。"""
 
-    当缺少真实标签列或缺少预测列时返回 ``None``，以便在无标签场景下优雅降级。
-    """
-
-    if accuracy_score is None or recall_score is None or pd is None:
+    if (
+        accuracy_score is None
+        or precision_score is None
+        or recall_score is None
+        or f1_score is None
+        or confusion_matrix is None
+        or roc_auc_score is None
+        or pd is None
+    ):
         return None
 
     if not hasattr(df, "columns") or label_col not in df.columns or pred_col not in df.columns:
         return None
 
     y_true = df[label_col]
-
     if y_true.dtype == "O":
         mapping = {
             "BENIGN": 0,
@@ -242,14 +258,39 @@ def compute_detection_metrics(
     y_true = y_true[pred_mask]
     y_pred = y_pred_numeric[pred_mask].astype(int)
 
-    acc = accuracy_score(y_true, y_pred)
-    rec = recall_score(y_true, y_pred, pos_label=1)
+    score_series = None
+    if score_col and score_col in df.columns:
+        try:
+            score_series = pd.to_numeric(df.loc[pred_mask, score_col], errors="coerce")
+        except Exception:
+            score_series = None
 
-    return {
+    acc = accuracy_score(y_true, y_pred)
+    pre = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0, pos_label=1)
+    f1_val = f1_score(y_true, y_pred, zero_division=0)
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    metrics = {
         "accuracy": float(acc),
+        "precision": float(pre),
         "recall": float(rec),
+        "f1": float(f1_val),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "tp": int(tp),
         "support": int(len(y_true)),
+        "auc": None,
     }
+
+    if score_series is not None and not score_series.isna().all():
+        try:
+            metrics["auc"] = float(roc_auc_score(y_true, score_series))
+        except Exception:
+            metrics["auc"] = None
+
+    return metrics
 
 
 def _safe_float(value: object, fallback: float) -> float:
@@ -376,8 +417,18 @@ def _run_prediction(
     metadata_obj: Dict[str, object] = dict(metadata_payload)
 
     def _maybe_compute_metrics(frame) -> Optional[Dict[str, object]]:
+        score_col = None
+        for candidate_score in ("fusion_score", "malicious_score", "model_score"):
+            if candidate_score in frame.columns:
+                score_col = candidate_score
+                break
         for candidate in METRIC_LABEL_CANDIDATES:
-            metrics = compute_detection_metrics(frame, label_col=candidate)
+            metrics = compute_detection_metrics(
+                frame,
+                label_col=candidate,
+                pred_col="prediction_status",
+                score_col=score_col,
+            )
             if metrics:
                 metrics["label_column"] = candidate
                 return metrics

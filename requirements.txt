@@ -12,7 +12,7 @@ joblib
 
 # 流量特征提取相关
 dpkt
-scapy
+scapy>=2.5
 
 # 体验类（可选，但推荐）
 tqdm
