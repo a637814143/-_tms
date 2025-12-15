@@ -42,16 +42,17 @@
 3. 命令行模式（适合批量处理/训练/预测/分析）：
    ```bash
    # 提取特征
-   python -m src.services.pipeline_service extract <pcap目录或文件> <输出目录> [--workers N] [--fast]
+   python -m src.services.pipeline_service extract <pcap目录> <输出目录> [--workers N] [--fast]
 
    # 训练模型（需要已分好训练/验证集的目录或 CSV）
-   python -m src.services.pipeline_service train <split目录> <results目录> <models目录>
+   python -m src.services.pipeline_service train <split目录> <results目录> <models目录> \
+     [--max-ensemble-members N] [--ensemble-weight-metric samples|auc|f1] [--reset-ensemble]
 
    # 预测
-   python -m src.services.pipeline_service predict <pipeline文件> <features.csv> [--metadata xxx.json] [--output out.csv]
+   python -m src.services.pipeline_service predict <pipeline.joblib> <features.csv> [--metadata meta.json] [--output out.csv]
 
    # 结果分析/可解释性统计
-   python -m src.services.pipeline_service analyze <预测结果csv> [--output-dir xxx]
+   python -m src.services.pipeline_service analyze <预测结果.csv> <输出目录> [--metadata meta.json]
    ```
 
 ## 数据格式说明
@@ -60,4 +61,4 @@
 
 ## 版本信息
 - 当前版本：v1.0.0
-- 最后更新：2025年1月
+- 最后更新：2025年12月
