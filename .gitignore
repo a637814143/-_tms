@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyc
+.pytest_cache/
 
 # IDE / OS
 .idea/

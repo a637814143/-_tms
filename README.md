@@ -42,21 +42,21 @@
 3. 命令行模式（适合批量处理/训练/预测/分析）：
    ```bash
    # 提取特征
-   python -m src.services.pipeline_service extract --input <pcap目录或文件> --output <features.csv>
+   python -m src.services.pipeline_service extract <pcap目录或文件> <输出目录> [--workers N] [--fast]
 
    # 训练模型（需要已分好训练/验证集的目录或 CSV）
-   python -m src.services.pipeline_service train --input <split目录或csv> --output <模型输出目录>
+   python -m src.services.pipeline_service train <split目录> <results目录> <models目录>
 
    # 预测
-   python -m src.services.pipeline_service predict --pipeline <模型文件> --features <features.csv> --output <结果路径>
+   python -m src.services.pipeline_service predict <pipeline文件> <features.csv> [--metadata xxx.json] [--output out.csv]
 
    # 结果分析/可解释性统计
-   python -m src.services.pipeline_service analyze --input <预测结果csv>
+   python -m src.services.pipeline_service analyze <预测结果csv> [--output-dir xxx]
    ```
 
 ## 数据格式说明
 - 支持 pcap/pcapng（通过 `feature_extractor.py` 与 `info.py` 提取统计与特征）。
-- 训练/预测特征采用 CSV，标签列默认 `Label`/`label`/`class`/`ground_truth`（界面与 CLI 会自动探测）。
+- 训练/预测特征采用 CSV，标签列默认 `LabelBinary`/`Label`/`label`/`class`/`ground_truth`（界面与 CLI 会自动探测）。
 
 ## 版本信息
 - 当前版本：v1.0.0
