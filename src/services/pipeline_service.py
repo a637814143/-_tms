@@ -1,3 +1,4 @@
+
 """CLI and optional REST services for malware detector workflows."""
 
 from __future__ import annotations
