@@ -16,3 +16,15 @@ __pycache__/
 
 # Misc
 *.log
+# 运行产物/数据（按你仓库实际结构）
+data/
+src/ui/data/
+tests/data/
+
+# 常见产物
+*.pcap
+*.pcapng
+*.csv
+*.jsonl
+*.joblib
+
