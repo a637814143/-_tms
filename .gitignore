@@ -10,9 +10,13 @@ __pycache__/
 .idea/
 *.iml
 .DS_Store
+Thumbs.db
+Desktop.ini
 
 # Environments
 .venv/
+.env
+.env.*
 
 # Misc
 *.log
@@ -27,4 +31,11 @@ tests/data/
 *.csv
 *.jsonl
 *.joblib
+dist/
+build/
+*.egg-info/
+
+# 允许提交示例数据
+!examples/
+!examples/**/*.csv
 
