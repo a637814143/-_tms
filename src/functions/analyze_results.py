@@ -25,6 +25,7 @@ logger = get_logger(__name__)
 # ---- 基础配置 --------------------------------------------------------------
 
 SCORE_CANDIDATES: Sequence[str] = (
+    "fusion_score",
     "malicious_score",
     "anomaly_score",
     "score",
@@ -63,6 +64,27 @@ DEFAULT_TOP_PERCENT = 0.01
 MAX_TOP_ROWS = 2000
 TOP_REASON_COUNT = 5
 CHUNK_SIZE = 50000
+
+# 额外：评估绘图（可选依赖）
+try:
+    from sklearn.metrics import (
+        roc_curve,
+        auc,
+        precision_recall_curve,
+        average_precision_score,
+        confusion_matrix,
+    )
+except Exception:  # sklearn 可能在轻量环境缺失
+    roc_curve = auc = precision_recall_curve = average_precision_score = confusion_matrix = None
+
+TRUTH_LABEL_CANDIDATES: Sequence[str] = (
+    "LabelBinary",
+    "labelbinary",
+    "Label",
+    "label",
+    "class",
+    "ground_truth",
+)
 
 try:  # pragma: no cover - optional dependency
     import pyarrow  # type: ignore  # noqa: F401
@@ -131,6 +153,13 @@ def _select_first(candidates: Sequence[str], columns: Sequence[str]) -> Optional
     return None
 
 
+def _select_truth_label(columns: Sequence[str]) -> Optional[str]:
+    for name in TRUTH_LABEL_CANDIDATES:
+        if name in columns:
+            return name
+    return None
+
+
 def _prepare_meta_columns(
     available: Sequence[str],
     score_col: str,
@@ -174,13 +203,78 @@ def _ensure_float32(series: pd.Series) -> pd.Series:
 
 
 def _normalize_label(series: pd.Series) -> pd.Series:
+    return _binarize_truth(series)
+
+
+def _binarize_truth(series: pd.Series) -> pd.Series:
+    # 1) 数值型：>0 为 1
     numeric = pd.to_numeric(series, errors="coerce")
     if numeric.notna().any():
         return (numeric.fillna(0.0) > 0).astype("int32", copy=False)
-    normalized = series.fillna("").astype(str).str.strip().str.lower()
-    true_tokens = {"1", "true", "yes", "attack", "anomaly", "malicious", "恶意", "异常"}
-    values = normalized.isin(true_tokens).astype("int32", copy=False)
-    return values
+
+    # 2) 字符串型：BENIGN/normal 为 0，其它为 1
+    s = series.fillna("").astype(str).str.strip().str.lower()
+    benign_tokens = {"benign", "normal", "0"}
+    return (~s.isin(benign_tokens) & (s != "")).astype("int32", copy=False)
+
+
+def _plot_roc_pr_cm(y_true: np.ndarray, y_score: np.ndarray, y_pred: np.ndarray, out_dir: str):
+    plots = []
+    roc_auc_val = None
+    pr_auc_val = None
+
+    if roc_curve is None or confusion_matrix is None:
+        return plots, roc_auc_val, pr_auc_val
+
+    # ROC
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    roc_auc_val = float(auc(fpr, tpr))
+    plt.figure(figsize=(7, 6))
+    plt.plot(fpr, tpr, label=f"AUC={roc_auc_val:.4f}")
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("False Positive Rate (FPR)")
+    plt.ylabel("True Positive Rate (TPR)")
+    plt.title("ROC Curve")
+    plt.legend(loc="lower right")
+    plt.tight_layout()
+    roc_path = os.path.join(out_dir, "roc_curve.png")
+    plt.savefig(roc_path)
+    plt.close()
+    plots.append(roc_path)
+
+    # PR
+    if precision_recall_curve is not None and average_precision_score is not None:
+        prec, rec, _ = precision_recall_curve(y_true, y_score)
+        pr_auc_val = float(average_precision_score(y_true, y_score))
+        plt.figure(figsize=(7, 6))
+        plt.plot(rec, prec, label=f"AP={pr_auc_val:.4f}")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title("Precision-Recall Curve")
+        plt.legend(loc="lower left")
+        plt.tight_layout()
+        pr_path = os.path.join(out_dir, "pr_curve.png")
+        plt.savefig(pr_path)
+        plt.close()
+        plots.append(pr_path)
+
+    # Confusion Matrix
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cm)
+    plt.title("Confusion Matrix")
+    plt.xticks([0, 1], ["Pred 0", "Pred 1"])
+    plt.yticks([0, 1], ["True 0", "True 1"])
+    for i in range(2):
+        for j in range(2):
+            plt.text(j, i, str(cm[i, j]), ha="center", va="center")
+    plt.tight_layout()
+    cm_path = os.path.join(out_dir, "confusion_matrix.png")
+    plt.savefig(cm_path)
+    plt.close()
+    plots.append(cm_path)
+
+    return plots, roc_auc_val, pr_auc_val
 
 
 def _export_summary_by_file(
@@ -318,10 +412,13 @@ def analyze_results(
         raise ValueError("结果文件缺少 anomaly_score/score 列")
 
     label_col = _select_first(LABEL_CANDIDATES, available_columns)
+    truth_col = _select_truth_label(available_columns)
     file_col = _select_first(FILE_CANDIDATES, available_columns)
     id_col = _select_first(ID_CANDIDATES, available_columns)
 
     meta_cols = _prepare_meta_columns(available_columns, score_col, label_col, file_col, id_col)
+    if truth_col and truth_col not in meta_cols:
+        meta_cols.append(truth_col)
     df_meta = _read_meta_frame(results_csv, meta_cols, engine)
 
     df_meta[score_col] = _ensure_float32(df_meta[score_col])
@@ -337,6 +434,13 @@ def analyze_results(
         df_meta[label_col] = _normalize_label(df_meta[label_col])
     else:
         label_col = None
+
+    if truth_col and truth_col in df_meta.columns:
+        df_meta[truth_col] = _binarize_truth(df_meta[truth_col])
+    else:
+        truth_col = None
+    if truth_col and not label_col:
+        label_col = truth_col
 
     total_rows = int(len(df_meta))
     if total_rows == 0:
@@ -359,8 +463,13 @@ def analyze_results(
     score_column_meta = ""
     if isinstance(meta_payload, dict):
         score_column_meta = str(meta_payload.get("score_column", "")).strip().lower()
-    descending_scores = score_col.lower() in {"malicious_score", "prob_malicious", "proba_malicious"}
-    if score_column_meta in {"malicious_score", "prob_malicious", "proba_malicious"}:
+    descending_scores = score_col.lower() in {
+        "fusion_score",
+        "malicious_score",
+        "prob_malicious",
+        "proba_malicious",
+    }
+    if score_column_meta in {"fusion_score", "malicious_score", "prob_malicious", "proba_malicious"}:
         descending_scores = True
 
     hist_path = _plot_hist(df_meta[score_col], out_dir, descending=descending_scores)
@@ -435,6 +544,18 @@ def analyze_results(
             score_threshold = float(score_quantiles.get(0.05, float(df_meta[score_col].min())))
     ratio_threshold = float(meta_payload.get("ratio_threshold", 0.05)) if isinstance(meta_payload, dict) else 0.05
 
+    roc_pr_cm_plots: List[str] = []
+    roc_auc_val = None
+    pr_auc_val = None
+    if truth_col:
+        y_true = df_meta[truth_col].to_numpy(dtype=np.int32, copy=False)
+        y_score = df_meta[score_col].to_numpy(dtype=float, copy=False)
+        if descending_scores:
+            y_pred = (y_score >= score_threshold).astype(np.int32, copy=False)
+        else:
+            y_pred = (y_score <= score_threshold).astype(np.int32, copy=False)
+        roc_pr_cm_plots, roc_auc_val, pr_auc_val = _plot_roc_pr_cm(y_true, y_score, y_pred, out_dir)
+
     drift_alerts = None
     train_quantiles_raw = meta_payload.get("score_quantiles") if isinstance(meta_payload, dict) else None
     if isinstance(train_quantiles_raw, dict):
@@ -488,8 +609,8 @@ def analyze_results(
         "top_n": top_n,
         "top_csv": top_csv_path,
         "model_metrics": None,
-        "roc_auc": None,
-        "pr_auc": None,
+        "roc_auc": roc_auc_val,
+        "pr_auc": pr_auc_val,
         "score_column": score_col,
         "score_direction": "descending" if descending_scores else "ascending",
     }
@@ -519,7 +640,7 @@ def analyze_results(
     )
 
     payload = {
-        "plots": [hist_path],
+        "plots": [hist_path, *roc_pr_cm_plots],
         "top20_csv": top_csv_path,
         "summary_csv": summary_csv_path,
         "summary_json": summary_json_path,
