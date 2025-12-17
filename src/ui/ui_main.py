@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil, json, textwrap, logging
@@ -62,6 +63,9 @@ from src.functions.analyze_results import analyze_results as run_analysis
 from src.functions.vectorizer import (
     preprocess_feature_dir as preprocess_dir,
     FeatureSource,
+    DataPreprocessor,
+    numeric_feature_names,
+    _apply_header_aliases,
 )
 from src.functions.annotations import (
     upsert_annotation,
@@ -5199,7 +5203,34 @@ class Ui_MainWindow(object):
         align_info: Dict[str, object] = {}
 
         try:
-            if feature_order:
+            if profile_token == "cicids":
+                expected_features = numeric_feature_names()
+                preprocessor = DataPreprocessor(
+                    feature_columns=expected_features, include_label_binary=False
+                )
+                normalized_cols = _apply_header_aliases(
+                    [str(col).strip() for col in df.columns]
+                )
+                raw_column_set = {str(col) for col in normalized_cols}
+                df_clean = preprocessor.clean_data(df)
+                feature_df_raw = df_clean.loc[:, expected_features]
+                missing_columns = [
+                    col for col in expected_features if col not in raw_column_set
+                ]
+                extra_columns = [
+                    col
+                    for col in raw_column_set
+                    if col not in expected_features
+                    and col not in {"Label", "LabelBinary"}
+                    and not str(col).lower().startswith("unnamed:")
+                ]
+                align_info = {
+                    "feature_order": expected_features,
+                    "missing_filled": missing_columns,
+                    "extra_columns": extra_columns,
+                    "schema_version": metadata.get("schema_version"),
+                }
+            elif feature_order:
                 feature_df_raw, align_info = _align_input_features(
                     df,
                     metadata,
@@ -5227,13 +5258,24 @@ class Ui_MainWindow(object):
 
         if expected_feature_count is not None:
             feature_count = feature_df_raw.shape[1]
-            self.display_result(f"[INFO] 输入特征数量：{feature_count}")
+            missing_after_align = align_info.get("missing_filled") if isinstance(align_info, dict) else None
+            extras_detected = align_info.get("extra_columns") if isinstance(align_info, dict) else None
+            summary_parts = [f"对齐后特征数量：{feature_count}"]
+            if missing_after_align:
+                summary_parts.append(
+                    "缺失特征已补 0：" + ", ".join(list(missing_after_align)[:8])
+                )
+            if extras_detected:
+                summary_parts.append(
+                    "已忽略额外列：" + ", ".join(list(extras_detected)[:8])
+                )
+            self.display_result("[INFO] " + "; ".join(summary_parts))
             if feature_count != expected_feature_count:
                 QtWidgets.QMessageBox.warning(
                     parent_widget,
                     "特征数量不匹配",
-                    f"当前模型期望 {expected_feature_count} 个数值特征，但输入数据中检测到 {feature_count} 个。\n"
-                    "请确认使用了正确的模型类型（CICIDS / UNSW）和数据格式。",
+                    f"当前模型期望 {expected_feature_count} 个特征，对齐后得到 {feature_count} 个。\n"
+                    "缺失列已补 0，多余列已忽略，请确认选择了正确的模型类型（CICIDS / UNSW）和数据格式。",
                 )
                 return {}
 
