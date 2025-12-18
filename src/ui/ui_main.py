@@ -5150,7 +5150,7 @@ class Ui_MainWindow(object):
                 model_type_text = ""
 
         profile_token = "unsw" if "unsw" in model_type_text.lower() else "cicids"
-        expected_feature_count = 39 if profile_token == "unsw" else 80
+        expected_feature_count: Optional[int] = None
         models_base = Path(PATHS["models"])
         profile_dir = models_base / profile_token
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -5210,6 +5210,10 @@ class Ui_MainWindow(object):
             return {}
 
         feature_order = _feature_order_from_metadata(metadata)
+        if feature_order:
+            expected_feature_count = len(feature_order)
+        elif expected_feature_count is None:
+            expected_feature_count = 39 if profile_token == "unsw" else 80
         allowed_extra = set(self._prediction_allowed_extras(metadata))
         extras_detected: List[str] = []
         source = "profile_selection"
@@ -5218,6 +5222,7 @@ class Ui_MainWindow(object):
         try:
             if profile_token == "cicids":
                 expected_features = numeric_feature_names()
+                expected_feature_count = expected_feature_count or len(expected_features)
                 preprocessor = DataPreprocessor(
                     feature_columns=expected_features, include_label_binary=False
                 )
