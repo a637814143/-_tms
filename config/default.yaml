@@ -1,3 +1,4 @@
+
 paths:
   data_dir: data
   split_dir: data/split
@@ -7,120 +8,64 @@ paths:
   models_dir: data/models
   results_dir: data/results
   logs_dir: data/logs
-
 plugins:
   feature_dirs:
     - plugins/features
   autoload: true
   reload_on_start: false
-
 ui:
   risk_trend_window: 200
   online_detection_poll_seconds: 5
   default_model_tag: latest
-
 training:
   fusion_alpha: 0.5
-
 online_detection:
   watch_dir: data/live
   output_dir: data/live_results
   auto_preprocess: true
   batch_size: 1
-
 rules:
-  # 默认档位（UI不传profile时才会用它）
   active_profile: baseline
-
-  # ⚠️ 重要：不要在这里写 trigger_threshold / fusion(model_weight/rule_weight/decision_threshold)
-  # 否则会覆盖各 profile 设置，导致高敏/低敏输出一样
-
   profiles:
     baseline:
-      # ====== 融合/决策参数（低敏）======
+      UDP_PPS_HI: 3000.0
+      SCAN_TARGETS: 30
+      BEACON_STD_MAX: 0.005
+      BEACON_MIN_PKTS: 20
+      EXFIL_BPS_RATIO: 0.8
+      EXFIL_UP_RATIO: 0.8
+      EXFIL_STRICT_UP_RATIO: 0.9
+      SYN_HEAVY: 15
+      RATE_SPIKE_ABS: 1000.0
+      SMALL_PKT_MEAN: 50.0
+      SMALL_PKT_PPS: 100.0
+      ICMP_BPS_HI: 50000.0
+      TLS_DURATION_MAX: 1.0
+      PORT_SCAN_UNIQUE_PORTS: 10
+      BPS_SIGMA_MULT: 3.0
+      DDOS_PKT_RATE: 1000.0
+      DDOS_BYTE_RATE: 1000000.0
+      SLOWLORIS_DURATION: 60.0
+      SLOWLORIS_BPS_MAX: 100.0
+      IP_SPOOF_SRC_VARIETY: 10
+      ARP_PPS_HI: 100.0
+      DNS_REQ_BYTES_MAX: 100.0
+      DNS_RESP_BYTES_MIN: 1000.0
+      FTP_LARGE_TRANSFER: 50000.0
+      UNIQUE_DST_PORTS: 10
+      UNIQUE_DST_IPS: 10
+      TRAFFIC_SPIKE_BPS: 10000.0
+      TRAFFIC_SPIKE_DURATION: 5.0
+      UNUSUAL_PROTO_PPS: 100.0
+      SHORT_SESSION_DURATION: 1.0
+      LONG_SESSION_DURATION: 3600.0
       trigger_threshold: 60.0
-      model_weight: 0.6
-      rule_weight: 0.4
-      fusion_threshold: 0.5
-      mode: conservative
-
-      # ====== 规则阈值参数（你原来的 baseline 全保留）======
-      UDP_PPS_HI: 3000.0
-      SCAN_TARGETS: 30
-      BEACON_STD_MAX: 0.005
-      BEACON_MIN_PKTS: 20
-      EXFIL_BPS_RATIO: 0.8
-      EXFIL_UP_RATIO: 0.8
-      EXFIL_STRICT_UP_RATIO: 0.9
-      SYN_HEAVY: 15
-      RATE_SPIKE_ABS: 1000.0
-      SMALL_PKT_MEAN: 50.0
-      SMALL_PKT_PPS: 100.0
-      ICMP_BPS_HI: 50000.0
-      TLS_DURATION_MAX: 1.0
-      PORT_SCAN_UNIQUE_PORTS: 10
-      BPS_SIGMA_MULT: 3.0
-      DDOS_PKT_RATE: 1000.0
-      DDOS_BYTE_RATE: 1000000.0
-      SLOWLORIS_DURATION: 60.0
-      SLOWLORIS_BPS_MAX: 100.0
-      IP_SPOOF_SRC_VARIETY: 10
-      ARP_PPS_HI: 100.0
-      DNS_REQ_BYTES_MAX: 100.0
-      DNS_RESP_BYTES_MIN: 1000.0
-      FTP_LARGE_TRANSFER: 50000.0
-      UNIQUE_DST_PORTS: 10
-      UNIQUE_DST_IPS: 10
-      TRAFFIC_SPIKE_BPS: 10000.0
-      TRAFFIC_SPIKE_DURATION: 5.0
-      UNUSUAL_PROTO_PPS: 100.0
-      SHORT_SESSION_DURATION: 1.0
-      LONG_SESSION_DURATION: 3600.0
-
+      fusion:
+        model_weight: 0.70
+        rule_weight: 0.30
+        decision_threshold: 0.70
+        mode: conservative
     aggressive:
-      # ====== 融合/决策参数（高敏）======
-      # 让规则占比更大 + 更容易触发规则 + 融合阈值更低
-      trigger_threshold: 35.0
-      model_weight: 0.25
-      rule_weight: 0.75
-      fusion_threshold: 0.35
-      mode: aggressive
-
-      # ====== 规则阈值参数（先沿用 baseline，避免引入额外变量）======
-      UDP_PPS_HI: 3000.0
-      SCAN_TARGETS: 30
-      BEACON_STD_MAX: 0.005
-      BEACON_MIN_PKTS: 20
-      EXFIL_BPS_RATIO: 0.8
-      EXFIL_UP_RATIO: 0.8
-      EXFIL_STRICT_UP_RATIO: 0.9
-      SYN_HEAVY: 15
-      RATE_SPIKE_ABS: 1000.0
-      SMALL_PKT_MEAN: 50.0
-      SMALL_PKT_PPS: 100.0
-      ICMP_BPS_HI: 50000.0
-      TLS_DURATION_MAX: 1.0
-      PORT_SCAN_UNIQUE_PORTS: 10
-      BPS_SIGMA_MULT: 3.0
-      DDOS_PKT_RATE: 1000.0
-      DDOS_BYTE_RATE: 1000000.0
-      SLOWLORIS_DURATION: 60.0
-      SLOWLORIS_BPS_MAX: 100.0
-      IP_SPOOF_SRC_VARIETY: 10
-      ARP_PPS_HI: 100.0
-      DNS_REQ_BYTES_MAX: 100.0
-      DNS_RESP_BYTES_MIN: 1000.0
-      FTP_LARGE_TRANSFER: 50000.0
-      UNIQUE_DST_PORTS: 10
-      UNIQUE_DST_IPS: 10
-      TRAFFIC_SPIKE_BPS: 10000.0
-      TRAFFIC_SPIKE_DURATION: 5.0
-      UNUSUAL_PROTO_PPS: 100.0
-      SHORT_SESSION_DURATION: 1.0
-      LONG_SESSION_DURATION: 3600.0
-
-    # 你原来的 gateway 我保留（可选，不影响 UI 高敏/低敏）
-    gateway:
       UDP_PPS_HI: 6000.0
       SCAN_TARGETS: 60
       BEACON_STD_MAX: 0.01
@@ -152,3 +97,9 @@ rules:
       UNUSUAL_PROTO_PPS: 120.0
       SHORT_SESSION_DURATION: 1.0
       LONG_SESSION_DURATION: 5400.0
+      trigger_threshold: 35.0
+      fusion:
+        model_weight: 0.35
+        rule_weight: 0.65
+        decision_threshold: 0.40
+        mode: aggressive

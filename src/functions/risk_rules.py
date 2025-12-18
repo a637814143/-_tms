@@ -172,16 +172,10 @@ def get_rule_settings(profile: Optional[str] = None) -> Dict[str, Any]:
         if isinstance(candidate, dict):
             profile_params = candidate
     else:
-        # 若 YAML profiles 未包含该档位，但内置 PROFILE_PRESETS 支持，则回退到内置预设，
-        # 避免用户只配置了 baseline 导致 aggressive 永远失效。
-        if selected_profile in PROFILE_PRESETS:
-            profile_params = PROFILE_PRESETS.get(selected_profile, {})
-        else:
-            selected_profile = DEFAULT_RULE_PROFILE
-            fallback = profiles_cfg.get(DEFAULT_RULE_PROFILE, {})
-            if isinstance(fallback, dict):
-                profile_params = fallback
-
+        selected_profile = DEFAULT_RULE_PROFILE
+        fallback = profiles_cfg.get(DEFAULT_RULE_PROFILE, {})
+        if isinstance(fallback, dict):
+            profile_params = fallback
 
     # 3) 规则阈值：拷贝 DEFAULTS，再用 profile 中同名键覆盖
     params: Dict[str, float] = dict(DEFAULTS)
@@ -954,8 +948,7 @@ def fuse_model_rule_votes(
         fused_scores = dynamic_model_weight * model_arr + dynamic_rule_weight * normalized_rules
     fused_flags = (fused_scores >= fusion_threshold).astype(bool)
 
-    # 高敏档位：以 profile 为准（而不是 mode）。兼容旧配置：mode 也可触发高敏。
-    if profile_token.startswith("aggr") or mode.startswith("aggr"):
+    if mode.startswith("aggr"):
         final_flags = np.logical_or(fused_flags, rules_triggered)
     else:
         final_flags = fused_flags
