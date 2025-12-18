@@ -25,11 +25,6 @@ online_detection:
   batch_size: 1
 rules:
   active_profile: baseline
-  trigger_threshold: 60.0
-  fusion:
-    model_weight: 0.6
-    rule_weight: 0.4
-    decision_threshold: 0.5
   profiles:
     baseline:
       UDP_PPS_HI: 3000.0
@@ -63,7 +58,13 @@ rules:
       UNUSUAL_PROTO_PPS: 100.0
       SHORT_SESSION_DURATION: 1.0
       LONG_SESSION_DURATION: 3600.0
-    gateway:
+      trigger_threshold: 60.0
+      fusion:
+        model_weight: 0.70
+        rule_weight: 0.30
+        decision_threshold: 0.70
+        mode: conservative
+    aggressive:
       UDP_PPS_HI: 6000.0
       SCAN_TARGETS: 60
       BEACON_STD_MAX: 0.01
@@ -95,3 +96,9 @@ rules:
       UNUSUAL_PROTO_PPS: 120.0
       SHORT_SESSION_DURATION: 1.0
       LONG_SESSION_DURATION: 5400.0
+      trigger_threshold: 35.0
+      fusion:
+        model_weight: 0.35
+        rule_weight: 0.65
+        decision_threshold: 0.40
+        mode: aggressive
