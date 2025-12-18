@@ -5583,7 +5583,7 @@ class Ui_MainWindow(object):
 
             model_score_array = np.clip(np.asarray(scores, dtype=float), 0.0, 1.0)
             model_confidence_array = np.maximum(model_score_array, 1.0 - model_score_array)
-            fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
+            fusion_scores_array, final_flags_array, rules_triggered_array = fuse_model_rule_votes(
                 model_score_array,
                 rule_scores_array,
                 model_weight=float(fusion_model_weight_base),
@@ -5594,7 +5594,7 @@ class Ui_MainWindow(object):
                 model_confidence=model_confidence_array,
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
-            fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
+            final_flags_array = np.asarray(final_flags_array, dtype=bool)
             rules_triggered_array = np.asarray(rules_triggered_array, dtype=bool)
 
             if fusion_scores_array.size < total_predictions:
@@ -5603,10 +5603,10 @@ class Ui_MainWindow(object):
                     (0, total_predictions - fusion_scores_array.size),
                     "edge",
                 )
-            if fusion_flags_array.size < total_predictions:
-                fusion_flags_array = np.pad(
-                    fusion_flags_array,
-                    (0, total_predictions - fusion_flags_array.size),
+            if final_flags_array.size < total_predictions:
+                final_flags_array = np.pad(
+                    final_flags_array,
+                    (0, total_predictions - final_flags_array.size),
                     "edge",
                 )
 
@@ -5621,7 +5621,7 @@ class Ui_MainWindow(object):
 
             rule_flags = rules_triggered_array
 
-            final_flags = [bool(flag) for flag in fusion_flags_array[:total_predictions]]
+            final_flags = [bool(flag) for flag in final_flags_array[:total_predictions]]
             final_statuses = ["异常" if flag else "正常" for flag in final_flags]
             fusion_scores = fusion_scores_array[:total_predictions]
 
@@ -5643,6 +5643,9 @@ class Ui_MainWindow(object):
                 out_df["fusion_status"] = pd.Series(row_statuses, dtype=object)
             out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
             out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
+            out_df["_final_decision"] = pd.Series(final_flags_array.astype(int), dtype=int)
+            out_df["_rules_triggered"] = pd.Series(rules_triggered_array.astype(int), dtype=int)
+            out_df["_rule_profile"] = rule_profile
             if rule_scores_series is not None:
                 out_df["rules_score"] = rule_scores_series
             else:
@@ -5992,7 +5995,7 @@ class Ui_MainWindow(object):
 
         model_scores_input = np.clip(np.asarray(risk_score, dtype=float), 0.0, 1.0)
         model_confidence_input = np.maximum(model_scores_input, 1.0 - model_scores_input)
-        fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
+        fusion_scores_array, final_flags_array, rules_triggered_array = fuse_model_rule_votes(
             model_scores_input,
             rule_scores_array,
             model_weight=float(fusion_model_weight_base),
@@ -6003,7 +6006,7 @@ class Ui_MainWindow(object):
             model_confidence=model_confidence_input,
         )
         fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
-        fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
+        final_flags_array = np.asarray(final_flags_array, dtype=bool)
         rules_triggered_array = np.asarray(rules_triggered_array, dtype=bool)
         if fusion_scores_array.size < total:
             fusion_scores_array = np.pad(
@@ -6011,10 +6014,10 @@ class Ui_MainWindow(object):
                 (0, total - fusion_scores_array.size),
                 "edge",
             )
-        if fusion_flags_array.size < total:
-            fusion_flags_array = np.pad(
-                fusion_flags_array,
-                (0, total - fusion_flags_array.size),
+        if final_flags_array.size < total:
+            final_flags_array = np.pad(
+                final_flags_array,
+                (0, total - final_flags_array.size),
                 "edge",
             )
         if rules_triggered_array.size < total:
@@ -6026,9 +6029,9 @@ class Ui_MainWindow(object):
         elif rules_triggered_array.size > total:
             rules_triggered_array = rules_triggered_array[:total]
         rule_flags = rules_triggered_array
-        fusion_flags = fusion_flags_array[:total]
+        final_flags = final_flags_array[:total]
         fusion_scores = fusion_scores_array[:total]
-        final_statuses = ["异常" if flag else "正常" for flag in fusion_flags]
+        final_statuses = ["异常" if flag else "正常" for flag in final_flags]
 
         out_df["prediction"] = preds
         out_df["anomaly_score"] = scores
@@ -6038,8 +6041,11 @@ class Ui_MainWindow(object):
         out_df["model_anomaly"] = pd.Series(model_flag_values, dtype=int)
         out_df["model_status"] = pd.Series(model_statuses, dtype=object)
         out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
-        out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
-        out_df["prediction_status"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
+        out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in final_flags], dtype=int)
+        out_df["_final_decision"] = pd.Series(final_flags.astype(int), dtype=int)
+        out_df["_rules_triggered"] = pd.Series(rule_flags.astype(int), dtype=int)
+        out_df["_rule_profile"] = rule_profile
+        out_df["prediction_status"] = pd.Series([1 if flag else 0 for flag in final_flags], dtype=int)
         out_df["fusion_status"] = pd.Series(final_statuses, dtype=object)
         if rule_scores_series is not None:
             out_df["rules_score"] = rule_scores_series
@@ -6053,9 +6059,9 @@ class Ui_MainWindow(object):
         elif "rules_reasons" not in out_df.columns:
             out_df["rules_reasons"] = ["" for _ in range(total)]
 
-        out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
+        out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in final_flags], dtype=int)
 
-        malicious = int(np.count_nonzero(fusion_flags))
+        malicious = int(np.count_nonzero(final_flags))
         ratio = (malicious / total) if total else 0.0
 
         score_min = float(np.min(scores)) if len(scores) else 0.0
