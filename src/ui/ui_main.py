@@ -106,7 +106,8 @@ try:
         get_rule_settings,
         score_rules as apply_risk_rules,
     )
-except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
+except Exception as e:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
+    logging.exception("❌ risk_rules import failed, fallback to model-only. Error: %s", e)
     apply_risk_rules = None  # type: ignore
     DEFAULT_TRIGGER_THRESHOLD = 40.0  # type: ignore
     DEFAULT_MODEL_WEIGHT = 0.3  # type: ignore
@@ -115,21 +116,32 @@ except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型�
     RULE_TRIGGER_THRESHOLD = 25.0  # type: ignore
 
     def get_rule_settings(profile: Optional[str] = None) -> Dict[str, object]:  # type: ignore
+        p = (profile or "baseline").strip().lower()
+        if p.startswith("agg"):
+            return {
+                "params": {},
+                "trigger_threshold": 30.0,
+                "model_weight": 0.35,
+                "rule_weight": 0.65,
+                "fusion_threshold": 0.35,
+                "profile": "aggressive",
+            }
         return {
             "params": {},
-            "trigger_threshold": float(DEFAULT_TRIGGER_THRESHOLD),
-            "model_weight": float(DEFAULT_MODEL_WEIGHT),
-            "rule_weight": float(DEFAULT_RULE_WEIGHT),
-            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
-            "profile": profile,
+            "trigger_threshold": 65.0,
+            "model_weight": 0.85,
+            "rule_weight": 0.15,
+            "fusion_threshold": 0.75,
+            "profile": "baseline",
         }
 
     def get_fusion_settings(profile: Optional[str] = None) -> Dict[str, float]:  # type: ignore
+        s = get_rule_settings(profile)
         return {
-            "model_weight": float(DEFAULT_MODEL_WEIGHT),
-            "rule_weight": float(DEFAULT_RULE_WEIGHT),
-            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
-            "profile": profile or "baseline",
+            "model_weight": float(s["model_weight"]),
+            "rule_weight": float(s["rule_weight"]),
+            "fusion_threshold": float(s["fusion_threshold"]),
+            "profile": str(s["profile"]),
         }
 
     def fuse_model_rule_votes(
@@ -5536,11 +5548,11 @@ class Ui_MainWindow(object):
             rule_profile = fusion_defaults.get("profile") if rule_profile is None else rule_profile
             normalized_weights = rule_settings.get("normalized_weights")
 
-            effective_rule_threshold = min(
-                float(rule_threshold_value),
-                float(RULE_TRIGGER_THRESHOLD),
-            )
-            rule_threshold = float(effective_rule_threshold)
+            try:
+                rule_threshold = float(rule_threshold_value)
+            except (TypeError, ValueError):
+                rule_threshold = float(RULE_TRIGGER_THRESHOLD)
+            rule_threshold = max(rule_threshold, 0.0)
             rule_scores_series = None
             rule_reasons_series = None
             rule_flags = np.zeros(total_predictions, dtype=bool)
