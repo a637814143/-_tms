@@ -2714,7 +2714,7 @@ class Ui_MainWindow(object):
         self._selected_model_key = key
         self._selected_metadata = metadata
         self._selected_metadata_path = entry.get("metadata_path")
-        self._selected_pipeline_path = entry.get("pipeline_path")
+        self._selected_pipeline_path = entry.get("pipeline")
 
         info_lines = []
         if metadata.get("timestamp"):
@@ -5213,7 +5213,9 @@ class Ui_MainWindow(object):
                 )
                 raw_column_set = {str(col) for col in normalized_cols}
                 df_clean = preprocessor.clean_data(df)
-                feature_df_raw = df_clean.loc[:, expected_features]
+                feature_df_raw = df_clean.reindex(
+                    columns=expected_features, fill_value=0.0
+                )
                 missing_columns = [
                     col for col in expected_features if col not in raw_column_set
                 ]
