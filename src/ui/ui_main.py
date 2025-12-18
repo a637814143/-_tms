@@ -5125,8 +5125,6 @@ class Ui_MainWindow(object):
         metadata_path = bundle.get("metadata_path")
         metadata_obj = bundle.get("metadata") or {}
         metadata = dict(metadata_obj) if isinstance(metadata_obj, dict) else {}
-        if isinstance(metadata_override, dict):
-            metadata.update(metadata_override)
 
         model_type_text = ""
         profile_label = "CICIDS / PCAP 模型"
@@ -5177,6 +5175,9 @@ class Ui_MainWindow(object):
                 if isinstance(metadata_from_disk, dict):
                     metadata.update(metadata_from_disk)
                     metadata_path = str(globbed[0])
+
+        if isinstance(metadata_override, dict):
+            metadata.update(metadata_override)
 
         self.display_result(f"[INFO] 当前加载模型类型：{profile_label}")
         if pipeline_path:
