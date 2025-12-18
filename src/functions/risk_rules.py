@@ -97,13 +97,13 @@ PROFILE_PRESETS: Dict[str, Dict[str, Any]] = {
         "TOTAL_DIRECTIONAL_PKTS": 120.0,
     },
     "aggressive": {
-        # 只要规则分数达到 35 就当“很可疑”
-        "trigger_threshold": 30.0,
+        # 只要规则分数达到 25-30 就当“很可疑”
+        "trigger_threshold": 25.0,
         # 规则权重更高，宁可多报一点
-        "model_weight": 0.35,
-        "rule_weight": 0.65,
+        "model_weight": 0.25,
+        "rule_weight": 0.75,
         # 融合阈值放宽
-        "fusion_threshold": 0.35,
+        "fusion_threshold": 0.3,
         # aggressive 模式：融合得分 OR 强规则命中
         "mode": "aggressive",
         "FLOW_PPS_THRESHOLD": 90.0,
