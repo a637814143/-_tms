@@ -150,6 +150,14 @@ def get_rule_settings(profile: Optional[str] = None) -> Dict[str, Any]:
         selected_profile = DEFAULT_RULE_PROFILE
     selected_profile = selected_profile.strip().lower() or DEFAULT_RULE_PROFILE
 
+    # 兼容 UI 传入的展示文本（如 Aggressive（高敏）/ Baseline（常规））
+    if selected_profile not in {"baseline", "aggressive"}:
+        if selected_profile.startswith("agg") or "aggressive" in selected_profile or "高敏" in selected_profile:
+            selected_profile = "aggressive"
+        elif selected_profile.startswith("base") or "baseline" in selected_profile or "常规" in selected_profile:
+            selected_profile = "baseline"
+
+
     # 2) YAML 中若配置了 profiles，优先使用；否则用内置预设
     profiles_cfg_raw = rules_cfg.get("profiles")
     if isinstance(profiles_cfg_raw, dict) and profiles_cfg_raw:

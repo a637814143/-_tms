@@ -1,5 +1,4 @@
 
-
 # -*- coding: utf-8 -*-
 from PyQt5 import QtCore, QtGui, QtWidgets
 import sys, os, platform, subprocess, math, shutil, json, textwrap, logging
@@ -107,8 +106,7 @@ try:
         get_rule_settings,
         score_rules as apply_risk_rules,
     )
-except Exception as e:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
-    logging.exception("❌ risk_rules import failed, fallback to model-only. Error: %s", e)
+except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
     apply_risk_rules = None  # type: ignore
     DEFAULT_TRIGGER_THRESHOLD = 40.0  # type: ignore
     DEFAULT_MODEL_WEIGHT = 0.3  # type: ignore
@@ -117,32 +115,21 @@ except Exception as e:  # pragma: no cover - 规则引擎缺失时退化为纯�
     RULE_TRIGGER_THRESHOLD = 25.0  # type: ignore
 
     def get_rule_settings(profile: Optional[str] = None) -> Dict[str, object]:  # type: ignore
-        p = (profile or "baseline").strip().lower()
-        if p.startswith("agg"):
-            return {
-                "params": {},
-                "trigger_threshold": 30.0,
-                "model_weight": 0.35,
-                "rule_weight": 0.65,
-                "fusion_threshold": 0.35,
-                "profile": "aggressive",
-            }
         return {
             "params": {},
-            "trigger_threshold": 65.0,
-            "model_weight": 0.85,
-            "rule_weight": 0.15,
-            "fusion_threshold": 0.75,
-            "profile": "baseline",
+            "trigger_threshold": float(DEFAULT_TRIGGER_THRESHOLD),
+            "model_weight": float(DEFAULT_MODEL_WEIGHT),
+            "rule_weight": float(DEFAULT_RULE_WEIGHT),
+            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+            "profile": profile,
         }
 
     def get_fusion_settings(profile: Optional[str] = None) -> Dict[str, float]:  # type: ignore
-        s = get_rule_settings(profile)
         return {
-            "model_weight": float(s["model_weight"]),
-            "rule_weight": float(s["rule_weight"]),
-            "fusion_threshold": float(s["fusion_threshold"]),
-            "profile": str(s["profile"]),
+            "model_weight": float(DEFAULT_MODEL_WEIGHT),
+            "rule_weight": float(DEFAULT_RULE_WEIGHT),
+            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
+            "profile": profile or "baseline",
         }
 
     def fuse_model_rule_votes(
@@ -1592,17 +1579,43 @@ class Ui_MainWindow(object):
             btn.setEnabled(enabled)
 
     def _current_rule_profile(self) -> Optional[str]:
+        """读取 UI 当前选择的规则档位，并规范化为内部可识别的 token。
+
+        说明：
+        - 优先读取 QComboBox.itemData(UserRole)（应为 baseline / aggressive）。
+        - 若取不到 data，则回退到 currentText（如 'Aggressive（高敏）'）。
+        - 无论哪种来源，都做一次归一化映射，避免传入 risk_rules 后回退到 baseline。
+        """
+
         combo = getattr(self, "rule_profile_combo", None)
+        token = ""
         if isinstance(combo, QtWidgets.QComboBox):
-            data = combo.currentData()
+            try:
+                data = combo.currentData()
+            except Exception:
+                data = None
             candidate = data if isinstance(data, str) else combo.currentText()
-            candidate = str(candidate).strip().lower()
-            if candidate:
-                return candidate
-        stored = getattr(self, "_last_rule_profile", None)
-        if isinstance(stored, str) and stored.strip():
-            return stored.strip().lower()
-        return None
+            token = str(candidate).strip().lower() if candidate is not None else ""
+
+        if not token:
+            stored = getattr(self, "_last_rule_profile", None)
+            if isinstance(stored, str):
+                token = stored.strip().lower()
+
+        if not token:
+            return None
+
+        # 统一把 UI 展示文本映射为内部 profile key
+        if token in {"baseline", "aggressive"}:
+            return token
+        if token.startswith("agg") or "aggressive" in token or "高敏" in token:
+            return "aggressive"
+        if token.startswith("base") or "baseline" in token or "常规" in token:
+            return "baseline"
+        # 兜底：包含“敏”字默认认为高敏
+        if "敏" in token:
+            return "aggressive"
+        return token
 
     def _update_rule_profile_tip(self, profile: Optional[str]) -> None:
         label = getattr(self, "rule_profile_hint", None)
@@ -1684,14 +1697,24 @@ class Ui_MainWindow(object):
         metadata: Optional[dict],
         profile: Optional[str],
     ) -> Optional[dict]:
+        """把当前规则档位写入 metadata（并确保 token 可被规则引擎识别）。"""
+
         if not profile:
             return metadata
+
+        token = str(profile).strip().lower()
+        if token not in {"baseline", "aggressive"}:
+            if token.startswith("agg") or "aggressive" in token or "高敏" in token:
+                token = "aggressive"
+            elif token.startswith("base") or "baseline" in token or "常规" in token:
+                token = "baseline"
+
         base: dict
         if isinstance(metadata, dict):
             base = dict(metadata)
         else:
             base = {}
-        base["rule_profile"] = profile
+        base["rule_profile"] = token
         return base
 
     def _resolve_rule_settings(self, metadata: Optional[Dict[str, object]] = None) -> Dict[str, object]:
@@ -1701,7 +1724,16 @@ class Ui_MainWindow(object):
         if not isinstance(profile_override, str) or not profile_override.strip():
             profile_override = None
         else:
-            profile_override = profile_override.strip()
+            token = profile_override.strip().lower()
+            # 允许 UI 传入 'Aggressive（高敏）' / 'Baseline（常规）' 等文本
+            if token in {"baseline", "aggressive"}:
+                profile_override = token
+            elif token.startswith("agg") or "aggressive" in token or "高敏" in token:
+                profile_override = "aggressive"
+            elif token.startswith("base") or "baseline" in token or "常规" in token:
+                profile_override = "baseline"
+            else:
+                profile_override = token
 
         try:
             settings = get_rule_settings(profile=profile_override)
@@ -1725,7 +1757,7 @@ class Ui_MainWindow(object):
                 "profile": profile or "baseline",
             }
 
-        profile_name = profile.strip() if isinstance(profile, str) and profile.strip() else None
+        profile_name = profile.strip().lower() if isinstance(profile, str) and profile.strip() else None
         if profile_name is None:
             candidate_profile = fusion_defaults.get("profile")
             if isinstance(candidate_profile, str) and candidate_profile.strip():
@@ -5549,11 +5581,15 @@ class Ui_MainWindow(object):
             rule_profile = fusion_defaults.get("profile") if rule_profile is None else rule_profile
             normalized_weights = rule_settings.get("normalized_weights")
 
+            # 规则触发阈值来自档位配置：baseline=65 / aggressive=25
+            # 不要再用 min(..., RULE_TRIGGER_THRESHOLD) 否则 baseline 会被错误压到 25
             try:
                 rule_threshold = float(rule_threshold_value)
-            except (TypeError, ValueError):
-                rule_threshold = float(RULE_TRIGGER_THRESHOLD)
-            rule_threshold = max(rule_threshold, 0.0)
+            except Exception:
+                rule_threshold = float(DEFAULT_TRIGGER_THRESHOLD)
+            if not math.isfinite(rule_threshold):
+                rule_threshold = float(DEFAULT_TRIGGER_THRESHOLD)
+            rule_threshold = max(0.0, min(rule_threshold, 100.0))
             rule_scores_series = None
             rule_reasons_series = None
             rule_flags = np.zeros(total_predictions, dtype=bool)
@@ -5583,7 +5619,17 @@ class Ui_MainWindow(object):
             )
 
             model_score_array = np.clip(np.asarray(scores, dtype=float), 0.0, 1.0)
-            model_confidence_array = np.maximum(model_score_array, 1.0 - model_score_array)
+            # 默认使用“模型置信度动态权重”，但在 aggressive（高敏）下建议让规则权重真正生效：
+
+            # - aggressive: 使用显式 model_weight/rule_weight（不传 model_confidence）
+
+            # - baseline: 继续使用动态权重
+
+            model_confidence_array = None
+
+            if not (isinstance(rule_profile, str) and rule_profile.strip().lower().startswith("agg")):
+
+                model_confidence_array = np.maximum(model_score_array, 1.0 - model_score_array)
             fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
                 model_score_array,
                 rule_scores_array,
@@ -5664,7 +5710,18 @@ class Ui_MainWindow(object):
             os.makedirs(output_dir, exist_ok=True)
             safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in source_name)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_csv = os.path.join(output_dir, f"prediction_{safe_name}_{stamp}.csv")
+            profile_tag = str(rule_profile or "baseline").strip().lower()
+            if profile_tag.startswith("agg") or "高敏" in profile_tag:
+                profile_tag = "aggressive"
+            elif profile_tag.startswith("base") or "常规" in profile_tag:
+                profile_tag = "baseline"
+            # 输出调试信息：确保你能在结果里看到本次使用的档位/权重/阈值
+            out_df["_rule_profile"] = profile_tag
+            out_df["_rule_threshold"] = float(rule_threshold)
+            out_df["_fusion_threshold"] = float(fusion_threshold_value)
+            out_df["_model_weight"] = float(fusion_model_weight_base)
+            out_df["_rule_weight"] = float(fusion_rule_weight_base)
+            out_csv = os.path.join(output_dir, f"prediction_{safe_name}_{profile_tag}_{stamp}.csv")
             out_df.to_csv(out_csv, index=False, encoding="utf-8")
 
             total_rows = int(len(out_df))
@@ -5957,11 +6014,15 @@ class Ui_MainWindow(object):
         rule_profile = fusion_defaults.get("profile") if rule_profile is None else rule_profile
         normalized_weights = rule_settings.get("normalized_weights")
 
-        effective_rule_threshold = min(
-            float(rule_threshold_value),
-            float(RULE_TRIGGER_THRESHOLD),
-        )
-        rule_threshold = float(effective_rule_threshold)
+        # 规则触发阈值来自档位配置：baseline=65 / aggressive=25
+        # 不要再用 min(..., RULE_TRIGGER_THRESHOLD) 否则 baseline 会被错误压到 25
+        try:
+            rule_threshold = float(rule_threshold_value)
+        except Exception:
+            rule_threshold = float(DEFAULT_TRIGGER_THRESHOLD)
+        if not math.isfinite(rule_threshold):
+            rule_threshold = float(DEFAULT_TRIGGER_THRESHOLD)
+        rule_threshold = max(0.0, min(rule_threshold, 100.0))
         rule_scores_series = None
         rule_reasons_series = None
         total = int(len(out_df))
@@ -5992,7 +6053,11 @@ class Ui_MainWindow(object):
         )
 
         model_scores_input = np.clip(np.asarray(risk_score, dtype=float), 0.0, 1.0)
-        model_confidence_input = np.maximum(model_scores_input, 1.0 - model_scores_input)
+        model_confidence_input = None
+
+        if not (isinstance(rule_profile, str) and rule_profile.strip().lower().startswith("agg")):
+
+            model_confidence_input = np.maximum(model_scores_input, 1.0 - model_scores_input)
         fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
             model_scores_input,
             rule_scores_array,
@@ -6105,7 +6170,18 @@ class Ui_MainWindow(object):
         os.makedirs(output_dir, exist_ok=True)
         safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in source_name)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_csv = os.path.join(output_dir, f"prediction_{safe_name}_{stamp}.csv")
+        profile_tag = str(rule_profile or "baseline").strip().lower()
+        if profile_tag.startswith("agg") or "高敏" in profile_tag:
+            profile_tag = "aggressive"
+        elif profile_tag.startswith("base") or "常规" in profile_tag:
+            profile_tag = "baseline"
+        # 输出调试信息：确保你能在结果里看到本次使用的档位/权重/阈值
+        out_df["_rule_profile"] = profile_tag
+        out_df["_rule_threshold"] = float(rule_threshold)
+        out_df["_fusion_threshold"] = float(fusion_threshold_value)
+        out_df["_model_weight"] = float(fusion_model_weight_base)
+        out_df["_rule_weight"] = float(fusion_rule_weight_base)
+        out_csv = os.path.join(output_dir, f"prediction_{safe_name}_{profile_tag}_{stamp}.csv")
         out_df.to_csv(out_csv, index=False, encoding="utf-8")
 
         messages.extend(summary_lines)
