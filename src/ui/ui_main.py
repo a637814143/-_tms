@@ -106,7 +106,8 @@ try:
         get_rule_settings,
         score_rules as apply_risk_rules,
     )
-except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
+except Exception as e:  # pragma: no cover - 规则引擎缺失时退化为纯模型预测
+    logging.exception("❌ risk_rules import failed, fallback to model-only. Error: %s", e)
     apply_risk_rules = None  # type: ignore
     DEFAULT_TRIGGER_THRESHOLD = 40.0  # type: ignore
     DEFAULT_MODEL_WEIGHT = 0.3  # type: ignore
@@ -115,21 +116,32 @@ except Exception:  # pragma: no cover - 规则引擎缺失时退化为纯模型�
     RULE_TRIGGER_THRESHOLD = 25.0  # type: ignore
 
     def get_rule_settings(profile: Optional[str] = None) -> Dict[str, object]:  # type: ignore
+        p = (profile or "baseline").strip().lower()
+        if p.startswith("agg"):
+            return {
+                "params": {},
+                "trigger_threshold": 30.0,
+                "model_weight": 0.35,
+                "rule_weight": 0.65,
+                "fusion_threshold": 0.35,
+                "profile": "aggressive",
+            }
         return {
             "params": {},
-            "trigger_threshold": float(DEFAULT_TRIGGER_THRESHOLD),
-            "model_weight": float(DEFAULT_MODEL_WEIGHT),
-            "rule_weight": float(DEFAULT_RULE_WEIGHT),
-            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
-            "profile": profile,
+            "trigger_threshold": 65.0,
+            "model_weight": 0.85,
+            "rule_weight": 0.15,
+            "fusion_threshold": 0.75,
+            "profile": "baseline",
         }
 
     def get_fusion_settings(profile: Optional[str] = None) -> Dict[str, float]:  # type: ignore
+        s = get_rule_settings(profile)
         return {
-            "model_weight": float(DEFAULT_MODEL_WEIGHT),
-            "rule_weight": float(DEFAULT_RULE_WEIGHT),
-            "fusion_threshold": float(DEFAULT_FUSION_THRESHOLD),
-            "profile": profile or "baseline",
+            "model_weight": float(s["model_weight"]),
+            "rule_weight": float(s["rule_weight"]),
+            "fusion_threshold": float(s["fusion_threshold"]),
+            "profile": str(s["profile"]),
         }
 
     def fuse_model_rule_votes(
@@ -1073,6 +1085,45 @@ def _feature_order_from_metadata(metadata: dict) -> List[str]:
     return [str(col) for col in values if str(col)]
 
 
+def _feature_order_from_pipeline(pipeline: object) -> List[str]:
+    order: List[str] = []
+
+    names = getattr(pipeline, "feature_names_in_", None)
+    if names is not None:
+        try:
+            order = [str(col) for col in list(names) if str(col)]
+        except Exception:
+            order = []
+
+    if order:
+        return order
+
+    try:  # pragma: no cover - runtime inspection only
+        from sklearn.compose import ColumnTransformer
+    except Exception:
+        ColumnTransformer = None  # type: ignore
+
+    if ColumnTransformer and hasattr(pipeline, "steps"):
+        try:
+            for _, step in pipeline.steps:  # type: ignore[attr-defined]
+                if isinstance(step, ColumnTransformer):
+                    cols: List[str] = []
+                    for _, col_set, _ in step.transformers_:  # type: ignore[attr-defined]
+                        if col_set in ("drop", "passthrough"):
+                            continue
+                        try:
+                            cols.extend([str(col) for col in list(col_set)])
+                        except Exception:
+                            continue
+                    if cols:
+                        order = cols
+                        break
+        except Exception:
+            order = order
+
+    return [str(col) for col in order if str(col)]
+
+
 def _align_input_features(
     df: "pd.DataFrame",
     metadata: dict,
@@ -1084,14 +1135,44 @@ def _align_input_features(
     if not isinstance(metadata, dict):
         raise ValueError("模型缺少有效的元数据。")
 
+    df = df.copy()
+    stripped_columns = [str(col).strip() for col in df.columns]
+    df.columns = stripped_columns
+
     schema_version = metadata.get("schema_version")
     if schema_version is None:
-        raise ValueError("模型元数据缺少 schema_version 字段，请重新训练模型。")
+        if strict:
+            raise ValueError("模型元数据缺少 schema_version 字段，请重新训练模型。")
+        schema_version = "unknown"
     info["schema_version"] = schema_version
 
     feature_order = _feature_order_from_metadata(metadata)
     if not feature_order:
         raise ValueError("模型元数据缺少 feature_order 描述，无法校验列。")
+
+    feature_order_set = set(feature_order)
+
+    # 仅当别名映射能提升与模型特征的重叠度时才应用，否则保持原始列名
+    alias_candidates = _apply_header_aliases(stripped_columns)
+    overlap_raw = len(set(df.columns) & feature_order_set)
+    overlap_alias = len(set(alias_candidates) & feature_order_set)
+    aliases_applied = False
+    if overlap_alias > overlap_raw:
+        df.columns = alias_candidates
+        aliases_applied = True
+    info["aliases_applied"] = aliases_applied
+
+    # 针对 UNSW 期待的 dur/spkts/... 特征，优先复制而非重命名，避免误伤 CICIDS 列
+    alias_copies = {
+        "Flow Duration": "dur",
+        "Total Fwd Packets": "spkts",
+        "Total Backward Packets": "dpkts",
+        "Total Length of Fwd Packets": "sbytes",
+        "Total Length of Bwd Packets": "dbytes",
+    }
+    for source_col, target_col in alias_copies.items():
+        if target_col in feature_order_set and target_col not in df.columns and source_col in df.columns:
+            df[target_col] = df[source_col]
 
     default_fill = 0.0
     allow_set = {str(col) for col in allow_extra or []}
@@ -1148,10 +1229,16 @@ def _align_input_features(
         # 在非严格模式下，只对齐模型所需特征，其他列直接忽略并且不提示
         if strict:
             extra_columns.append(column_norm)
+    missing_count = len(missing_columns)
+    total_features = max(len(feature_order), 1)
+    coverage_ratio = max(0.0, (total_features - missing_count) / float(total_features))
+
     info["missing_filled"] = missing_columns
     info["extra_columns"] = extra_columns
     info["feature_order"] = feature_order
     info["ignored_columns"] = ignored_columns
+    info["coverage"] = coverage_ratio
+    info["missing_count"] = missing_count
 
     if strict and (missing_columns or extra_columns):
         parts: List[str] = []
@@ -2558,12 +2645,26 @@ class Ui_MainWindow(object):
             return lambda key=key: str(PATHS[key])
         raise AttributeError(name)
 
+    def _resolve_model_profile_dir(self, profile: str) -> Path:
+        base_dir = Path(PATHS["models"])
+        candidates = [base_dir / profile]
+        hardcoded_base = Path(r"D:\pythonProject8\data\models")
+        candidates.append(hardcoded_base / profile)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        # 默认回落到首个候选并创建
+        fallback = candidates[0]
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
     def _default_models_dir(self) -> str:
         """
         根据当前 UI 选择的预测模型类型返回模型目录。
         例如 data/models/cicids 或 data/models/unsw，默认使用 cicids。
         """
-        base_dir = Path(PATHS["models"])
         profile = "cicids"
         combo = getattr(self, "model_profile_combo", None)
         if combo is not None:
@@ -2580,7 +2681,7 @@ class Ui_MainWindow(object):
                 else:
                     profile = token
 
-        models_dir = base_dir / profile
+        models_dir = self._resolve_model_profile_dir(profile)
         models_dir.mkdir(parents=True, exist_ok=True)
         return str(models_dir)
 
@@ -2590,7 +2691,6 @@ class Ui_MainWindow(object):
         CICIDS / PCAP -> data/models/cicids
         UNSW CSV     -> data/models/unsw
         """
-        base = Path(PATHS["models"])
         profile = None
 
         combo = getattr(self, "model_profile_combo", None)
@@ -2601,12 +2701,12 @@ class Ui_MainWindow(object):
                 profile = data.strip().lower()
 
         if profile in ("unsw", "unsw_csv", "unsw-model"):
-            return base / "unsw"
+            return self._resolve_model_profile_dir("unsw")
         elif profile in ("cicids", "cicids_pcap", "pcap-model"):
-            return base / "cicids"
+            return self._resolve_model_profile_dir("cicids")
 
         # 兜底：还是用老的 models 根目录
-        return base
+        return self._resolve_model_profile_dir("cicids")
 
     def _current_model_key(self) -> Optional[str]:
         """
@@ -2714,7 +2814,7 @@ class Ui_MainWindow(object):
         self._selected_model_key = key
         self._selected_metadata = metadata
         self._selected_metadata_path = entry.get("metadata_path")
-        self._selected_pipeline_path = entry.get("pipeline_path")
+        self._selected_pipeline_path = entry.get("pipeline")
 
         info_lines = []
         if metadata.get("timestamp"):
@@ -5125,8 +5225,6 @@ class Ui_MainWindow(object):
         metadata_path = bundle.get("metadata_path")
         metadata_obj = bundle.get("metadata") or {}
         metadata = dict(metadata_obj) if isinstance(metadata_obj, dict) else {}
-        if isinstance(metadata_override, dict):
-            metadata.update(metadata_override)
 
         model_type_text = ""
         profile_label = "CICIDS / PCAP 模型"
@@ -5140,9 +5238,8 @@ class Ui_MainWindow(object):
                 model_type_text = ""
 
         profile_token = "unsw" if "unsw" in model_type_text.lower() else "cicids"
-        expected_feature_count = 39 if profile_token == "unsw" else 80
-        models_base = Path(PATHS["models"])
-        profile_dir = models_base / profile_token
+        expected_feature_count: Optional[int] = None
+        profile_dir = self._resolve_model_profile_dir(profile_token)
         profile_dir.mkdir(parents=True, exist_ok=True)
         preferred_model_path = profile_dir / f"model_{profile_token}.joblib"
         fallback_model_path = profile_dir / "model.joblib"
@@ -5178,6 +5275,9 @@ class Ui_MainWindow(object):
                     metadata.update(metadata_from_disk)
                     metadata_path = str(globbed[0])
 
+        if isinstance(metadata_override, dict):
+            metadata.update(metadata_override)
+
         self.display_result(f"[INFO] 当前加载模型类型：{profile_label}")
         if pipeline_path:
             self.display_result(f"[INFO] 模型文件：{os.path.basename(pipeline_path)}")
@@ -5196,7 +5296,21 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.critical(parent_widget, "预测失败", f"无法加载模型：{exc}")
             return {}
 
-        feature_order = _feature_order_from_metadata(metadata)
+        metadata_for_align = dict(metadata) if isinstance(metadata, dict) else {}
+        schema_value = metadata.get("schema_version") if isinstance(metadata, dict) else None
+        if metadata_for_align.get("schema_version") is None:
+            metadata_for_align["schema_version"] = schema_value if schema_value is not None else "unknown"
+
+        pipeline_feature_order = _feature_order_from_pipeline(pipeline)
+        metadata_feature_order = _feature_order_from_metadata(metadata_for_align)
+        if pipeline_feature_order:
+            metadata_for_align["feature_order"] = pipeline_feature_order
+        feature_order = pipeline_feature_order or metadata_feature_order
+
+        if feature_order:
+            expected_feature_count = len(feature_order)
+        elif expected_feature_count is None:
+            expected_feature_count = 39 if profile_token == "unsw" else 80
         allowed_extra = set(self._prediction_allowed_extras(metadata))
         extras_detected: List[str] = []
         source = "profile_selection"
@@ -5205,6 +5319,7 @@ class Ui_MainWindow(object):
         try:
             if profile_token == "cicids":
                 expected_features = numeric_feature_names()
+                expected_feature_count = expected_feature_count or len(expected_features)
                 preprocessor = DataPreprocessor(
                     feature_columns=expected_features, include_label_binary=False
                 )
@@ -5213,7 +5328,9 @@ class Ui_MainWindow(object):
                 )
                 raw_column_set = {str(col) for col in normalized_cols}
                 df_clean = preprocessor.clean_data(df)
-                feature_df_raw = df_clean.loc[:, expected_features]
+                feature_df_raw = df_clean.reindex(
+                    columns=expected_features, fill_value=0.0
+                )
                 missing_columns = [
                     col for col in expected_features if col not in raw_column_set
                 ]
@@ -5224,20 +5341,30 @@ class Ui_MainWindow(object):
                     and col not in {"Label", "LabelBinary"}
                     and not str(col).lower().startswith("unnamed:")
                 ]
+                missing_count = len(missing_columns)
+                total_features = max(len(expected_features), 1)
+                coverage_ratio = max(
+                    0.0, (total_features - missing_count) / float(total_features)
+                )
                 align_info = {
                     "feature_order": expected_features,
                     "missing_filled": missing_columns,
                     "extra_columns": extra_columns,
                     "schema_version": metadata.get("schema_version"),
+                    "coverage": coverage_ratio,
+                    "missing_count": missing_count,
                 }
             elif feature_order:
                 feature_df_raw, align_info = _align_input_features(
                     df,
-                    metadata,
+                    metadata_for_align,
                     strict=False,
                     allow_extra=allowed_extra.union(
                         {"Label", "label", "LabelBinary", "attack_cat", "id"}
                     ),
+                )
+                align_info["feature_source"] = (
+                    "pipeline" if pipeline_feature_order else "metadata"
                 )
             else:
                 numeric_df = df.select_dtypes(include=["number"])
@@ -5256,6 +5383,30 @@ class Ui_MainWindow(object):
             )
             return {}
 
+        coverage_ratio = None
+        feature_order_for_cov: Sequence[str] = []
+        if isinstance(align_info, dict):
+            feature_order_for_cov = align_info.get("feature_order") or []
+            missing_after_align = align_info.get("missing_filled") or []
+            missing_count_value = len(missing_after_align)
+            if feature_order_for_cov:
+                coverage_ratio = align_info.get("coverage")
+                if coverage_ratio is None:
+                    total_feat = max(len(feature_order_for_cov), 1)
+                    coverage_ratio = max(0.0, (total_feat - missing_count_value) / float(total_feat))
+                    align_info["coverage"] = coverage_ratio
+                align_info["missing_count"] = missing_count_value
+                if missing_count_value / max(len(feature_order_for_cov), 1) > 0.3:
+                    QtWidgets.QMessageBox.warning(
+                        parent_widget,
+                        "特征覆盖率过低",
+                        (
+                            "检测到输入缺失大量模型特征，结果可能不可信。\n"
+                            f"缺失 {missing_count_value} / {len(feature_order_for_cov)} 列。\n"
+                            "请使用对应数据集的特征 CSV / PCAP 处理链，或切换匹配的模型。"
+                        ),
+                    )
+
         if expected_feature_count is not None:
             feature_count = feature_df_raw.shape[1]
             missing_after_align = align_info.get("missing_filled") if isinstance(align_info, dict) else None
@@ -5271,13 +5422,12 @@ class Ui_MainWindow(object):
                 )
             self.display_result("[INFO] " + "; ".join(summary_parts))
             if feature_count != expected_feature_count:
-                QtWidgets.QMessageBox.warning(
+                QtWidgets.QMessageBox.information(
                     parent_widget,
-                    "特征数量不匹配",
+                    "特征数量不完全匹配",
                     f"当前模型期望 {expected_feature_count} 个特征，对齐后得到 {feature_count} 个。\n"
-                    "缺失列已补 0，多余列已忽略，请确认选择了正确的模型类型（CICIDS / UNSW）和数据格式。",
+                    "继续预测并自动填补/忽略差异，如结果异常请检查模型类型与数据格式。",
                 )
-                return {}
 
         self._selected_model_key = model_key
         self._selected_metadata = metadata
@@ -5311,17 +5461,26 @@ class Ui_MainWindow(object):
         if pipeline_features is not None:
             pipeline_cols = [str(col) for col in pipeline_features]
             if list(pipeline_cols) != list(expected_order):
-                raise RuntimeError(
-                    "模型管线的特征列顺序与训练时不一致，请重新训练或重新选择模型。"
+                # 以模型自身记录的列顺序为准进行重排/补齐，避免因元数据差异阻断预测。
+                missing_for_pipeline = [col for col in pipeline_cols if col not in feature_df_raw.columns]
+                if missing_for_pipeline:
+                    for col in missing_for_pipeline:
+                        feature_df_raw[col] = 0.0
+                feature_df_raw = feature_df_raw.reindex(columns=pipeline_cols, fill_value=0.0)
+                expected_order = pipeline_cols
+                expected_feature_count = len(expected_order)
+                self.display_result(
+                    "[INFO] 已按照模型内部特征顺序重新对齐列并填充缺失特征。"
                 )
 
         if isinstance(pipeline, dict) and "model" in pipeline and "feature_names" in pipeline:
             feature_names = [str(name) for name in pipeline.get("feature_names", [])]
             if not feature_names:
                 feature_names = list(expected_order)
-            if feature_names and expected_order and list(feature_names) != list(expected_order):
-                feature_df_raw = feature_df_raw.loc[:, feature_names]
-            matrix = feature_df_raw.loc[:, feature_names].to_numpy(dtype=np.float64, copy=False)
+            feature_df_raw = feature_df_raw.reindex(
+                columns=feature_names, fill_value=0.0
+            )
+            matrix = feature_df_raw.to_numpy(dtype=np.float64, copy=False)
 
             model = pipeline["model"]
             positive_keywords = {"异常", "恶意", "malicious", "anomaly", "attack", "1", "-1"}
@@ -5533,11 +5692,11 @@ class Ui_MainWindow(object):
             rule_profile = fusion_defaults.get("profile") if rule_profile is None else rule_profile
             normalized_weights = rule_settings.get("normalized_weights")
 
-            effective_rule_threshold = min(
-                float(rule_threshold_value),
-                float(RULE_TRIGGER_THRESHOLD),
-            )
-            rule_threshold = float(effective_rule_threshold)
+            try:
+                rule_threshold = float(rule_threshold_value)
+            except (TypeError, ValueError):
+                rule_threshold = float(RULE_TRIGGER_THRESHOLD)
+            rule_threshold = max(rule_threshold, 0.0)
             rule_scores_series = None
             rule_reasons_series = None
             rule_flags = np.zeros(total_predictions, dtype=bool)
@@ -5568,7 +5727,7 @@ class Ui_MainWindow(object):
 
             model_score_array = np.clip(np.asarray(scores, dtype=float), 0.0, 1.0)
             model_confidence_array = np.maximum(model_score_array, 1.0 - model_score_array)
-            fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
+            fusion_scores_array, final_flags_array, rules_triggered_array = fuse_model_rule_votes(
                 model_score_array,
                 rule_scores_array,
                 model_weight=float(fusion_model_weight_base),
@@ -5579,7 +5738,7 @@ class Ui_MainWindow(object):
                 model_confidence=model_confidence_array,
             )
             fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
-            fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
+            final_flags_array = np.asarray(final_flags_array, dtype=bool)
             rules_triggered_array = np.asarray(rules_triggered_array, dtype=bool)
 
             if fusion_scores_array.size < total_predictions:
@@ -5588,10 +5747,10 @@ class Ui_MainWindow(object):
                     (0, total_predictions - fusion_scores_array.size),
                     "edge",
                 )
-            if fusion_flags_array.size < total_predictions:
-                fusion_flags_array = np.pad(
-                    fusion_flags_array,
-                    (0, total_predictions - fusion_flags_array.size),
+            if final_flags_array.size < total_predictions:
+                final_flags_array = np.pad(
+                    final_flags_array,
+                    (0, total_predictions - final_flags_array.size),
                     "edge",
                 )
 
@@ -5606,7 +5765,7 @@ class Ui_MainWindow(object):
 
             rule_flags = rules_triggered_array
 
-            final_flags = [bool(flag) for flag in fusion_flags_array[:total_predictions]]
+            final_flags = [bool(flag) for flag in final_flags_array[:total_predictions]]
             final_statuses = ["异常" if flag else "正常" for flag in final_flags]
             fusion_scores = fusion_scores_array[:total_predictions]
 
@@ -5619,15 +5778,32 @@ class Ui_MainWindow(object):
             elif total_predictions:
                 status_text = "正常"
 
+            coverage_value = None
+            missing_value = None
+            total_feature_value = None
+            if isinstance(align_info, dict):
+                coverage_value = align_info.get("coverage")
+                missing_value = align_info.get("missing_count")
+                total_feature_value = len(align_info.get("feature_order") or [])
+
             out_df["prediction"] = [int(value) if isinstance(value, (int, np.integer)) else value for value in preds]
             out_df["prediction_label"] = display_labels
             out_df["malicious_score"] = [float(value) for value in np.asarray(scores, dtype=float)]
             out_df["model_status"] = pd.Series(model_statuses, dtype=object)
             out_df["model_flag"] = pd.Series(model_flag_values, dtype=int)
+            if coverage_value is not None:
+                out_df["_input_coverage"] = float(coverage_value)
+            if missing_value is not None:
+                out_df["_missing_features"] = int(missing_value)
+            if total_feature_value is not None:
+                out_df["_total_model_features"] = int(total_feature_value)
             if row_statuses:
                 out_df["fusion_status"] = pd.Series(row_statuses, dtype=object)
             out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
             out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in anomaly_flags], dtype=int)
+            out_df["_final_decision"] = pd.Series(final_flags_array.astype(int), dtype=int)
+            out_df["_rules_triggered"] = pd.Series(rules_triggered_array.astype(int), dtype=int)
+            out_df["_rule_profile"] = rule_profile
             if rule_scores_series is not None:
                 out_df["rules_score"] = rule_scores_series
             else:
@@ -5977,7 +6153,7 @@ class Ui_MainWindow(object):
 
         model_scores_input = np.clip(np.asarray(risk_score, dtype=float), 0.0, 1.0)
         model_confidence_input = np.maximum(model_scores_input, 1.0 - model_scores_input)
-        fusion_scores_array, fusion_flags_array, rules_triggered_array = fuse_model_rule_votes(
+        fusion_scores_array, final_flags_array, rules_triggered_array = fuse_model_rule_votes(
             model_scores_input,
             rule_scores_array,
             model_weight=float(fusion_model_weight_base),
@@ -5988,7 +6164,7 @@ class Ui_MainWindow(object):
             model_confidence=model_confidence_input,
         )
         fusion_scores_array = np.asarray(fusion_scores_array, dtype=float)
-        fusion_flags_array = np.asarray(fusion_flags_array, dtype=bool)
+        final_flags_array = np.asarray(final_flags_array, dtype=bool)
         rules_triggered_array = np.asarray(rules_triggered_array, dtype=bool)
         if fusion_scores_array.size < total:
             fusion_scores_array = np.pad(
@@ -5996,10 +6172,10 @@ class Ui_MainWindow(object):
                 (0, total - fusion_scores_array.size),
                 "edge",
             )
-        if fusion_flags_array.size < total:
-            fusion_flags_array = np.pad(
-                fusion_flags_array,
-                (0, total - fusion_flags_array.size),
+        if final_flags_array.size < total:
+            final_flags_array = np.pad(
+                final_flags_array,
+                (0, total - final_flags_array.size),
                 "edge",
             )
         if rules_triggered_array.size < total:
@@ -6011,9 +6187,9 @@ class Ui_MainWindow(object):
         elif rules_triggered_array.size > total:
             rules_triggered_array = rules_triggered_array[:total]
         rule_flags = rules_triggered_array
-        fusion_flags = fusion_flags_array[:total]
+        final_flags = final_flags_array[:total]
         fusion_scores = fusion_scores_array[:total]
-        final_statuses = ["异常" if flag else "正常" for flag in fusion_flags]
+        final_statuses = ["异常" if flag else "正常" for flag in final_flags]
 
         out_df["prediction"] = preds
         out_df["anomaly_score"] = scores
@@ -6023,8 +6199,11 @@ class Ui_MainWindow(object):
         out_df["model_anomaly"] = pd.Series(model_flag_values, dtype=int)
         out_df["model_status"] = pd.Series(model_statuses, dtype=object)
         out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
-        out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
-        out_df["prediction_status"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
+        out_df["fusion_decision"] = pd.Series([1 if flag else 0 for flag in final_flags], dtype=int)
+        out_df["_final_decision"] = pd.Series(final_flags.astype(int), dtype=int)
+        out_df["_rules_triggered"] = pd.Series(rule_flags.astype(int), dtype=int)
+        out_df["_rule_profile"] = rule_profile
+        out_df["prediction_status"] = pd.Series([1 if flag else 0 for flag in final_flags], dtype=int)
         out_df["fusion_status"] = pd.Series(final_statuses, dtype=object)
         if rule_scores_series is not None:
             out_df["rules_score"] = rule_scores_series
@@ -6038,9 +6217,9 @@ class Ui_MainWindow(object):
         elif "rules_reasons" not in out_df.columns:
             out_df["rules_reasons"] = ["" for _ in range(total)]
 
-        out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in fusion_flags], dtype=int)
+        out_df["is_malicious"] = pd.Series([1 if flag else 0 for flag in final_flags], dtype=int)
 
-        malicious = int(np.count_nonzero(fusion_flags))
+        malicious = int(np.count_nonzero(final_flags))
         ratio = (malicious / total) if total else 0.0
 
         score_min = float(np.min(scores)) if len(scores) else 0.0

@@ -70,6 +70,8 @@ DEFAULTS = dict(
     UP_RATIO_THRESHOLD = 0.95,          # 上行占比阈值
     MIN_PKT_LEN_THRESHOLD = 40.0,       # 最小包长阈值（字节）
     TOTAL_DIRECTIONAL_PKTS = 100.0,     # 单向最小包数阈值
+    RISKY_PORT_BPS = 50_000.0,          # 高风险端口触发的速率阈值
+    RISKY_PORT_PPS = 150.0,             # 高风险端口触发的包速阈值
 )
 
 # 规则档位预设：baseline / aggressive
@@ -78,39 +80,39 @@ DEFAULT_RULE_PROFILE = "baseline"
 PROFILE_PRESETS: Dict[str, Dict[str, Any]] = {
     "baseline": {
         # 触发规则的分数线（规则总分低于它，基本不参与决策）
-        "trigger_threshold": 60.0,
-        # 模型权重更大，规则只做轻微修正
-        "model_weight": 0.70,
-        "rule_weight": 0.30,
+        "trigger_threshold": 65.0,
+        # 模型权重更大，规则只做修正
+        "model_weight": 0.85,
+        "rule_weight": 0.15,
         # 融合得分必须比较高才算异常
-        "fusion_threshold": 0.70,
+        "fusion_threshold": 0.75,
         # baseline 模式：只看融合得分
         "mode": "conservative",
-        "FLOW_PPS_THRESHOLD": 200.0,
-        "FLOW_BPS_THRESHOLD": 1_000_000.0,
-        "FLOW_DURATION_SHORT": 1.0,
-        "SPECIAL_DURATION_THRESHOLD": 0.25,
-        "UP_RATIO_THRESHOLD": 0.95,
-        "MIN_PKT_LEN_THRESHOLD": 40.0,
-        "TOTAL_DIRECTIONAL_PKTS": 100.0,
+        "FLOW_PPS_THRESHOLD": 240.0,
+        "FLOW_BPS_THRESHOLD": 1_200_000.0,
+        "FLOW_DURATION_SHORT": 1.2,
+        "SPECIAL_DURATION_THRESHOLD": 0.3,
+        "UP_RATIO_THRESHOLD": 0.96,
+        "MIN_PKT_LEN_THRESHOLD": 45.0,
+        "TOTAL_DIRECTIONAL_PKTS": 120.0,
     },
     "aggressive": {
-        # 只要规则分数达到 35 就当“很可疑”
-        "trigger_threshold": 35.0,
+        # 只要规则分数达到 25-30 就当“很可疑”
+        "trigger_threshold": 25.0,
         # 规则权重更高，宁可多报一点
-        "model_weight": 0.40,
-        "rule_weight": 0.60,
+        "model_weight": 0.25,
+        "rule_weight": 0.75,
         # 融合阈值放宽
-        "fusion_threshold": 0.40,
+        "fusion_threshold": 0.3,
         # aggressive 模式：融合得分 OR 强规则命中
         "mode": "aggressive",
-        "FLOW_PPS_THRESHOLD": 100.0,
-        "FLOW_BPS_THRESHOLD": 500_000.0,
+        "FLOW_PPS_THRESHOLD": 90.0,
+        "FLOW_BPS_THRESHOLD": 400_000.0,
         "FLOW_DURATION_SHORT": 0.5,
-        "SPECIAL_DURATION_THRESHOLD": 0.15,
-        "UP_RATIO_THRESHOLD": 0.90,
-        "MIN_PKT_LEN_THRESHOLD": 20.0,
-        "TOTAL_DIRECTIONAL_PKTS": 50.0,
+        "SPECIAL_DURATION_THRESHOLD": 0.12,
+        "UP_RATIO_THRESHOLD": 0.88,
+        "MIN_PKT_LEN_THRESHOLD": 18.0,
+        "TOTAL_DIRECTIONAL_PKTS": 45.0,
     },
 }
 
@@ -288,6 +290,22 @@ def score_rules(
 
     if params is None:
         params = settings.get("params", DEFAULTS)
+
+    # 列名别名映射，兼容 CICIDS/UNSW 导出的字段空格与大小写差异
+    ALIASES = {
+        "Protocol": "protocol",
+        " Protocol": "protocol",
+        " Destination Port": "dst_port",
+        "Destination Port": "dst_port",
+        " Source IP": "src_ip",
+        "Source IP": "src_ip",
+        " Destination IP": "dst_ip",
+        "Destination IP": "dst_ip",
+    }
+
+    for src, dst in ALIASES.items():
+        if src in df.columns and dst not in df.columns:
+            df[dst] = df[src]
 
     n = len(df)
     score = np.zeros(n, dtype=np.float32)
@@ -470,6 +488,22 @@ def score_rules(
     )
     directional_mask = pd.Series(directional_max, index=df.index) >= directional_threshold
     _apply_profiled_rule(directional_mask, 10, 15, "Directional Packet Volume")
+
+    # 高风险服务端口：SSH/Telnet/RDP/SMB/VNC 等出现高频访问时更敏感
+    risky_ports = {"21", "22", "23", "2323", "445", "3389", "5900"}
+    risky_port_mask = dst_port_series.isin(risky_ports)
+    risky_bps_threshold = params.get("RISKY_PORT_BPS", DEFAULTS["RISKY_PORT_BPS"])
+    risky_pps_threshold = params.get("RISKY_PORT_PPS", DEFAULTS["RISKY_PORT_PPS"])
+    risky_service_mask = risky_port_mask & (
+        (flow_rate >= risky_bps_threshold) | (flow_pkts_per_s >= risky_pps_threshold)
+    )
+    _apply_profiled_rule(
+        risky_service_mask,
+        12,
+        28,
+        "High-risk service exposure",
+        aggressive_reason="High-risk service exposure / brute-force surface",
+    )
 
     # 1) UDP Flood：UDP 且包速高
     udp_mask = proto.isin(["17", "udp", "UDP", "Udp"])
@@ -888,11 +922,11 @@ def fuse_model_rule_votes(
 
         profile_is_aggressive = profile_token.startswith("agg")
         if profile_is_aggressive:
-            high_model_ratio, high_rule_ratio = 0.5, 0.5
-            low_model_ratio, low_rule_ratio = 0.35, 0.65
+            high_model_ratio, high_rule_ratio = 0.45, 0.55
+            low_model_ratio, low_rule_ratio = 0.25, 0.75
         else:
-            high_model_ratio, high_rule_ratio = 0.8, 0.2
-            low_model_ratio, low_rule_ratio = 0.6, 0.4
+            high_model_ratio, high_rule_ratio = 0.9, 0.1
+            low_model_ratio, low_rule_ratio = 0.7, 0.3
 
         high_model_weight = base_total_weight * high_model_ratio
         high_rule_weight = base_total_weight * high_rule_ratio
