@@ -1085,6 +1085,45 @@ def _feature_order_from_metadata(metadata: dict) -> List[str]:
     return [str(col) for col in values if str(col)]
 
 
+def _feature_order_from_pipeline(pipeline: object) -> List[str]:
+    order: List[str] = []
+
+    names = getattr(pipeline, "feature_names_in_", None)
+    if names is not None:
+        try:
+            order = [str(col) for col in list(names) if str(col)]
+        except Exception:
+            order = []
+
+    if order:
+        return order
+
+    try:  # pragma: no cover - runtime inspection only
+        from sklearn.compose import ColumnTransformer
+    except Exception:
+        ColumnTransformer = None  # type: ignore
+
+    if ColumnTransformer and hasattr(pipeline, "steps"):
+        try:
+            for _, step in pipeline.steps:  # type: ignore[attr-defined]
+                if isinstance(step, ColumnTransformer):
+                    cols: List[str] = []
+                    for _, col_set, _ in step.transformers_:  # type: ignore[attr-defined]
+                        if col_set in ("drop", "passthrough"):
+                            continue
+                        try:
+                            cols.extend([str(col) for col in list(col_set)])
+                        except Exception:
+                            continue
+                    if cols:
+                        order = cols
+                        break
+        except Exception:
+            order = order
+
+    return [str(col) for col in order if str(col)]
+
+
 def _align_input_features(
     df: "pd.DataFrame",
     metadata: dict,
@@ -1102,7 +1141,9 @@ def _align_input_features(
 
     schema_version = metadata.get("schema_version")
     if schema_version is None:
-        raise ValueError("模型元数据缺少 schema_version 字段，请重新训练模型。")
+        if strict:
+            raise ValueError("模型元数据缺少 schema_version 字段，请重新训练模型。")
+        schema_version = "unknown"
     info["schema_version"] = schema_version
 
     feature_order = _feature_order_from_metadata(metadata)
@@ -5213,7 +5254,17 @@ class Ui_MainWindow(object):
             QtWidgets.QMessageBox.critical(parent_widget, "预测失败", f"无法加载模型：{exc}")
             return {}
 
-        feature_order = _feature_order_from_metadata(metadata)
+        metadata_for_align = dict(metadata) if isinstance(metadata, dict) else {}
+        schema_value = metadata.get("schema_version") if isinstance(metadata, dict) else None
+        if metadata_for_align.get("schema_version") is None:
+            metadata_for_align["schema_version"] = schema_value if schema_value is not None else "unknown"
+
+        pipeline_feature_order = _feature_order_from_pipeline(pipeline)
+        metadata_feature_order = _feature_order_from_metadata(metadata_for_align)
+        if pipeline_feature_order:
+            metadata_for_align["feature_order"] = pipeline_feature_order
+        feature_order = pipeline_feature_order or metadata_feature_order
+
         if feature_order:
             expected_feature_count = len(feature_order)
         elif expected_feature_count is None:
@@ -5257,11 +5308,14 @@ class Ui_MainWindow(object):
             elif feature_order:
                 feature_df_raw, align_info = _align_input_features(
                     df,
-                    metadata,
+                    metadata_for_align,
                     strict=False,
                     allow_extra=allowed_extra.union(
                         {"Label", "label", "LabelBinary", "attack_cat", "id"}
                     ),
+                )
+                align_info["feature_source"] = (
+                    "pipeline" if pipeline_feature_order else "metadata"
                 )
             else:
                 numeric_df = df.select_dtypes(include=["number"])
@@ -5295,13 +5349,12 @@ class Ui_MainWindow(object):
                 )
             self.display_result("[INFO] " + "; ".join(summary_parts))
             if feature_count != expected_feature_count:
-                QtWidgets.QMessageBox.warning(
+                QtWidgets.QMessageBox.information(
                     parent_widget,
-                    "特征数量不匹配",
+                    "特征数量不完全匹配",
                     f"当前模型期望 {expected_feature_count} 个特征，对齐后得到 {feature_count} 个。\n"
-                    "缺失列已补 0，多余列已忽略，请确认选择了正确的模型类型（CICIDS / UNSW）和数据格式。",
+                    "继续预测并自动填补/忽略差异，如结果异常请检查模型类型与数据格式。",
                 )
-                return {}
 
         self._selected_model_key = model_key
         self._selected_metadata = metadata
@@ -5335,8 +5388,16 @@ class Ui_MainWindow(object):
         if pipeline_features is not None:
             pipeline_cols = [str(col) for col in pipeline_features]
             if list(pipeline_cols) != list(expected_order):
-                raise RuntimeError(
-                    "模型管线的特征列顺序与训练时不一致，请重新训练或重新选择模型。"
+                # 以模型自身记录的列顺序为准进行重排/补齐，避免因元数据差异阻断预测。
+                missing_for_pipeline = [col for col in pipeline_cols if col not in feature_df_raw.columns]
+                if missing_for_pipeline:
+                    for col in missing_for_pipeline:
+                        feature_df_raw[col] = 0.0
+                feature_df_raw = feature_df_raw.reindex(columns=pipeline_cols, fill_value=0.0)
+                expected_order = pipeline_cols
+                expected_feature_count = len(expected_order)
+                self.display_result(
+                    "[INFO] 已按照模型内部特征顺序重新对齐列并填充缺失特征。"
                 )
 
         if isinstance(pipeline, dict) and "model" in pipeline and "feature_names" in pipeline:
