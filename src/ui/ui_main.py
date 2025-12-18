@@ -5209,8 +5209,7 @@ class Ui_MainWindow(object):
 
         profile_token = "unsw" if "unsw" in model_type_text.lower() else "cicids"
         expected_feature_count: Optional[int] = None
-        models_base = Path(PATHS["models"])
-        profile_dir = models_base / profile_token
+        profile_dir = self._resolve_model_profile_dir(profile_token)
         profile_dir.mkdir(parents=True, exist_ok=True)
         preferred_model_path = profile_dir / f"model_{profile_token}.joblib"
         fallback_model_path = profile_dir / "model.joblib"
