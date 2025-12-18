@@ -2615,12 +2615,26 @@ class Ui_MainWindow(object):
             return lambda key=key: str(PATHS[key])
         raise AttributeError(name)
 
+    def _resolve_model_profile_dir(self, profile: str) -> Path:
+        base_dir = Path(PATHS["models"])
+        candidates = [base_dir / profile]
+        hardcoded_base = Path(r"D:\pythonProject8\data\models")
+        candidates.append(hardcoded_base / profile)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        # 默认回落到首个候选并创建
+        fallback = candidates[0]
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
     def _default_models_dir(self) -> str:
         """
         根据当前 UI 选择的预测模型类型返回模型目录。
         例如 data/models/cicids 或 data/models/unsw，默认使用 cicids。
         """
-        base_dir = Path(PATHS["models"])
         profile = "cicids"
         combo = getattr(self, "model_profile_combo", None)
         if combo is not None:
@@ -2637,7 +2651,7 @@ class Ui_MainWindow(object):
                 else:
                     profile = token
 
-        models_dir = base_dir / profile
+        models_dir = self._resolve_model_profile_dir(profile)
         models_dir.mkdir(parents=True, exist_ok=True)
         return str(models_dir)
 
@@ -2647,7 +2661,6 @@ class Ui_MainWindow(object):
         CICIDS / PCAP -> data/models/cicids
         UNSW CSV     -> data/models/unsw
         """
-        base = Path(PATHS["models"])
         profile = None
 
         combo = getattr(self, "model_profile_combo", None)
@@ -2658,12 +2671,12 @@ class Ui_MainWindow(object):
                 profile = data.strip().lower()
 
         if profile in ("unsw", "unsw_csv", "unsw-model"):
-            return base / "unsw"
+            return self._resolve_model_profile_dir("unsw")
         elif profile in ("cicids", "cicids_pcap", "pcap-model"):
-            return base / "cicids"
+            return self._resolve_model_profile_dir("cicids")
 
         # 兜底：还是用老的 models 根目录
-        return base
+        return self._resolve_model_profile_dir("cicids")
 
     def _current_model_key(self) -> Optional[str]:
         """
@@ -5404,20 +5417,6 @@ class Ui_MainWindow(object):
             feature_names = [str(name) for name in pipeline.get("feature_names", [])]
             if not feature_names:
                 feature_names = list(expected_order)
-            if profile_token == "unsw" and feature_names:
-                present = [c for c in feature_names if c in feature_df_raw.columns]
-                coverage = len(present) / max(len(feature_names), 1)
-
-                if coverage < 0.2:
-                    QtWidgets.QMessageBox.warning(
-                        parent_widget,
-                        "预测失败",
-                        "当前输入不包含 UNSW-NB15 所需特征列（dur/spkts/...）。\n"
-                        "如果你选择的是 pcap/pcapng，请先【提取特征】并生成 UNSW 特征CSV，或切换到 CICIDS/PCAP 模型。\n"
-                        "如果你选择的是 CSV，请确认该 CSV 是 UNSW 特征格式（包含 dur/spkts/...）。",
-                    )
-                    return {}
-
             feature_df_raw = feature_df_raw.reindex(
                 columns=feature_names, fill_value=0.0
             )
