@@ -5404,9 +5404,24 @@ class Ui_MainWindow(object):
             feature_names = [str(name) for name in pipeline.get("feature_names", [])]
             if not feature_names:
                 feature_names = list(expected_order)
-            if feature_names and expected_order and list(feature_names) != list(expected_order):
-                feature_df_raw = feature_df_raw.loc[:, feature_names]
-            matrix = feature_df_raw.loc[:, feature_names].to_numpy(dtype=np.float64, copy=False)
+            if profile_token == "unsw" and feature_names:
+                present = [c for c in feature_names if c in feature_df_raw.columns]
+                coverage = len(present) / max(len(feature_names), 1)
+
+                if coverage < 0.2:
+                    QtWidgets.QMessageBox.warning(
+                        parent_widget,
+                        "预测失败",
+                        "当前输入不包含 UNSW-NB15 所需特征列（dur/spkts/...）。\n"
+                        "如果你选择的是 pcap/pcapng，请先【提取特征】并生成 UNSW 特征CSV，或切换到 CICIDS/PCAP 模型。\n"
+                        "如果你选择的是 CSV，请确认该 CSV 是 UNSW 特征格式（包含 dur/spkts/...）。",
+                    )
+                    return {}
+
+            feature_df_raw = feature_df_raw.reindex(
+                columns=feature_names, fill_value=0.0
+            )
+            matrix = feature_df_raw.to_numpy(dtype=np.float64, copy=False)
 
             model = pipeline["model"]
             positive_keywords = {"异常", "恶意", "malicious", "anomaly", "attack", "1", "-1"}
