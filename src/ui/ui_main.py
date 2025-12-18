@@ -1683,6 +1683,11 @@ class Ui_MainWindow(object):
         metadata: Optional[dict],
         profile: Optional[str],
     ) -> Optional[dict]:
+        """把 UI 选择的规则档位写入 metadata。
+
+        关键点：当用户在 UI 手动选择 baseline/aggressive 时，我们希望“档位默认参数”生效，
+        而不是被模型 metadata 里遗留的 rule_threshold / fusion_* 覆盖，导致两个档位结果一样。
+        """
         if not profile:
             return metadata
         base: dict
@@ -1690,11 +1695,28 @@ class Ui_MainWindow(object):
             base = dict(metadata)
         else:
             base = {}
-        base["rule_profile"] = profile
+
+        normalized = str(profile).strip().lower()
+        base["rule_profile"] = normalized
+        # 标记：本次档位来自 UI 明确选择（用于 _resolve_rule_settings 决定是否忽略 metadata 的覆盖项）
+        base["_ui_rule_profile_selected"] = True
+
+        # 清理可能“锁死档位差异”的旧覆盖项，让 get_rule_settings(profile=...) 的默认值接管
+        for k in (
+            "rule_threshold",
+            "fusion_threshold",
+            "fusion_model_weight",
+            "fusion_rule_weight",
+            "fusion_weights",
+        ):
+            base.pop(k, None)
+
         return base
 
     def _resolve_rule_settings(self, metadata: Optional[Dict[str, object]] = None) -> Dict[str, object]:
         metadata_obj = metadata if isinstance(metadata, dict) else {}
+
+        ui_profile_selected = bool(metadata_obj.get("_ui_rule_profile_selected"))
 
         profile_override = metadata_obj.get("rule_profile") if metadata_obj else None
         if not isinstance(profile_override, str) or not profile_override.strip():
@@ -1743,10 +1765,17 @@ class Ui_MainWindow(object):
             fusion_defaults.get("fusion_threshold", DEFAULT_FUSION_THRESHOLD)
         )
 
-        rule_threshold = metadata_obj.get("rule_threshold") if metadata_obj else None
-        fusion_threshold = metadata_obj.get("fusion_threshold") if metadata_obj else None
-        fusion_model_weight = metadata_obj.get("fusion_model_weight") if metadata_obj else None
-        fusion_rule_weight = metadata_obj.get("fusion_rule_weight") if metadata_obj else None
+        if ui_profile_selected:
+            # UI 手动选择档位时，使用档位默认参数（避免被模型 metadata 中的历史覆盖项“锁死”）
+            rule_threshold = None
+            fusion_threshold = None
+            fusion_model_weight = None
+            fusion_rule_weight = None
+        else:
+            rule_threshold = metadata_obj.get("rule_threshold") if metadata_obj else None
+            fusion_threshold = metadata_obj.get("fusion_threshold") if metadata_obj else None
+            fusion_model_weight = metadata_obj.get("fusion_model_weight") if metadata_obj else None
+            fusion_rule_weight = metadata_obj.get("fusion_rule_weight") if metadata_obj else None
 
         try:
             resolved_threshold = float(rule_threshold)
