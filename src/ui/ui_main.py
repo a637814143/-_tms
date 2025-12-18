@@ -5295,13 +5295,12 @@ class Ui_MainWindow(object):
                 )
             self.display_result("[INFO] " + "; ".join(summary_parts))
             if feature_count != expected_feature_count:
-                QtWidgets.QMessageBox.warning(
+                QtWidgets.QMessageBox.information(
                     parent_widget,
-                    "特征数量不匹配",
+                    "特征数量不完全匹配",
                     f"当前模型期望 {expected_feature_count} 个特征，对齐后得到 {feature_count} 个。\n"
-                    "缺失列已补 0，多余列已忽略，请确认选择了正确的模型类型（CICIDS / UNSW）和数据格式。",
+                    "继续预测并自动填补/忽略差异，如结果异常请检查模型类型与数据格式。",
                 )
-                return {}
 
         self._selected_model_key = model_key
         self._selected_metadata = metadata
@@ -5335,8 +5334,16 @@ class Ui_MainWindow(object):
         if pipeline_features is not None:
             pipeline_cols = [str(col) for col in pipeline_features]
             if list(pipeline_cols) != list(expected_order):
-                raise RuntimeError(
-                    "模型管线的特征列顺序与训练时不一致，请重新训练或重新选择模型。"
+                # 以模型自身记录的列顺序为准进行重排/补齐，避免因元数据差异阻断预测。
+                missing_for_pipeline = [col for col in pipeline_cols if col not in feature_df_raw.columns]
+                if missing_for_pipeline:
+                    for col in missing_for_pipeline:
+                        feature_df_raw[col] = 0.0
+                feature_df_raw = feature_df_raw.reindex(columns=pipeline_cols, fill_value=0.0)
+                expected_order = pipeline_cols
+                expected_feature_count = len(expected_order)
+                self.display_result(
+                    "[INFO] 已按照模型内部特征顺序重新对齐列并填充缺失特征。"
                 )
 
         if isinstance(pipeline, dict) and "model" in pipeline and "feature_names" in pipeline:
