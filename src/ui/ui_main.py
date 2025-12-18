@@ -1096,6 +1096,10 @@ def _align_input_features(
     if not isinstance(metadata, dict):
         raise ValueError("模型缺少有效的元数据。")
 
+    # 标准化列名，去掉首尾空格并套用已知别名，减少 UNSW/CICIDS 表头差异导致的缺列问题
+    df = df.copy()
+    df.columns = _apply_header_aliases([str(col).strip() for col in df.columns])
+
     schema_version = metadata.get("schema_version")
     if schema_version is None:
         raise ValueError("模型元数据缺少 schema_version 字段，请重新训练模型。")
