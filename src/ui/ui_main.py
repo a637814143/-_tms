@@ -1135,9 +1135,9 @@ def _align_input_features(
     if not isinstance(metadata, dict):
         raise ValueError("模型缺少有效的元数据。")
 
-    # 标准化列名，去掉首尾空格并套用已知别名，减少 UNSW/CICIDS 表头差异导致的缺列问题
     df = df.copy()
-    df.columns = _apply_header_aliases([str(col).strip() for col in df.columns])
+    stripped_columns = [str(col).strip() for col in df.columns]
+    df.columns = stripped_columns
 
     schema_version = metadata.get("schema_version")
     if schema_version is None:
@@ -1149,6 +1149,30 @@ def _align_input_features(
     feature_order = _feature_order_from_metadata(metadata)
     if not feature_order:
         raise ValueError("模型元数据缺少 feature_order 描述，无法校验列。")
+
+    feature_order_set = set(feature_order)
+
+    # 仅当别名映射能提升与模型特征的重叠度时才应用，否则保持原始列名
+    alias_candidates = _apply_header_aliases(stripped_columns)
+    overlap_raw = len(set(df.columns) & feature_order_set)
+    overlap_alias = len(set(alias_candidates) & feature_order_set)
+    aliases_applied = False
+    if overlap_alias > overlap_raw:
+        df.columns = alias_candidates
+        aliases_applied = True
+    info["aliases_applied"] = aliases_applied
+
+    # 针对 UNSW 期待的 dur/spkts/... 特征，优先复制而非重命名，避免误伤 CICIDS 列
+    alias_copies = {
+        "Flow Duration": "dur",
+        "Total Fwd Packets": "spkts",
+        "Total Backward Packets": "dpkts",
+        "Total Length of Fwd Packets": "sbytes",
+        "Total Length of Bwd Packets": "dbytes",
+    }
+    for source_col, target_col in alias_copies.items():
+        if target_col in feature_order_set and target_col not in df.columns and source_col in df.columns:
+            df[target_col] = df[source_col]
 
     default_fill = 0.0
     allow_set = {str(col) for col in allow_extra or []}
@@ -1205,10 +1229,16 @@ def _align_input_features(
         # 在非严格模式下，只对齐模型所需特征，其他列直接忽略并且不提示
         if strict:
             extra_columns.append(column_norm)
+    missing_count = len(missing_columns)
+    total_features = max(len(feature_order), 1)
+    coverage_ratio = max(0.0, (total_features - missing_count) / float(total_features))
+
     info["missing_filled"] = missing_columns
     info["extra_columns"] = extra_columns
     info["feature_order"] = feature_order
     info["ignored_columns"] = ignored_columns
+    info["coverage"] = coverage_ratio
+    info["missing_count"] = missing_count
 
     if strict and (missing_columns or extra_columns):
         parts: List[str] = []
@@ -5311,11 +5341,18 @@ class Ui_MainWindow(object):
                     and col not in {"Label", "LabelBinary"}
                     and not str(col).lower().startswith("unnamed:")
                 ]
+                missing_count = len(missing_columns)
+                total_features = max(len(expected_features), 1)
+                coverage_ratio = max(
+                    0.0, (total_features - missing_count) / float(total_features)
+                )
                 align_info = {
                     "feature_order": expected_features,
                     "missing_filled": missing_columns,
                     "extra_columns": extra_columns,
                     "schema_version": metadata.get("schema_version"),
+                    "coverage": coverage_ratio,
+                    "missing_count": missing_count,
                 }
             elif feature_order:
                 feature_df_raw, align_info = _align_input_features(
@@ -5345,6 +5382,30 @@ class Ui_MainWindow(object):
                 str(exc),
             )
             return {}
+
+        coverage_ratio = None
+        feature_order_for_cov: Sequence[str] = []
+        if isinstance(align_info, dict):
+            feature_order_for_cov = align_info.get("feature_order") or []
+            missing_after_align = align_info.get("missing_filled") or []
+            missing_count_value = len(missing_after_align)
+            if feature_order_for_cov:
+                coverage_ratio = align_info.get("coverage")
+                if coverage_ratio is None:
+                    total_feat = max(len(feature_order_for_cov), 1)
+                    coverage_ratio = max(0.0, (total_feat - missing_count_value) / float(total_feat))
+                    align_info["coverage"] = coverage_ratio
+                align_info["missing_count"] = missing_count_value
+                if missing_count_value / max(len(feature_order_for_cov), 1) > 0.3:
+                    QtWidgets.QMessageBox.warning(
+                        parent_widget,
+                        "特征覆盖率过低",
+                        (
+                            "检测到输入缺失大量模型特征，结果可能不可信。\n"
+                            f"缺失 {missing_count_value} / {len(feature_order_for_cov)} 列。\n"
+                            "请使用对应数据集的特征 CSV / PCAP 处理链，或切换匹配的模型。"
+                        ),
+                    )
 
         if expected_feature_count is not None:
             feature_count = feature_df_raw.shape[1]
@@ -5717,11 +5778,25 @@ class Ui_MainWindow(object):
             elif total_predictions:
                 status_text = "正常"
 
+            coverage_value = None
+            missing_value = None
+            total_feature_value = None
+            if isinstance(align_info, dict):
+                coverage_value = align_info.get("coverage")
+                missing_value = align_info.get("missing_count")
+                total_feature_value = len(align_info.get("feature_order") or [])
+
             out_df["prediction"] = [int(value) if isinstance(value, (int, np.integer)) else value for value in preds]
             out_df["prediction_label"] = display_labels
             out_df["malicious_score"] = [float(value) for value in np.asarray(scores, dtype=float)]
             out_df["model_status"] = pd.Series(model_statuses, dtype=object)
             out_df["model_flag"] = pd.Series(model_flag_values, dtype=int)
+            if coverage_value is not None:
+                out_df["_input_coverage"] = float(coverage_value)
+            if missing_value is not None:
+                out_df["_missing_features"] = int(missing_value)
+            if total_feature_value is not None:
+                out_df["_total_model_features"] = int(total_feature_value)
             if row_statuses:
                 out_df["fusion_status"] = pd.Series(row_statuses, dtype=object)
             out_df["fusion_score"] = pd.Series(fusion_scores, dtype=float)
