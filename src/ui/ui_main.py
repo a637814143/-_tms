@@ -2615,12 +2615,26 @@ class Ui_MainWindow(object):
             return lambda key=key: str(PATHS[key])
         raise AttributeError(name)
 
+    def _resolve_model_profile_dir(self, profile: str) -> Path:
+        base_dir = Path(PATHS["models"])
+        candidates = [base_dir / profile]
+        hardcoded_base = Path(r"D:\pythonProject8\data\models")
+        candidates.append(hardcoded_base / profile)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        # 默认回落到首个候选并创建
+        fallback = candidates[0]
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+
     def _default_models_dir(self) -> str:
         """
         根据当前 UI 选择的预测模型类型返回模型目录。
         例如 data/models/cicids 或 data/models/unsw，默认使用 cicids。
         """
-        base_dir = Path(PATHS["models"])
         profile = "cicids"
         combo = getattr(self, "model_profile_combo", None)
         if combo is not None:
@@ -2637,7 +2651,7 @@ class Ui_MainWindow(object):
                 else:
                     profile = token
 
-        models_dir = base_dir / profile
+        models_dir = self._resolve_model_profile_dir(profile)
         models_dir.mkdir(parents=True, exist_ok=True)
         return str(models_dir)
 
@@ -2647,7 +2661,6 @@ class Ui_MainWindow(object):
         CICIDS / PCAP -> data/models/cicids
         UNSW CSV     -> data/models/unsw
         """
-        base = Path(PATHS["models"])
         profile = None
 
         combo = getattr(self, "model_profile_combo", None)
@@ -2658,12 +2671,12 @@ class Ui_MainWindow(object):
                 profile = data.strip().lower()
 
         if profile in ("unsw", "unsw_csv", "unsw-model"):
-            return base / "unsw"
+            return self._resolve_model_profile_dir("unsw")
         elif profile in ("cicids", "cicids_pcap", "pcap-model"):
-            return base / "cicids"
+            return self._resolve_model_profile_dir("cicids")
 
         # 兜底：还是用老的 models 根目录
-        return base
+        return self._resolve_model_profile_dir("cicids")
 
     def _current_model_key(self) -> Optional[str]:
         """
