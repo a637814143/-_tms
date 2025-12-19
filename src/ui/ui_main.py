@@ -2730,6 +2730,11 @@ class Ui_MainWindow(object):
         models_dir = self._active_models_dir()
         models_dir.mkdir(parents=True, exist_ok=True)
 
+        hardcoded_base = Path(r"D:\\pythonProject8\\data\\models")
+        hardcoded_dir = hardcoded_base / (
+            "unsw" if "unsw" in (self._current_model_key() or "") else "cicids"
+        )
+
         def _register_model(key: str, pipeline_path: Path, meta_path: Path) -> None:
             if not (pipeline_path.is_file() and meta_path.is_file()):
                 return
@@ -2751,6 +2756,8 @@ class Ui_MainWindow(object):
         pipeline_candidates = [
             models_dir / "model.joblib",
             models_dir / f"model_{profile_token}.joblib",
+            hardcoded_dir / "model.joblib",
+            hardcoded_dir / f"model_{profile_token}.joblib",
         ]
         meta_candidates = [
             models_dir / "latest_iforest_metadata.json",
@@ -5243,12 +5250,20 @@ class Ui_MainWindow(object):
         profile_dir.mkdir(parents=True, exist_ok=True)
         preferred_model_path = profile_dir / f"model_{profile_token}.joblib"
         fallback_model_path = profile_dir / "model.joblib"
+        hardcoded_base = Path(r"D:\\pythonProject8\\data\\models")
+        hardcoded_profile_dir = hardcoded_base / profile_token
+        hardcoded_preferred = hardcoded_profile_dir / f"model_{profile_token}.joblib"
+        hardcoded_fallback = hardcoded_profile_dir / "model.joblib"
         preferred_meta_path = profile_dir / f"latest_iforest_metadata_{profile_token}.json"
 
         if preferred_model_path.exists():
             pipeline_path = str(preferred_model_path)
         elif fallback_model_path.exists():
             pipeline_path = str(fallback_model_path)
+        elif hardcoded_preferred.exists():
+            pipeline_path = str(hardcoded_preferred)
+        elif hardcoded_fallback.exists():
+            pipeline_path = str(hardcoded_fallback)
         if preferred_meta_path.exists():
             try:
                 with preferred_meta_path.open("r", encoding="utf-8") as fh:
