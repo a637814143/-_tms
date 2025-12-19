@@ -2755,14 +2755,14 @@ class Ui_MainWindow(object):
 
         profile_token = "unsw" if profile_key.startswith("unsw") else "cicids"
         pipeline_candidates = [
-            models_dir / "model.joblib",
             models_dir / f"model_{profile_token}.joblib",
-            hardcoded_dir / "model.joblib",
+            models_dir / "model.joblib",
             hardcoded_dir / f"model_{profile_token}.joblib",
+            hardcoded_dir / "model.joblib",
         ]
         meta_candidates = [
-            models_dir / "latest_iforest_metadata.json",
             models_dir / f"latest_iforest_metadata_{profile_token}.json",
+            models_dir / "latest_iforest_metadata.json",
         ]
 
         pipeline_path = next((path for path in pipeline_candidates if path.is_file()), None)
