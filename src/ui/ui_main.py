@@ -2620,6 +2620,7 @@ class Ui_MainWindow(object):
         self.output_list.customContextMenuRequested.connect(self._on_output_ctx_menu)
         self.output_list.itemDoubleClicked.connect(self._on_output_double_click)
         self.table_view.doubleClicked.connect(self._on_table_double_click)
+        self.model_profile_combo.currentIndexChanged.connect(self._refresh_model_versions)
 
         self._verify_action_bindings()
 
@@ -5235,8 +5236,18 @@ class Ui_MainWindow(object):
 
         model_type_text = ""
         profile_label = "CICIDS / PCAP 模型"
+        profile_token = "cicids"
         combo = getattr(self, "model_profile_combo", None)
         if isinstance(combo, QtWidgets.QComboBox):
+            try:
+                data = combo.currentData()
+            except Exception:
+                data = None
+            if data == "unsw_csv":
+                profile_token = "unsw"
+            else:
+                profile_token = "cicids"
+
             try:
                 model_type_text = combo.currentText().strip()
                 if model_type_text:
@@ -5244,7 +5255,6 @@ class Ui_MainWindow(object):
             except Exception:
                 model_type_text = ""
 
-        profile_token = "unsw" if "unsw" in model_type_text.lower() else "cicids"
         expected_feature_count: Optional[int] = None
         profile_dir = self._resolve_model_profile_dir(profile_token)
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -5256,39 +5266,44 @@ class Ui_MainWindow(object):
         hardcoded_fallback = hardcoded_profile_dir / "model.joblib"
         preferred_meta_path = profile_dir / f"latest_iforest_metadata_{profile_token}.json"
 
-        if preferred_model_path.exists():
-            pipeline_path = str(preferred_model_path)
-        elif fallback_model_path.exists():
-            pipeline_path = str(fallback_model_path)
-        elif hardcoded_preferred.exists():
-            pipeline_path = str(hardcoded_preferred)
-        elif hardcoded_fallback.exists():
-            pipeline_path = str(hardcoded_fallback)
-        if preferred_meta_path.exists():
-            try:
-                with preferred_meta_path.open("r", encoding="utf-8") as fh:
-                    metadata_from_disk = json.load(fh)
-            except Exception:
-                metadata_from_disk = {}
-            if isinstance(metadata_from_disk, dict):
-                metadata.update(metadata_from_disk)
-                metadata_path = str(preferred_meta_path)
-        elif metadata_path is None:
-            # 兼容带时间戳的 metadata 文件名（例如 latest_iforest_metadata_*.json）。
-            globbed = sorted(
-                profile_dir.glob("latest_iforest_metadata*.json"),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if globbed:
+        if (not pipeline_path) or (not os.path.exists(str(pipeline_path))):
+            if preferred_model_path.exists():
+                pipeline_path = str(preferred_model_path)
+            elif fallback_model_path.exists():
+                pipeline_path = str(fallback_model_path)
+            elif hardcoded_preferred.exists():
+                pipeline_path = str(hardcoded_preferred)
+            elif hardcoded_fallback.exists():
+                pipeline_path = str(hardcoded_fallback)
+
+        metadata_missing = (not metadata_path) or (not os.path.exists(str(metadata_path))) or (not metadata)
+
+        if metadata_missing:
+            if preferred_meta_path.exists():
                 try:
-                    with globbed[0].open("r", encoding="utf-8") as fh:
+                    with preferred_meta_path.open("r", encoding="utf-8") as fh:
                         metadata_from_disk = json.load(fh)
                 except Exception:
                     metadata_from_disk = {}
                 if isinstance(metadata_from_disk, dict):
                     metadata.update(metadata_from_disk)
-                    metadata_path = str(globbed[0])
+                    metadata_path = str(preferred_meta_path)
+            else:
+                # 兼容带时间戳的 metadata 文件名（例如 latest_iforest_metadata_*.json）。
+                globbed = sorted(
+                    profile_dir.glob("latest_iforest_metadata*.json"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if globbed:
+                    try:
+                        with globbed[0].open("r", encoding="utf-8") as fh:
+                            metadata_from_disk = json.load(fh)
+                    except Exception:
+                        metadata_from_disk = {}
+                    if isinstance(metadata_from_disk, dict):
+                        metadata.update(metadata_from_disk)
+                        metadata_path = str(globbed[0])
 
         if isinstance(metadata_override, dict):
             metadata.update(metadata_override)
