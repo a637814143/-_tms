@@ -94,6 +94,56 @@ try:
 except Exception:
     pd = None
 
+
+def _prepare_rules_input_df(df):
+    """
+    让 risk_rules.py 能在 UNSW-NB15 这类特征表上触发规则：
+    - proto -> protocol
+    - dur -> flow_duration (秒)
+    - rate/spkts/dpkts/dur -> flow_pkts_per_s
+    - sbytes/dbytes/dur -> flow_byts_per_s
+    注意：UNSW 这份CSV通常没有 src_ip/dst_port，因此“端口扫描/HTTP端口类”规则仍不会触发，
+    但“包速/字节速率/协议异常”等规则会开始触发。
+    """
+    import numpy as np
+    import pandas as pd
+
+    out = df.copy()
+
+    def num(s):
+        return pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+    # 1) protocol
+    if "protocol" not in out.columns and "proto" in out.columns:
+        out["protocol"] = out["proto"].astype(str)
+
+    # 2) duration seconds
+    if "flow_duration" not in out.columns and "dur" in out.columns:
+        out["flow_duration"] = num(out["dur"]).astype(np.float32)
+
+    # 3) packets per second
+    if "flow_pkts_per_s" not in out.columns:
+        if "rate" in out.columns:
+            # UNSW的 rate 通常就是 pkts/s（如果你确认是这样，直接用它最稳）
+            out["flow_pkts_per_s"] = num(out["rate"]).astype(np.float32)
+        elif all(c in out.columns for c in ["spkts", "dpkts", "dur"]):
+            dur = num(out["dur"])
+            pkts = num(out["spkts"]) + num(out["dpkts"])
+            out["flow_pkts_per_s"] = (pkts / dur.replace(0, np.nan)).fillna(0.0).astype(np.float32)
+
+    # 4) bytes per second
+    if "flow_byts_per_s" not in out.columns:
+        if all(c in out.columns for c in ["sbytes", "dbytes", "dur"]):
+            dur = num(out["dur"])
+            byts = num(out["sbytes"]) + num(out["dbytes"])
+            out["flow_byts_per_s"] = (byts / dur.replace(0, np.nan)).fillna(0.0).astype(np.float32)
+        elif all(c in out.columns for c in ["sload", "dload"]):
+            # 兜底：有些UNSW特征里 sload/dload 可近似作速率（但口径可能是bits/s，谨慎用于论文解释）
+            out["flow_byts_per_s"] = (num(out["sload"]) + num(out["dload"])).astype(np.float32)
+
+    return out
+
+
 try:
     from src.functions.risk_rules import (
         DEFAULT_TRIGGER_THRESHOLD,
@@ -5732,8 +5782,10 @@ class Ui_MainWindow(object):
             rule_flags = np.zeros(total_predictions, dtype=bool)
             if apply_risk_rules is not None and pd is not None and total_predictions:
                 try:
+                    rules_df = _prepare_rules_input_df(out_df)
+
                     score_series, reason_series = apply_risk_rules(
-                        out_df,
+                        rules_df,
                         params=rule_params,
                         profile=rule_profile,
                     )
@@ -6158,8 +6210,10 @@ class Ui_MainWindow(object):
         rule_flags = np.zeros(total, dtype=bool)
         if apply_risk_rules is not None and pd is not None and total:
             try:
+                rules_df = _prepare_rules_input_df(out_df)
+
                 score_series, reason_series = apply_risk_rules(
-                    out_df,
+                    rules_df,
                     params=rule_params,
                     profile=rule_profile,
                 )
