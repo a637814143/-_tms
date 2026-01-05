@@ -1,4 +1,3 @@
-
 paths:
   data_dir: data
   split_dir: data/split

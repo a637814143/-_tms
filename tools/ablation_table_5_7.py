@@ -1,32 +1,30 @@
-# ablation_table_5_7.py
+# table_5_7_run_direct.py
+# 直接运行：计算表5-7（纯模型 / 纯规则 / 融合-常规 / 融合-高敏）
+# 输出：table_5_7_for_thesis.csv（可直接抄表）
+
 import math
-import pandas as pd
 import numpy as np
-from sklearn.metrics import roc_auc_score, f1_score, confusion_matrix
+import pandas as pd
+from sklearn.metrics import f1_score, roc_auc_score, confusion_matrix
 
-# ========= 你要改的输入 =========
-PRED_CSV = r"D:\pythonProject8\data\CSV\results\unsw_test_predictions.csv"  # 改成你的预测输出CSV
-LABEL_COL = "LabelBinary"
-MODEL_SCORE_COL = "model_score"     # 有的文件叫 malicious_score，按你的实际改
-RULES_SCORE_COL = "rules_score"     # 0-100
-TOP_PERCENT = 0.01                  # Top-1%
+# ===================== 你只需要改这里（固定地址） =====================
+BASELINE_CSV = r"D:\pythonProject8\data\results\modelprediction\biao5-8\prediction_balanced_20000_Friday-WorkingHours-Afternoon-PortScan_pcap_ISCX_20251229_200341_small_20260103_162411.csv"
+AGGRESSIVE_CSV = r"D:\pythonProject8\data\results\modelprediction\biao5-8\prediction_balanced_20000_Friday-WorkingHours-Afternoon-PortScan_pcap_ISCX_20251229_200341_small_20260103_162507.csv"
 
-# 纯模型固定阈值（用于“固定阈值口径”的F1/FPR）
-MODEL_THRESHOLD = 0.5
+# 列名（按你现在导出的CSV）
+LABEL_COL = "LabelBinary"          # 如果你的列是 label，就改成 "label"
+MODEL_SCORE_COL = "malicious_score"
+RULES_SCORE_COL = "rules_score"    # 0-100
+FUSION_SCORE_COL = "fusion_score"  # 0-1
+FUSION_DECISION_COL = "fusion_decision"  # 0/1（最终融合判定）
 
-# 档位参数（与你论文表3-1一致）
-BASELINE = dict(name="Baseline", w_m=0.85, w_r=0.15, t=0.75, trigger_threshold=65)
-AGGRESSIVE = dict(name="Aggressive", w_m=0.25, w_r=0.75, t=0.30, trigger_threshold=25)
-
-# 纯规则固定阈值（建议=Baseline 触发阈值/100）
-RULES_THRESHOLD = BASELINE["trigger_threshold"] / 100.0
-# ==============================
-
-
-def safe_auc(y_true, score):
-    if len(np.unique(y_true)) < 2:
-        return float("nan")
-    return float(roc_auc_score(y_true, score))
+# 阈值设置
+MODEL_THR = 0.5
+RULE_THR_BASELINE = 65.0           # 0-100（常规档规则触发阈值）
+RULE_THR_AGGRESSIVE = 25.0         # 0-100（高敏档规则触发阈值）——可选（脚本默认不输出第二条规则行）
+TOP_PERCENT = 0.01                 # Top-1%
+OUT_CSV = "table_5_7_for_thesis.csv"
+# =====================================================================
 
 
 def fpr(y_true, y_pred):
@@ -35,110 +33,99 @@ def fpr(y_true, y_pred):
 
 
 def top_hit_rate(y_true, score, top_percent=0.01):
+    """
+    Top-1% 命中率：当分数大量并列（比如很多100）时，加入极小抖动让排序可复现。
+    """
     n = len(score)
     k = max(1, int(math.ceil(n * top_percent)))
-    idx = np.argsort(-score)[:k]
+    jitter = (np.arange(n) * 1e-12).astype(float)
+    idx = np.argsort(-(score + jitter))[:k]
     return float(np.mean(y_true[idx] == 1)), k
 
 
-def decision_fixed(score, thr):
-    return (score >= thr).astype(int)
+def safe_auc(y_true, score):
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
+    return float(roc_auc_score(y_true, score))
 
 
-def decision_top_percent(score, top_percent=0.01):
-    n = len(score)
-    k = max(1, int(math.ceil(n * top_percent)))
-    cutoff = np.sort(score)[-k]   # 第k大的分数作为阈值（包含并列）
-    return (score >= cutoff).astype(int)
-
-
-def fuse(model_score, rules_score_0_100, profile):
-    r = np.clip(rules_score_0_100 / 100.0, 0.0, 1.0)
-    m = np.clip(model_score, 0.0, 1.0)
-    return np.clip(profile["w_m"] * m + profile["w_r"] * r, 0.0, 1.0)
-
-
-def eval_variant(name, y_true, score, fixed_thr):
-    auc = safe_auc(y_true, score)
-
-    # 固定阈值口径
-    y_pred_fixed = decision_fixed(score, fixed_thr)
-    f1_fixed = float(f1_score(y_true, y_pred_fixed, zero_division=0))
-    fpr_fixed = fpr(y_true, y_pred_fixed)
-
-    # Top-1%告警名额口径
-    hit, k = top_hit_rate(y_true, score, TOP_PERCENT)
-    y_pred_top = decision_top_percent(score, TOP_PERCENT)
-    f1_top = float(f1_score(y_true, y_pred_top, zero_division=0))
-    fpr_top = fpr(y_true, y_pred_top)
-
+def eval_from_scores(name, y_true, score, thr):
+    y_pred = (score >= thr).astype(int)
+    hit, _ = top_hit_rate(y_true, score, TOP_PERCENT)
     return {
         "组别": name,
-        "连续分数": "见脚本",
-        "阈值判定口径": f"固定阈值({fixed_thr}) / Top-{int(TOP_PERCENT*100)}%",
-        "F1": f1_fixed,
-        "ROC-AUC": auc,
-        "误报率(FPR)": fpr_fixed,
+        "F1": float(f1_score(y_true, y_pred, zero_division=0)),
+        "ROC-AUC": safe_auc(y_true, score),
+        "误报率(FPR)": fpr(y_true, y_pred),
         f"Top-{int(TOP_PERCENT*100)}%命中率": hit,
-        "F1@Top": f1_top,          # 论文表格不一定要填，可留作自己参考
-        "FPR@Top": fpr_top,        # 论文表格不一定要填，可留作自己参考
-        "TopK": int(k),
-        "固定阈值": fixed_thr,
+    }
+
+
+def eval_from_decision(name, y_true, score, decision):
+    hit, _ = top_hit_rate(y_true, score, TOP_PERCENT)
+    return {
+        "组别": name,
+        "F1": float(f1_score(y_true, decision, zero_division=0)),
+        "ROC-AUC": safe_auc(y_true, score),
+        "误报率(FPR)": fpr(y_true, decision),
+        f"Top-{int(TOP_PERCENT*100)}%命中率": hit,
     }
 
 
 def main():
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.width", 200)
+    base = pd.read_csv(BASELINE_CSV)
+    aggr = pd.read_csv(AGGRESSIVE_CSV)
 
-    df = pd.read_csv(PRED_CSV)
+    # 检查列
+    need_cols = [LABEL_COL, MODEL_SCORE_COL, RULES_SCORE_COL, FUSION_SCORE_COL, FUSION_DECISION_COL]
+    for c in need_cols:
+        if c not in base.columns:
+            raise ValueError(f"[Baseline] 缺少列：{c}，当前列：{base.columns.tolist()}")
+        if c not in aggr.columns:
+            raise ValueError(f"[Aggressive] 缺少列：{c}，当前列：{aggr.columns.tolist()}")
 
-    for col in [LABEL_COL, MODEL_SCORE_COL, RULES_SCORE_COL]:
-        if col not in df.columns:
-            raise ValueError(f"缺少列: {col}，请检查你的CSV列名。")
+    y = base[LABEL_COL].astype(int).to_numpy()
+    y2 = aggr[LABEL_COL].astype(int).to_numpy()
+    if len(y) != len(y2) or not np.all(y == y2):
+        print("[WARN] 两份CSV的label不一致/长度不一致：请确认是同一测试集导出。")
 
-    y_true = df[LABEL_COL].astype(int).to_numpy()
-    model_score = df[MODEL_SCORE_COL].astype(float).to_numpy()
-    rules_score = df[RULES_SCORE_COL].astype(float).to_numpy()
+    model_score = base[MODEL_SCORE_COL].astype(float).clip(0, 1).to_numpy()
 
-    # E：纯模型（w_r=0）
-    score_E = model_score
-    res_E = eval_variant("E 纯模型(w_r=0)", y_true, score_E, MODEL_THRESHOLD)
+    rules_base = (base[RULES_SCORE_COL].astype(float) / 100.0).clip(0, 1).to_numpy()
+    fusion_base = base[FUSION_SCORE_COL].astype(float).clip(0, 1).to_numpy()
+    decision_base = base[FUSION_DECISION_COL].astype(int).to_numpy()
 
-    # F：Baseline 融合（模型主导/轻规则）
-    score_F = fuse(model_score, rules_score, BASELINE)
-    res_F = eval_variant("F Baseline(w_m=0.85,w_r=0.15,t=0.75)", y_true, score_F, BASELINE["t"])
+    rules_aggr = (aggr[RULES_SCORE_COL].astype(float) / 100.0).clip(0, 1).to_numpy()
+    fusion_aggr = aggr[FUSION_SCORE_COL].astype(float).clip(0, 1).to_numpy()
+    decision_aggr = aggr[FUSION_DECISION_COL].astype(int).to_numpy()
 
-    # G：Aggressive 融合（规则增强/高敏）
-    score_G = fuse(model_score, rules_score, AGGRESSIVE)
-    res_G = eval_variant("G Aggressive(w_m=0.25,w_r=0.75,t=0.30)", y_true, score_G, AGGRESSIVE["t"])
+    rows = []
 
-    # Aggressive 的真实最终判定（fusion>=t OR rules>=trigger）
-    y_pred_aggr_final = ((score_G >= AGGRESSIVE["t"]) | (rules_score >= AGGRESSIVE["trigger_threshold"])).astype(int)
-    f1_final = float(f1_score(y_true, y_pred_aggr_final, zero_division=0))
-    fpr_final = fpr(y_true, y_pred_aggr_final)
+    # E：纯模型（离线消融）
+    rows.append(eval_from_scores("E 纯模型", y, model_score, MODEL_THR))
 
-    # H：纯规则（w_m=0）
-    score_H = np.clip(rules_score / 100.0, 0.0, 1.0)
-    res_H = eval_variant("H 纯规则(w_m=0)", y_true, score_H, RULES_THRESHOLD)
+    # H：纯规则（离线消融：按常规阈值）
+    rows.append(eval_from_scores("H 纯规则(常规阈值)", y, rules_base, RULE_THR_BASELINE / 100.0))
 
-    out = pd.DataFrame([res_E, res_F, res_G, res_H])
+    # F：融合-常规（使用系统最终融合判定）
+    rows.append(eval_from_decision("F 融合Baseline(常规)", y, fusion_base, decision_base))
 
-    # 论文表5-7要用的列（你可以直接抄）
-    table_cols = ["组别", "F1", "ROC-AUC", "误报率(FPR)", f"Top-{int(TOP_PERCENT*100)}%命中率"]
-    print("\n===== 表5-7 可直接抄写的结果 =====")
-    print(out[table_cols].to_string(index=False))
+    # G：融合-高敏（使用系统最终融合判定）
+    rows.append(eval_from_decision("G 融合Aggressive(高敏)", y, fusion_aggr, decision_aggr))
 
-    out.to_csv("table_5_7_ablation_full.csv", index=False)
-    out[table_cols].to_csv("table_5_7_ablation_for_thesis.csv", index=False)
+    out = pd.DataFrame(rows)
+    cols = ["组别", "F1", "ROC-AUC", "误报率(FPR)", f"Top-{int(TOP_PERCENT*100)}%命中率"]
 
-    print("\n已保存：table_5_7_ablation_for_thesis.csv（论文用）")
-    print("已保存：table_5_7_ablation_full.csv（含Top口径的F1/FPR等扩展信息）")
+    print("\n===== 表5-7 可直接抄写 =====")
+    print(out[cols].to_string(index=False))
 
-    print("\n[说明] Aggressive 真实最终判定包含 OR 规则强触发：")
-    print(f"  F1@final_aggressive = {f1_final:.6f}")
-    print(f"  FPR@final_aggressive = {fpr_final:.6f}")
-    print("建议你在论文表5-7的注释写明：Aggressive 的最终判定口径比仅 fusion>=t 更偏向高召回。")
+    out.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+    print(f"\n已保存：{OUT_CSV}")
+
+    # 附加：打印规则触发情况（方便你写论文解释）
+    trig_rate_base = float((base[RULES_SCORE_COL].astype(float) > 0).mean())
+    trig_rate_aggr = float((aggr[RULES_SCORE_COL].astype(float) > 0).mean())
+    print(f"\n[INFO] rules_score>0 触发比例：baseline={trig_rate_base:.4%}, aggressive={trig_rate_aggr:.4%}")
 
 
 if __name__ == "__main__":
